@@ -1,0 +1,128 @@
+{
+  "name": "wake-word",
+  "displayName": "Wake Word - Voice Activation for VS Code",
+  "description": "Hands-free voice activation for VS Code. Say \"Hey Claude\" or \"Hey Copilot\" to route to the right AI assistant. Zero config, fully local, no API keys.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "icon": "icon.png",
+  "publisher": "analytics-in-motion",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/analyticsinmotion/wake-word"
+  },
+  "homepage": "https://github.com/analyticsinmotion/wake-word#readme",
+  "bugs": {
+    "url": "https://github.com/analyticsinmotion/wake-word/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "voice",
+    "wake word",
+    "speech",
+    "hands-free",
+    "accessibility",
+    "copilot",
+    "claude",
+    "voice activation"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "wakeWord.enable",
+        "title": "Wake Word: Enable Listening"
+      },
+      {
+        "command": "wakeWord.disable",
+        "title": "Wake Word: Disable Listening"
+      },
+      {
+        "command": "wakeWord.toggle",
+        "title": "Wake Word: Toggle Listening"
+      },
+      {
+        "command": "wakeWord.resetConsent",
+        "title": "Wake Word: Reset Microphone Consent"
+      }
+    ],
+    "configuration": {
+      "title": "Wake Word",
+      "properties": {
+        "wakeWord.routes": {
+          "type": "array",
+          "default": [],
+          "description": "Wake phrase routing table. Each entry maps a spoken phrase to a VS Code command. If empty, default routes are used (Hey Copilot, Hey Claude, Computer).",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "phrase",
+              "command"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "Human-readable name shown in notifications (e.g. \"Claude\")"
+              },
+              "phrase": {
+                "type": "string",
+                "description": "The spoken phrase to listen for, in plain English (e.g. \"hey claude\")"
+              },
+              "command": {
+                "type": "string",
+                "description": "VS Code command ID to execute (e.g. \"workbench.action.chat.open\")"
+              }
+            }
+          }
+        },
+        "wakeWord.cooldownSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 300,
+          "description": "Seconds to pause wake word listening after handing off to an assistant."
+        },
+        "wakeWord.enableOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start listening automatically when VS Code opens."
+        },
+        "wakeWord.showNotificationOnDetection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a brief notification when a wake phrase is detected."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "publish:vscode": "vsce publish",
+    "publish:openvsx": "ovsx publish",
+    "publish:all": "npm run publish:vscode && npm run publish:openvsx",
+    "release": "npm run compile && npm run package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "ovsx": "^0.8.0",
+    "typescript": "^5.3.3",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/parser": "^6.18.0",
+    "@typescript-eslint/eslint-plugin": "^6.18.0"
+  },
+  "dependencies": {}
+}

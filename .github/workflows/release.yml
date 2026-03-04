@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - run: npm run compile
+
+      # Build .vsix package
+      - name: Package extension
+        run: npx vsce package -o wake-word-${{ github.event.release.tag_name }}.vsix
+
+      # Attach .vsix to the GitHub release
+      - name: Upload .vsix to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: wake-word-${{ github.event.release.tag_name }}.vsix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish to VS Code Marketplace
+      - name: Publish to VS Code Marketplace
+        run: npx vsce publish
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      # Publish to Open VSX Registry
+      - name: Publish to Open VSX
+        run: npx ovsx publish -p ${{ secrets.OVSX_PAT }}
