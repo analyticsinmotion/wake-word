@@ -203,7 +203,7 @@ try {
     $phrasePrefix = @{}
     foreach ($p in $phrases) {
         # Pick the longest word as the keyword (skips filler like "hey")
-        $keyword = ($p -split '\s+') | Sort-Object Length -Descending | Select-Object -First 1
+        $keyword = ($p -split '\\s+') | Sort-Object Length -Descending | Select-Object -First 1
         $phrasePrefix[$p] = $keyword.ToLower().Substring(0, [Math]::Min(2, $keyword.Length))
     }
 
@@ -219,7 +219,7 @@ try {
             $result = $engine.Recognize([TimeSpan]::FromSeconds(5))
             if ($result -ne $null -and $result.Confidence -ge 0.3) {
                 $text = $result.Text.ToLower()
-                $recWords = $text -split '\s+'
+                $recWords = $text -split '\\s+'
                 $found = $false
                 foreach ($p in $phrases) {
                     $prefix = $phrasePrefix[$p]
