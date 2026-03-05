@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for VS Code with customizable wake word. Fully local, zero config.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -99,6 +99,13 @@
           "type": "boolean",
           "default": true,
           "description": "Show a brief notification when a wake phrase is detected."
+        },
+        "wakeWord.confidenceThreshold": {
+          "type": "number",
+          "default": 0.3,
+          "minimum": 0.1,
+          "maximum": 0.9,
+          "description": "Minimum confidence score (0.1 to 0.9) required to trigger a wake phrase. Lower values detect more but increase false positives."
         }
       }
     }
