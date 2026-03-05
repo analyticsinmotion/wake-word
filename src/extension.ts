@@ -6,6 +6,7 @@ let resumeTimer: ReturnType<typeof setTimeout> | null = null;
 let speechEngine: SpeechEngine;
 let isActive = false;
 let isStarting = false;
+let isDevMode = false;
 
 // ── Default routes ──────────────────────────────────────────
 
@@ -30,6 +31,23 @@ const DEFAULT_ROUTES: WakePhrase[] = [
 // ── Activation ──────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext) {
+  isDevMode = context.extensionMode === vscode.ExtensionMode.Development;
+  console.log("[Wake Word] Activating, devMode:", isDevMode);
+
+  if (process.platform !== "win32") {
+    const notWindows = () =>
+      vscode.window.showInformationMessage(
+        "Wake Word currently supports Windows only."
+      );
+    context.subscriptions.push(
+      vscode.commands.registerCommand("wakeWord.enable", notWindows),
+      vscode.commands.registerCommand("wakeWord.disable", notWindows),
+      vscode.commands.registerCommand("wakeWord.toggle", notWindows),
+      vscode.commands.registerCommand("wakeWord.resetConsent", notWindows)
+    );
+    return;
+  }
+
   speechEngine = new SpeechEngine();
 
   // Wire up events from the speech engine
@@ -49,6 +67,14 @@ export function activate(context: vscode.ExtensionContext) {
   speechEngine.on("stopped", () => {
     isActive = false;
     setStatusBar("off");
+  });
+
+  speechEngine.on("debug", (info: string) => {
+    console.log("[Wake Word] Speech:", info);
+  });
+
+  speechEngine.on("warning", (msg: string) => {
+    console.warn("[Wake Word]", msg);
   });
 
   speechEngine.on("error", (err: Error) => {
@@ -115,8 +141,10 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  stopListening();
-  speechEngine.dispose();
+  if (speechEngine) {
+    stopListening();
+    speechEngine.dispose();
+  }
 }
 
 // ── Consent ─────────────────────────────────────────────────
@@ -176,7 +204,8 @@ function startListening() {
     return;
   }
 
-  speechEngine.start(routes);
+  const threshold = config.get<number>("confidenceThreshold", 0.3);
+  speechEngine.start(routes, threshold, isDevMode);
 }
 
 function stopListening() {
