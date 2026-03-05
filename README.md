@@ -16,7 +16,8 @@
       <td>
         <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/v/analytics-in-motion.wake-word?label=Marketplace&color=blue" alt="VS Code Marketplace version"></a>&nbsp;
         <a href="https://open-vsx.org/extension/analytics-in-motion/wake-word"><img src="https://img.shields.io/open-vsx/v/analytics-in-motion/wake-word?label=Open%20VSX&color=blue" alt="Open VSX version"></a>&nbsp;
-        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/i/analytics-in-motion.wake-word?label=Installs&color=blue" alt="VS Code Marketplace installs"></a>&nbsp;
+        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/i/analytics-in-motion.wake-word?label=Marketplace%20Installs&color=blue" alt="VS Code Marketplace installs"></a>&nbsp;
+        <a href="https://open-vsx.org/extension/analytics-in-motion/wake-word"><img src="https://img.shields.io/open-vsx/dt/analytics-in-motion/wake-word?label=Open%20VSX%20Installs&color=blue" alt="Open VSX installs"></a>&nbsp;
         <a href="https://github.com/analyticsinmotion/wake-word/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0 License"></a>&nbsp;
       </td>
     </tr>
@@ -36,7 +37,7 @@ All audio processing happens locally on your machine using Windows built-in spee
 
 1. Install the extension -- that's it, no other setup
 2. When VS Code opens, the extension starts listening on your microphone via Windows speech recognition
-3. The extension matches recognised words against your configured wake phrases using prefix matching
+3. The speech engine uses a constrained grammar to match recognised speech against your configured wake phrases
 4. If a phrase is detected with sufficient confidence, the extension **releases the mic** and fires the mapped command
 5. The target assistant (Claude, Copilot, etc.) takes over the microphone with no contention
 6. After a configurable cooldown, wake word listening resumes automatically
@@ -69,7 +70,7 @@ macOS and Linux support is planned for a future release.
 
 The first time the extension tries to listen, a modal dialog explains exactly what happens: continuous microphone use, fully local processing. You must click "Allow Microphone Listening" to proceed.
 
-If you decline, auto-start is disabled. You can re-enable any time via the status bar or command palette. Reset the consent prompt with **Wake Word: Reset Microphone Consent**.
+If you decline, listening does not start. You can enable it any time via the status bar or command palette, which will re-prompt for consent. Reset the consent prompt with **Wake Word: Reset Microphone Consent**.
 
 ## Wake Phrase Routing
 
@@ -116,7 +117,7 @@ Add your own phrases in `settings.json`. Any spoken English phrase works:
 }
 ```
 
-The speech engine uses Windows built-in dictation with prefix matching against your configured phrases.
+The speech engine uses a constrained grammar built from your configured phrases for accurate matching.
 
 ### The handoff
 
@@ -138,6 +139,7 @@ This ensures only one thing uses the mic at a time.
 | `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming |
 | `wakeWord.enableOnStartup` | `true` | Start listening when VS Code opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
+| `wakeWord.confidenceThreshold` | `0.3` | Minimum confidence score (0.1–0.9) for wake phrase detection |
 
 ## Commands
 
@@ -167,15 +169,26 @@ The extension spawns a background PowerShell process that uses `System.Speech.Re
 
 The process flow:
 
-1. Extension builds a dictation-based recognition loop with prefix matching for the configured wake phrases
+1. Extension builds a constrained grammar from the configured wake phrases
 2. The recognition script is passed to PowerShell via an encoded command
-3. PowerShell loads `System.Speech`, sets up a dictation grammar, and calls `Recognize()` in a loop
-4. Recognised text is matched against wake phrase prefixes; a match writes to stdout
+3. PowerShell loads `System.Speech`, builds a `Choices`/`GrammarBuilder` grammar, and enters a synchronous `Recognize()` polling loop
+4. Each recognition result above the confidence threshold is written to stdout
 5. The extension reads stdout and fires the corresponding VS Code command
 6. On pause (handoff), the PowerShell process is killed to release the microphone
 7. On resume, a new PowerShell process starts
 
 Zero runtime npm dependencies. Zero model downloads. The speech engine ships with Windows.
+
+## Troubleshooting
+
+| Problem | Solution |
+| --- | --- |
+| "Wake Word currently supports Windows only" | The extension requires Windows 10 or later. macOS and Linux support is planned. |
+| Engine starts but never detects phrases | Try lowering `wakeWord.confidenceThreshold` (e.g. `0.2`). Speak clearly and close to your microphone. |
+| Too many false positives | Raise `wakeWord.confidenceThreshold` (e.g. `0.5` or higher). Use longer, more distinctive wake phrases. |
+| "Failed to start speech engine" | Ensure your microphone is connected and not in use by another application. Check Windows sound settings. |
+| Status bar shows "Wake: Error" | Click the status bar item to retry. Check the Output panel for details. If the error persists, try **Wake Word: Reset Microphone Consent** and re-enable. |
+| Extension keeps restarting | The engine retries up to 3 times on crash with increasing delays. If it fails after 3 retries, check that your audio device is working. |
 
 ## Privacy
 

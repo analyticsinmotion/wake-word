@@ -30,7 +30,7 @@ Two source files. `extension.ts` owns all VS Code API interactions. `speechEngin
 
 ## Architecture
 
-The extension spawns a background PowerShell process using Windows `System.Speech.Recognition`. The process writes `READY` and `DETECTED:<phrase>` to stdout. The extension reads stdout, matches phrases, and fires VS Code commands.
+The extension spawns a background PowerShell process using Windows `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. The process communicates via stdout using four protocols: `READY`, `DETECTED:<phrase>`, `ERROR:<message>`, and `DEBUG:<info>`. The extension reads stdout, matches phrases, and fires VS Code commands.
 
 On wake word detection, the PowerShell process is killed to release the microphone (handoff), then respawned after a cooldown. This ensures only one thing uses the mic at a time.
 
