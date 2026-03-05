@@ -24,6 +24,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] - 2026-03-05
+
+### Added
+
+- Configurable confidence threshold (`wakeWord.confidenceThreshold`) — adjustable from 0.1 to 0.9 with safe clamping.
+- Automatic retry with exponential backoff when the speech engine crashes (up to 3 retries at 2s, 5s, 10s delays).
+- Non-Windows activation guard: commands register as stubs with an informational message on macOS/Linux.
+- Troubleshooting section in README with common problems and solutions.
+- `npm run lint` step added to the release CI workflow.
+
+### Changed
+
+- Speech engine switched from async `RecognizeAsync()` to synchronous `Recognize()` polling loop. The async approach crashed with exit code 2 when spawned from the VS Code extension host.
+- Error reporting from the PowerShell script now uses stdout (`ERROR:` prefix) instead of stderr to avoid PowerShell CLIXML wrapping issues.
+
+### Fixed
+
+- Grammar construction: each wake phrase is now added individually to `Choices` via a `foreach` loop instead of passing the array directly. The previous approach created a sequence grammar (all phrases as one utterance) instead of alternatives.
+- `deactivate()` no longer crashes on non-Windows platforms where `speechEngine` is not initialized.
+
+---
+
 ## [0.1.1] - 2026-03-05
 
 ### Added
