@@ -1,6 +1,30 @@
-# Wake Word - Voice Activation for VS Code
+<!-- markdownlint-disable MD033 MD041 -->
 
-Hands-free voice activation for VS Code. Say a wake phrase and the right AI assistant opens -- no clicking required.
+<h1 align="center">
+  <br>
+  <img src="icon.png" width="96" height="96" alt="Wake Word icon">
+  <br>
+  Wake Word
+</h1>
+<h3 align="center">Voice Activation for VS Code</h3>
+
+<!-- badges: start -->
+<div align="center">
+  <table>
+    <tr>
+      <td><strong>Meta</strong></td>
+      <td>
+        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/v/analytics-in-motion.wake-word?label=Marketplace&color=blue" alt="VS Code Marketplace version"></a>&nbsp;
+        <a href="https://open-vsx.org/extension/analytics-in-motion/wake-word"><img src="https://img.shields.io/open-vsx/v/analytics-in-motion/wake-word?label=Open%20VSX&color=blue" alt="Open VSX version"></a>&nbsp;
+        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/i/analytics-in-motion.wake-word?label=Installs&color=blue" alt="VS Code Marketplace installs"></a>&nbsp;
+        <a href="https://github.com/analyticsinmotion/wake-word/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0 License"></a>&nbsp;
+      </td>
+    </tr>
+  </table>
+</div>
+<!-- badges: end -->
+
+Say a wake phrase and the right AI assistant opens -- no clicking required.
 
 Say **"Hey Claude"** and Claude opens. Say **"Hey Copilot"** and Copilot opens. Say **"Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
 
@@ -173,29 +197,6 @@ All speech recognition runs locally via Windows built-in `System.Speech.Recognit
 | Cursor | Open VSX or .vsix from GitHub Releases |
 | Windsurf | Open VSX or .vsix from GitHub Releases |
 | Other VS Code forks | .vsix from GitHub Releases |
-
-## Development
-
-```bash
-git clone https://github.com/analyticsinmotion/wake-word.git
-cd wake-word
-npm install
-npm run compile
-# Press F5 in VS Code to launch the extension in a dev host
-```
-
-### Publishing
-
-Automated via GitHub Actions. Create a release on GitHub and the workflow will:
-
-1. Build and package a `.vsix` file (attached to the release)
-2. Publish to the VS Code Marketplace
-3. Publish to the Open VSX Registry
-
-Required repository secrets:
-
-- `VSCE_PAT` -- VS Code Marketplace token ([create here](https://dev.azure.com))
-- `OVSX_PAT` -- Open VSX token ([create here](https://open-vsx.org))
 
 ## License
 

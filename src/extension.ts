@@ -224,13 +224,14 @@ async function onWakeWordDetected(phrase: WakePhrase) {
   // Fire the target command
   try {
     await vscode.commands.executeCommand(phrase.command);
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error(
       `[Wake Word] Failed to execute command "${phrase.command}":`,
       err
     );
+    const message = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(
-      `Wake Word: Could not execute "${phrase.command}" -- ${err.message}`
+      `Wake Word: Could not execute "${phrase.command}" -- ${message}`
     );
     resumeListening();
     return;
