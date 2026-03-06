@@ -34,7 +34,7 @@
       <td><strong>Meta</strong></td>
       <td>
         <a href="https://github.com/analyticsinmotion/wake-word/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0 License"></a>&nbsp;
-        <a href="https://github.com/analyticsinmotion"><img src="https://raw.githubusercontent.com/analyticsinmotion/.github/main/assets/images/analytics-in-motion-github-badge-rounded.svg" alt="Analytics in Motion"></a>&nbsp;
+        <a href="https://github.com/analyticsinmotion"><img src="https://github.com/user-attachments/assets/55c46a58-dd89-4c45-a753-201ba11afd13" alt="Analytics in Motion"></a>&nbsp;
       </td>
     </tr>
     <tr>
