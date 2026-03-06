@@ -73,12 +73,29 @@
                 "description": "Human-readable name shown in notifications (e.g. \"Claude\")"
               },
               "phrase": {
-                "type": "string",
-                "description": "The spoken phrase to listen for, in plain English (e.g. \"hey claude\")"
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "description": "A single spoken phrase to listen for (e.g. \"hey claude\")"
+                  },
+                  {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Multiple phrases that trigger the same command (e.g. [\"hey claude\", \"open claude\"])"
+                  }
+                ],
+                "description": "Spoken phrase(s) to listen for. Use a string for one phrase or an array for multiple aliases."
               },
               "command": {
                 "type": "string",
                 "description": "VS Code command ID to execute (e.g. \"workbench.action.chat.open\")"
+              },
+              "cooldownSeconds": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 300,
+                "description": "Override the global cooldown for this route (seconds). Falls back to wakeWord.cooldownSeconds if not set."
               }
             }
           }
@@ -100,6 +117,11 @@
           "default": true,
           "description": "Show a brief notification when a wake phrase is detected."
         },
+        "wakeWord.pauseOnFocusLoss": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pause wake word listening when VS Code loses focus and resume when it regains focus."
+        },
         "wakeWord.confidenceThreshold": {
           "type": "number",
           "default": 0.3,
@@ -114,7 +136,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts",
+    "lint": "eslint src --ext ts && node scripts/check-readme.js",
     "package": "vsce package",
     "publish:vscode": "vsce publish",
     "publish:openvsx": "ovsx publish",
