@@ -8,19 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
-
-### Added
-<!-- Add new features here -->
-
-### Changed
-<!-- Add changed behavior here -->
+## [0.2.1] - 2026-03-06
 
 ### Fixed
-<!-- Add bug fixes here -->
 
-### Removed
-<!-- Add removals/deprecations here -->
+- Consent flow now uses `try-finally` to ensure `isStarting` flag is always reset, even if the dialog throws.
+- Removed duplicate `isActive` state tracking in favour of `speechEngine.isListening`.
+- `pause()` now clears pending retry timers to prevent unexpected restarts during mic handoff.
+- `resume()` resets the retry counter so a fresh session gets the full 3 retries.
+- `killProcess()` now removes all process listeners before nulling the reference, preventing listener accumulation across crash/retry cycles.
 
 ---
 
@@ -100,5 +96,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auto-start on VS Code launch (after consent).
 - Windows 10/11 supported; macOS and Linux planned for a future release.
 - Published to VS Code Marketplace and Open VSX Registry.
+
+---
+
+## [Unreleased]
+
+### Added
+<!-- Add new features here -->
+
+### Changed
+<!-- Add changed behavior here -->
+
+### Fixed
+<!-- Add bug fixes here -->
+
+### Removed
+<!-- Add removals/deprecations here -->
 
 ---

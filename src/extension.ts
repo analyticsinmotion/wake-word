@@ -4,7 +4,6 @@ import { SpeechEngine, WakePhrase } from "./speechEngine";
 let statusBarItem: vscode.StatusBarItem;
 let resumeTimer: ReturnType<typeof setTimeout> | null = null;
 let speechEngine: SpeechEngine;
-let isActive = false;
 let isStarting = false;
 let isDevMode = false;
 
@@ -56,7 +55,6 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   speechEngine.on("started", () => {
-    isActive = true;
     setStatusBar("listening");
   });
 
@@ -65,7 +63,6 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   speechEngine.on("stopped", () => {
-    isActive = false;
     setStatusBar("off");
   });
 
@@ -80,7 +77,6 @@ export function activate(context: vscode.ExtensionContext) {
   speechEngine.on("error", (err: Error) => {
     console.error("[Wake Word]", err);
     vscode.window.showErrorMessage(`Wake Word error: ${err.message}`);
-    isActive = false;
     setStatusBar("error");
   });
 
@@ -103,7 +99,7 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand("wakeWord.disable", () => stopListening()),
     vscode.commands.registerCommand("wakeWord.toggle", () => {
-      if (isActive || speechEngine.isPaused) {
+      if (speechEngine.isListening || speechEngine.isPaused) {
         stopListening();
       } else {
         handleConsentThenStart(context);
@@ -131,7 +127,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("wakeWord.routes")) {
-        if (isActive) {
+        if (speechEngine.isListening) {
           stopListening();
           handleConsentThenStart(context);
         }
@@ -154,7 +150,7 @@ const CONSENT_KEY = "wakeWord.userConsented";
 async function handleConsentThenStart(
   context: vscode.ExtensionContext
 ): Promise<void> {
-  if (isActive || isStarting) {
+  if (speechEngine.isListening || isStarting) {
     return;
   }
 
@@ -167,27 +163,29 @@ async function handleConsentThenStart(
 
   isStarting = true;
 
-  const choice = await vscode.window.showWarningMessage(
-    "Wake Word uses your microphone to listen for wake phrases " +
-      "whenever VS Code is open. All audio is processed locally on " +
-      "your machine using Windows built-in speech recognition. " +
-      "Nothing is recorded or transmitted.\n\n" +
-      "When a wake phrase is detected, the microphone is released " +
-      "so the target assistant can use it. Wake word listening " +
-      "resumes automatically after a cooldown period.\n\n" +
-      "You can disable this at any time from the status bar.",
-    { modal: true },
-    "Allow Microphone Listening",
-    "Not Now"
-  );
+  try {
+    const choice = await vscode.window.showWarningMessage(
+      "Wake Word uses your microphone to listen for wake phrases " +
+        "whenever VS Code is open. All audio is processed locally on " +
+        "your machine using Windows built-in speech recognition. " +
+        "Nothing is recorded or transmitted.\n\n" +
+        "When a wake phrase is detected, the microphone is released " +
+        "so the target assistant can use it. Wake word listening " +
+        "resumes automatically after a cooldown period.\n\n" +
+        "You can disable this at any time from the status bar.",
+      { modal: true },
+      "Allow Microphone Listening",
+      "Not Now"
+    );
 
-  isStarting = false;
-
-  if (choice === "Allow Microphone Listening") {
-    await context.globalState.update(CONSENT_KEY, true);
-    startListening();
-  } else {
-    setStatusBar("off");
+    if (choice === "Allow Microphone Listening") {
+      await context.globalState.update(CONSENT_KEY, true);
+      startListening();
+    } else {
+      setStatusBar("off");
+    }
+  } finally {
+    isStarting = false;
   }
 }
 
@@ -211,7 +209,6 @@ function startListening() {
 function stopListening() {
   clearResumeTimer();
   speechEngine.stop();
-  isActive = false;
   setStatusBar("off");
 }
 

@@ -184,6 +184,7 @@ export class SpeechEngine extends EventEmitter {
     }
 
     this._isPaused = true;
+    this.clearRetryTimer();
     this.killProcess();
     this._isListening = false;
     this.emit("paused");
@@ -197,6 +198,7 @@ export class SpeechEngine extends EventEmitter {
     // Don't clear _isPaused here — start() will clear it via the
     // "started" event when the engine is actually ready. If start()
     // fails, we remain in the paused state.
+    this.retryCount = 0;
     this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
   }
 
@@ -227,6 +229,9 @@ export class SpeechEngine extends EventEmitter {
   private killProcess(): void {
     if (this.process) {
       this._killedIntentionally = true;
+      this.process.stdout?.removeAllListeners();
+      this.process.stderr?.removeAllListeners();
+      this.process.removeAllListeners();
       try {
         this.process.kill();
       } catch {
