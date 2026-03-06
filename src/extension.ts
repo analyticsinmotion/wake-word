@@ -2,10 +2,12 @@ import * as vscode from "vscode";
 import { SpeechEngine, WakePhrase } from "./speechEngine";
 
 let statusBarItem: vscode.StatusBarItem;
+let outputChannel: vscode.OutputChannel;
 let resumeTimer: ReturnType<typeof setTimeout> | null = null;
 let speechEngine: SpeechEngine;
 let isStarting = false;
 let isDevMode = false;
+let isPausedByFocus = false;
 
 // ── Default routes ──────────────────────────────────────────
 
@@ -47,11 +49,14 @@ export function activate(context: vscode.ExtensionContext) {
     return;
   }
 
+  outputChannel = vscode.window.createOutputChannel("Wake Word");
+  context.subscriptions.push(outputChannel);
+
   speechEngine = new SpeechEngine();
 
   // Wire up events from the speech engine
-  speechEngine.on("detected", (phrase: WakePhrase) => {
-    onWakeWordDetected(phrase);
+  speechEngine.on("detected", (phrase: WakePhrase, confidence: number) => {
+    onWakeWordDetected(phrase, confidence);
   });
 
   speechEngine.on("started", () => {
@@ -67,16 +72,23 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   speechEngine.on("debug", (info: string) => {
-    console.log("[Wake Word] Speech:", info);
+    log("info", info);
   });
 
   speechEngine.on("warning", (msg: string) => {
-    console.warn("[Wake Word]", msg);
+    log("warn", msg);
   });
 
   speechEngine.on("error", (err: Error) => {
-    console.error("[Wake Word]", err);
-    vscode.window.showErrorMessage(`Wake Word error: ${err.message}`);
+    log("error", err.message);
+    vscode.window.showErrorMessage(
+      `Wake Word error: ${err.message}`,
+      "Show Log"
+    ).then((choice) => {
+      if (choice === "Show Log") {
+        outputChannel.show();
+      }
+    });
     setStatusBar("error");
   });
 
@@ -131,6 +143,26 @@ export function activate(context: vscode.ExtensionContext) {
           stopListening();
           handleConsentThenStart(context);
         }
+      }
+    })
+  );
+
+  // Pause when VS Code loses focus (opt-in)
+  context.subscriptions.push(
+    vscode.window.onDidChangeWindowState((state) => {
+      const config = vscode.workspace.getConfiguration("wakeWord");
+      if (!config.get<boolean>("pauseOnFocusLoss", false)) {
+        return;
+      }
+
+      if (!state.focused && speechEngine.isListening) {
+        isPausedByFocus = true;
+        speechEngine.pause();
+        log("info", "Paused: window lost focus");
+      } else if (state.focused && isPausedByFocus) {
+        isPausedByFocus = false;
+        speechEngine.resume();
+        log("info", "Resumed: window regained focus");
       }
     })
   );
@@ -189,6 +221,17 @@ async function handleConsentThenStart(
   }
 }
 
+// ── Logging ──────────────────────────────────────────────────
+
+function log(level: "info" | "warn" | "error", message: string) {
+  const timestamp = new Date().toISOString().substring(11, 23);
+  const line = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
+  outputChannel.appendLine(line);
+  if (isDevMode) {
+    console.log("[Wake Word]", line);
+  }
+}
+
 // ── Core logic ──────────────────────────────────────────────
 
 function startListening() {
@@ -203,11 +246,14 @@ function startListening() {
   }
 
   const threshold = config.get<number>("confidenceThreshold", 0.3);
+  log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}`);
+  log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
   speechEngine.start(routes, threshold, isDevMode);
 }
 
 function stopListening() {
   clearResumeTimer();
+  isPausedByFocus = false;
   speechEngine.stop();
   setStatusBar("off");
 }
@@ -217,9 +263,10 @@ function stopListening() {
 function buildRoutes(config: vscode.WorkspaceConfiguration): WakePhrase[] {
   const userRoutes = config.get<WakePhrase[]>("routes", []);
 
-  const validRoutes = userRoutes.filter(
-    (r) => r.phrase?.trim() && r.label?.trim() && r.command?.trim()
-  );
+  const validRoutes = userRoutes.filter((r) => {
+    const phrases = Array.isArray(r.phrase) ? r.phrase : [r.phrase];
+    return phrases.some((p) => p?.trim()) && r.label?.trim() && r.command?.trim();
+  });
 
   if (validRoutes.length > 0) {
     return validRoutes;
@@ -230,13 +277,16 @@ function buildRoutes(config: vscode.WorkspaceConfiguration): WakePhrase[] {
 
 // ── Wake word triggered ─────────────────────────────────────
 
-async function onWakeWordDetected(phrase: WakePhrase) {
+async function onWakeWordDetected(phrase: WakePhrase, confidence: number) {
+  log("info", `Detected: "${phrase.label}" (confidence: ${confidence.toFixed(2)})`);
+
   const config = vscode.workspace.getConfiguration("wakeWord");
   const showNotification = config.get<boolean>(
     "showNotificationOnDetection",
     true
   );
-  const cooldownSeconds = config.get<number>("cooldownSeconds", 30);
+  const globalCooldown = config.get<number>("cooldownSeconds", 30);
+  const cooldownSeconds = phrase.cooldownSeconds ?? globalCooldown;
 
   if (showNotification) {
     vscode.window.showInformationMessage(
