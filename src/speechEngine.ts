@@ -4,8 +4,9 @@ import * as os from "os";
 
 export interface WakePhrase {
   label: string;
-  phrase: string;
+  phrase: string | string[];
   command: string;
+  cooldownSeconds?: number;
 }
 
 /**
@@ -63,7 +64,7 @@ export class SpeechEngine extends EventEmitter {
     const safeThreshold = Math.max(0.1, Math.min(0.9, Number(confidenceThreshold) || 0.3));
     this.currentThreshold = safeThreshold;
     this.currentDebugMode = debugMode;
-    const phraseStrings = phrases.map((p) => p.phrase.toLowerCase().trim());
+    const phraseStrings = phrases.flatMap((p) => SpeechEngine.normalizePhrases(p.phrase));
     const script = this.buildScript(phraseStrings, safeThreshold, debugMode);
     const encoded = Buffer.from(script, "utf16le").toString("base64");
 
@@ -96,12 +97,15 @@ export class SpeechEngine extends EventEmitter {
         } else if (trimmed.startsWith("ERROR:")) {
           this.emit("error", new Error(trimmed.substring(6)));
         } else if (trimmed.startsWith("DETECTED:")) {
-          const detected = trimmed.substring(9).toLowerCase().trim();
-          const match = phrases.find(
-            (p) => p.phrase.toLowerCase().trim() === detected
+          const payload = trimmed.substring(9);
+          const sepIndex = payload.lastIndexOf("|");
+          const detected = (sepIndex >= 0 ? payload.substring(0, sepIndex) : payload).toLowerCase().trim();
+          const confidence = sepIndex >= 0 ? parseFloat(payload.substring(sepIndex + 1)) : 0;
+          const match = phrases.find((p) =>
+            SpeechEngine.normalizePhrases(p.phrase).includes(detected)
           );
           if (match) {
-            this.emit("detected", match);
+            this.emit("detected", match, isNaN(confidence) ? 0 : confidence);
           }
         }
       }
@@ -208,6 +212,11 @@ export class SpeechEngine extends EventEmitter {
     this.removeAllListeners();
   }
 
+  static normalizePhrases(phrase: string | string[]): string[] {
+    const arr = Array.isArray(phrase) ? phrase : [phrase];
+    return arr.map((p) => p.toLowerCase().trim()).filter((p) => p.length > 0);
+  }
+
   private parseStderr(raw: string): string {
     // Extract error text from PowerShell CLIXML wrapper
     const match = raw.match(/<S S="Error">(.+?)<\/S>/s);
@@ -272,7 +281,7 @@ try {
             [Console]::Out.WriteLine("DEBUG:" + $result.Text + "|" + $result.Confidence)
             [Console]::Out.Flush()` : ""}
             if ($result.Confidence -ge ${confidenceThreshold}) {
-                [Console]::Out.WriteLine("DETECTED:" + $result.Text.ToLower())
+                [Console]::Out.WriteLine("DETECTED:" + $result.Text.ToLower() + "|" + $result.Confidence)
                 [Console]::Out.Flush()
             }
         }

@@ -6,6 +6,7 @@ node_modules/**
 .gitignore
 tsconfig.json
 AGENTS.md
+scripts/**
 test-*.js
 **/*.ts
 **/*.map

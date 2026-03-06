@@ -148,6 +148,31 @@ Add your own phrases in `settings.json`. Any spoken English phrase works:
 
 The speech engine uses a constrained grammar built from your configured phrases for accurate matching.
 
+### Phrase aliases
+
+The `phrase` field accepts a string or an array of strings. Use arrays to map multiple trigger phrases to the same command:
+
+```json
+{
+  "label": "Claude",
+  "phrase": ["hey claude", "open claude"],
+  "command": "claude-vscode.focus"
+}
+```
+
+### Per-route cooldown
+
+Override the global cooldown for individual routes with `cooldownSeconds`:
+
+```json
+{
+  "label": "Terminal",
+  "phrase": "computer",
+  "command": "workbench.action.terminal.focus",
+  "cooldownSeconds": 10
+}
+```
+
 ### The handoff
 
 When a wake phrase is detected:
@@ -168,6 +193,7 @@ This ensures only one thing uses the mic at a time.
 | `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming |
 | `wakeWord.enableOnStartup` | `true` | Start listening when VS Code opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
+| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when VS Code loses focus, resume on regain |
 | `wakeWord.confidenceThreshold` | `0.3` | Minimum confidence score (0.1–0.9) for wake phrase detection |
 
 ## Commands
@@ -201,7 +227,7 @@ The process flow:
 1. Extension builds a constrained grammar from the configured wake phrases
 2. The recognition script is passed to PowerShell via an encoded command
 3. PowerShell loads `System.Speech`, builds a `Choices`/`GrammarBuilder` grammar, and enters a synchronous `Recognize()` polling loop
-4. Each recognition result above the confidence threshold is written to stdout
+4. Each recognition result above the confidence threshold is written to stdout as `DETECTED:<phrase>|<confidence>`
 5. The extension reads stdout and fires the corresponding VS Code command
 6. On pause (handoff), the PowerShell process is killed to release the microphone
 7. On resume, a new PowerShell process starts

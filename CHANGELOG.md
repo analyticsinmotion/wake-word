@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-03-06
+
+### Added
+
+- Dedicated "Wake Word" output channel in the Output panel for all logging (debug, warnings, errors, detections).
+- Startup diagnostics logged automatically: route count, threshold, OS, VS Code version.
+- "Show Log" action on error toasts — opens the output channel directly.
+- Dual logging: output channel always, debug console when running via F5 (dev mode).
+- Pause on focus loss (`wakeWord.pauseOnFocusLoss`) — pauses listening when VS Code loses focus, resumes on regain. Off by default.
+- Phrase aliases: `phrase` field now accepts a string or array of strings, mapping multiple trigger phrases to one command.
+- Per-route cooldown: optional `cooldownSeconds` on each route entry, overrides the global setting.
+- SVG guard in `npm run lint` — catches blocked SVG references in README.md before commit.
+
+### Changed
+
+- Speech engine protocol: `DETECTED:<phrase>` now includes confidence as `DETECTED:<phrase>|<confidence>`.
+- `npm run lint` now also runs `scripts/check-readme.js` to catch vsce-blocked SVGs.
+
+---
+
 ## [0.2.1] - 2026-03-06
 
 ### Fixed
