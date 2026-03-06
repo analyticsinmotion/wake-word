@@ -6,7 +6,7 @@
 npm install                # Install dependencies
 npm run compile            # Build TypeScript to dist/
 npm run watch              # Build in watch mode
-npm run lint               # Run ESLint (report only). Do not use --fix.
+npm run lint               # Run ESLint + SVG check on README.md. Do not use --fix.
 npm run package            # Build .vsix package
 ```
 
@@ -21,6 +21,8 @@ wake-word/
   src/
     extension.ts       # VS Code extension entry point, commands, status bar, consent flow
     speechEngine.ts    # SpeechEngine class, spawns PowerShell, manages mic lifecycle
+  scripts/
+    check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
   dist/                # Compiled JS output (do not edit)
   .github/workflows/
     release.yml        # CI: build .vsix, publish to Marketplace and Open VSX
@@ -30,7 +32,7 @@ Two source files. `extension.ts` owns all VS Code API interactions. `speechEngin
 
 ## Architecture
 
-The extension spawns a background PowerShell process using Windows `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. The process communicates via stdout using four protocols: `READY`, `DETECTED:<phrase>`, `ERROR:<message>`, and `DEBUG:<info>`. The extension reads stdout, matches phrases, and fires VS Code commands.
+The extension spawns a background PowerShell process using Windows `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. The process communicates via stdout using four protocols: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, and `DEBUG:<info>`. The extension reads stdout, matches phrases, and fires VS Code commands. All events are logged to a dedicated "Wake Word" output channel.
 
 On wake word detection, the PowerShell process is killed to release the microphone (handoff), then respawned after a cooldown. This ensures only one thing uses the mic at a time.
 
@@ -72,6 +74,7 @@ Manual testing checklist:
 5. Status bar transitions to "Wake: Active" during handoff
 6. Status bar returns to "Wake: Listening" after cooldown
 7. Toggle, enable, disable, and reset consent commands all work
+8. Output panel shows "Wake Word" channel with timestamped logs
 
 ## Boundaries
 
