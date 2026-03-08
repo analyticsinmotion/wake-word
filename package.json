@@ -1,7 +1,7 @@
 {
   "name": "wake-word",
   "displayName": "Wake Word",
-  "description": "Voice control for VS Code with customizable wake word. Fully local, zero config.",
+  "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
   "version": "0.4.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
@@ -59,7 +59,7 @@
         "wakeWord.routes": {
           "type": "array",
           "default": [],
-          "description": "Wake phrase routing table. Each entry maps a spoken phrase to a VS Code command. If empty, default routes are used (Hey Copilot, Hey Claude, Computer).",
+          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Copilot, Hey Claude, Computer).",
           "items": {
             "type": "object",
             "required": [
@@ -89,7 +89,7 @@
               },
               "command": {
                 "type": "string",
-                "description": "VS Code command ID to execute (e.g. \"workbench.action.chat.open\")"
+                "description": "Command ID to execute (e.g. \"workbench.action.chat.open\")"
               },
               "cooldownSeconds": {
                 "type": "number",
@@ -110,7 +110,7 @@
         "wakeWord.enableOnStartup": {
           "type": "boolean",
           "default": true,
-          "description": "Start listening automatically when VS Code opens."
+          "description": "Start listening automatically when the editor opens."
         },
         "wakeWord.showNotificationOnDetection": {
           "type": "boolean",
@@ -120,7 +120,7 @@
         "wakeWord.pauseOnFocusLoss": {
           "type": "boolean",
           "default": false,
-          "description": "Pause wake word listening when VS Code loses focus and resume when it regains focus."
+          "description": "Pause wake word listening when the editor loses focus and resume when it regains focus."
         },
         "wakeWord.confidenceThreshold": {
           "type": "number",

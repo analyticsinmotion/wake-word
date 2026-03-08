@@ -6,7 +6,7 @@
   <br>
   Wake Word
 </h1>
-<h3 align="center">Voice Activation for VS Code</h3>
+<h3 align="center">Voice Activation for Code Editors</h3>
 
 <!-- badges: start -->
 <!--
@@ -90,7 +90,7 @@ All audio processing happens locally on your machine using Windows built-in spee
 ## How It Works
 
 1. Install the extension -- that's it, no other setup
-2. When VS Code opens, the extension starts listening on your microphone via Windows speech recognition
+2. When your editor opens, the extension starts listening on your microphone via Windows speech recognition
 3. The speech engine uses a constrained grammar to match recognised speech against your configured wake phrases
 4. If a phrase is detected with sufficient confidence, the extension **releases the mic** and fires the mapped command
 5. The target assistant (Claude, Copilot, etc.) takes over the microphone with no contention
@@ -102,7 +102,7 @@ All audio processing happens locally on your machine using Windows built-in spee
 
 Install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word).
 
-Or from the command line:
+Or from the command line (VS Code only):
 
 ```bash
 code --install-extension analytics-in-motion.wake-word
@@ -216,9 +216,9 @@ This ensures only one thing uses the mic at a time.
 | --- | --- | --- |
 | `wakeWord.routes` | `[]` | Wake phrase routing table. Uses defaults if empty. |
 | `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming |
-| `wakeWord.enableOnStartup` | `true` | Start listening when VS Code opens |
+| `wakeWord.enableOnStartup` | `true` | Start listening when the editor opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
-| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when VS Code loses focus, resume on regain |
+| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, resume on regain |
 | `wakeWord.confidenceThreshold` | `0.3` | Minimum confidence score (0.1–0.9) for wake phrase detection |
 
 ## Commands
@@ -230,7 +230,7 @@ This ensures only one thing uses the mic at a time.
 
 ## Common command IDs
 
-Useful values for the `command` field in your routes:
+Useful values for the `command` field in your routes. Command IDs listed are for VS Code — Cursor and other editors may use different IDs for the same features.
 
 | Assistant / Feature | Command ID |
 | --- | --- |
