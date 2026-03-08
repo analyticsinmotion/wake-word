@@ -3,7 +3,8 @@ import { SpeechEngine, WakePhrase } from "./speechEngine";
 
 let statusBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
-let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+let countdownTimer: ReturnType<typeof setInterval> | null = null;
+let countdownRemaining = 0;
 let speechEngine: SpeechEngine;
 let isStarting = false;
 let isDevMode = false;
@@ -321,11 +322,27 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence: number) {
 
 function scheduleResume(seconds: number) {
   clearResumeTimer();
+  countdownRemaining = seconds;
 
-  resumeTimer = setTimeout(() => {
-    resumeTimer = null;
-    resumeListening();
-  }, seconds * 1000);
+  statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
+  statusBarItem.tooltip = "Mic handed off to assistant. Resuming soon.";
+  statusBarItem.backgroundColor = new vscode.ThemeColor(
+    "statusBarItem.warningBackground"
+  );
+
+  countdownTimer = setInterval(() => {
+    countdownRemaining--;
+
+    if (countdownRemaining <= 0) {
+      clearResumeTimer();
+      resumeListening();
+      log("info", "Resumed: cooldown expired");
+    } else {
+      statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
+    }
+  }, 1000);
+
+  log("info", `Cooldown: ${seconds}s`);
 }
 
 function resumeListening() {
@@ -334,10 +351,11 @@ function resumeListening() {
 }
 
 function clearResumeTimer() {
-  if (resumeTimer) {
-    clearTimeout(resumeTimer);
-    resumeTimer = null;
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
   }
+  countdownRemaining = 0;
 }
 
 // ── Status bar ──────────────────────────────────────────────
