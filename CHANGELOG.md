@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-03-08
+
+### Added
+
+- Status bar countdown during cooldown: after a wake phrase fires, the status bar shows a live second-by-second countdown (`Wake: 30s → Wake: 29s → ...`) instead of a static "Wake: Active" message. Gives clear feedback on how long until listening resumes.
+
+### Changed
+
+- Countdown uses a clock icon (`$(clock)`) rather than the spinning sync icon. The spinning icon reset its CSS animation every second when the status bar text was updated, causing a visible jerk. The clock icon is static and appropriate for a timed countdown.
+
+---
+
 ## [0.3.0] - 2026-03-06
 
 ### Added
