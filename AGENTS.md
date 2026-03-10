@@ -21,8 +21,8 @@ wake-word/
   src/
     extension.ts              # VS Code extension entry point, commands, status bar, consent flow
     speechEngineInterface.ts  # ISpeechEngine interface (implemented by both engines)
-    windowsSpeechEngine.ts    # WindowsSpeechEngine — spawns PowerShell, Windows System.Speech
-    sherpaEngine.ts           # SherpaEngine — spawns audio-engine.js under system Node.js
+    windowsSpeechEngine.ts    # WindowsSpeechEngine: PowerShell child process using Windows System.Speech
+    sherpaEngine.ts           # SherpaEngine: audio-engine.js child process under system Node.js
   engine/
     audio-engine.js           # Child process: micstream mic capture + sherpa-onnx keyword spotting
     package.json              # Engine dependencies (micstream, sherpa-onnx, sentencepiece-js)
@@ -33,7 +33,7 @@ wake-word/
     release.yml        # CI: build .vsix, publish to Marketplace and Open VSX
 ```
 
-`extension.ts` owns all VS Code API interactions. Both engines implement `ISpeechEngine` — `windowsSpeechEngine.ts` for Windows, `sherpaEngine.ts` for cross-platform. `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
+`extension.ts` owns all VS Code API interactions. Both engines implement `ISpeechEngine`: `windowsSpeechEngine.ts` (Windows) and `sherpaEngine.ts` (cross-platform). `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
 
 ## Architecture
 
@@ -54,6 +54,7 @@ On wake word detection, the engine process is killed to release the microphone (
 - All speech processing must remain local. No network calls for audio or recognition.
 - Use single-quoted strings in generated PowerShell to prevent injection. Never use double-quoted strings for user-provided phrases.
 - Keep the extension under the `analytics-in-motion` publisher namespace.
+- Avoid em dashes. Rewrite sentences to use a colon, semicolon, or separate sentence instead.
 
 ## Changelog
 
@@ -84,8 +85,8 @@ Manual testing checklist:
 6. Status bar returns to "Wake: Listening" after cooldown; target command fired correctly
 7. Toggle, enable, disable, and reset consent commands all work
 8. Output panel shows "Wake Word" channel with timestamped logs
-9. Change `wakeWord.engine` in Settings while listening — engine restarts immediately, engine indicator updates
-10. Change `wakeWord.engine` during cooldown — countdown continues, new engine starts when it expires
+9. Change `wakeWord.engine` in Settings while listening. Confirm engine restarts immediately and engine indicator updates.
+10. Change `wakeWord.engine` during cooldown. Confirm countdown continues and the new engine starts when it expires.
 
 ## Boundaries
 
@@ -94,6 +95,8 @@ Manual testing checklist:
 **NEVER** send audio data over the network. All recognition is local.
 
 **NEVER** use PowerShell double-quoted strings for user-provided content (injection risk).
+
+**NEVER** add `darwin-x64` as a CI build target. Intel Mac (pre-2020) is excluded: the `macos-13` GitHub Actions runner has uncertain long-term availability, and `@analyticsinmotion/micstream` darwin-x64 pre-built binaries are unconfirmed. Revisit only if a darwin-x64 user files an issue with confirmed binary support.
 
 **NEVER** modify the ATTRIBUTION.md protocol frontmatter without explicit instruction.
 
