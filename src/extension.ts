@@ -13,6 +13,8 @@ let speechEngine: ISpeechEngine;
 let isStarting = false;
 let isDevMode = false;
 let isPausedByFocus = false;
+let lastDetectionTime = 0;
+const DETECTION_DEBOUNCE_MS = 3000;
 
 // ── Default routes ──────────────────────────────────────────
 
@@ -155,6 +157,7 @@ export function activate(context: vscode.ExtensionContext) {
         const wasListening = speechEngine.isListening;
         const cooldownActive = countdownTimer !== null;
         isPausedByFocus = false;
+        lastDetectionTime = 0;
         speechEngine.dispose();
         speechEngine = createEngine(context);
         wireEngine(speechEngine);
@@ -281,6 +284,7 @@ function startListening() {
 function stopListening() {
   clearResumeTimer();
   isPausedByFocus = false;
+  lastDetectionTime = 0;
   speechEngine.stop();
   setStatusBar("off");
 }
@@ -305,6 +309,13 @@ function buildRoutes(config: vscode.WorkspaceConfiguration): WakePhrase[] {
 // ── Wake word triggered ─────────────────────────────────────
 
 async function onWakeWordDetected(phrase: WakePhrase, confidence: number) {
+  const now = Date.now();
+  if (now - lastDetectionTime < DETECTION_DEBOUNCE_MS) {
+    log("info", `Debounced duplicate detection: ${phrase.label}`);
+    return;
+  }
+  lastDetectionTime = now;
+
   log("info", `Detected: "${phrase.label}" (confidence: ${confidence.toFixed(2)})`);
 
   const config = vscode.workspace.getConfiguration("wakeWord");
@@ -373,6 +384,7 @@ function scheduleResume(seconds: number) {
 
 function resumeListening() {
   clearResumeTimer();
+  lastDetectionTime = 0;
   if (speechEngine.isPaused) {
     speechEngine.resume();
   } else {

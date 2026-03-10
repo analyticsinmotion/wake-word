@@ -6,7 +6,21 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: win32-x64
+            lint: true
+          - os: macos-latest
+            target: darwin-arm64
+            lint: false
+          - os: ubuntu-latest
+            target: linux-x64
+            lint: false
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -16,28 +30,33 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run lint
+      - name: Install engine dependencies
+        run: cd engine && npm install
 
-      - run: npm run compile
+      - name: Lint and compile
+        if: matrix.lint
+        run: |
+          npm run lint
+          npm run compile
 
-      # Build .vsix package
+      # Build platform-specific .vsix package
       - name: Package extension
-        run: npx vsce package -o wake-word-${{ github.event.release.tag_name }}.vsix
+        run: npx vsce package --target ${{ matrix.target }} -o wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix
 
       # Attach .vsix to the GitHub release
       - name: Upload .vsix to release
         uses: softprops/action-gh-release@v1
         with:
-          files: wake-word-${{ github.event.release.tag_name }}.vsix
+          files: wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Publish to VS Code Marketplace
       - name: Publish to VS Code Marketplace
-        run: npx vsce publish
+        run: npx vsce publish --target ${{ matrix.target }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
       # Publish to Open VSX Registry
       - name: Publish to Open VSX
-        run: npx ovsx publish -p ${{ secrets.OVSX_PAT }}
+        run: npx ovsx publish wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix -p ${{ secrets.OVSX_PAT }}

@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-03-10
+
+### Fixed
+
+- Native engine dependencies (`sherpa-onnx`, `micstream`, `sentencepiece-js`) are now correctly bundled in the published `.vsix`. The v0.4.0 CI build omitted `engine/node_modules` because it was gitignored and never installed in CI. SherpaEngine failed with MODULE_NOT_FOUND on all platforms. Fixed by adding `cd engine && npm install` to each CI job before packaging.
+- Duplicate wake phrase detections within 3 seconds are now suppressed. A buffered `DETECTED` message could arrive on stdout after the engine process was killed, causing a second command to fire.
+
+### Changed
+
+- Release CI now produces platform-specific `.vsix` files (`win32-x64`, `darwin-arm64`, `linux-x64`), each containing the correct native audio binaries for that platform.
+
+---
+
 ## [0.4.0] - 2026-03-10
 
 ### Added

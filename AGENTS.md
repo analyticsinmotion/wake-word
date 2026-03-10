@@ -95,6 +95,8 @@ Manual testing checklist:
 
 **NEVER** use PowerShell double-quoted strings for user-provided content (injection risk).
 
+**NEVER** add `darwin-x64` as a CI build target. Intel Mac (pre-2020) is excluded: the `macos-13` GitHub Actions runner has uncertain long-term availability, and `@analyticsinmotion/micstream` darwin-x64 pre-built binaries are unconfirmed. Revisit only if a darwin-x64 user files an issue with confirmed binary support.
+
 **NEVER** modify the ATTRIBUTION.md protocol frontmatter without explicit instruction.
 
 ## Attribution
