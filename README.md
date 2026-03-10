@@ -6,7 +6,7 @@
   <br>
   Wake Word
 </h1>
-<h3 align="center">Voice Activation for VS Code</h3>
+<h3 align="center">Voice Activation for Code Editors</h3>
 
 <!-- badges: start -->
 <!--
@@ -83,15 +83,15 @@ Say a wake phrase and the right AI assistant opens -- no clicking required.
 
 Say **"Hey Claude"** and Claude opens. Say **"Hey Copilot"** and Copilot opens. Say **"Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
 
-**Zero config. No API keys. No accounts. No downloads. No system dependencies.** Install and go.
+**Zero config. No API keys. No accounts. No system dependencies.** Install and go.
 
-All audio processing happens locally on your machine using Windows built-in speech recognition. Nothing is recorded or transmitted.
+All audio processing happens locally on your machine. Nothing is recorded or transmitted.
 
 ## How It Works
 
-1. Install the extension -- that's it, no other setup
-2. When VS Code opens, the extension starts listening on your microphone via Windows speech recognition
-3. The speech engine uses a constrained grammar to match recognised speech against your configured wake phrases
+1. Install the extension. On Windows, that's all. On macOS/Linux, a local speech model (~17MB) is downloaded on first use and cached.
+2. When your editor opens, the extension starts listening on your microphone
+3. The speech engine matches recognised speech against your configured wake phrases
 4. If a phrase is detected with sufficient confidence, the extension **releases the mic** and fires the mapped command
 5. The target assistant (Claude, Copilot, etc.) takes over the microphone with no contention
 6. After a configurable cooldown, wake word listening resumes automatically
@@ -102,7 +102,7 @@ All audio processing happens locally on your machine using Windows built-in spee
 
 Install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word).
 
-Or from the command line:
+Or from the command line (VS Code only):
 
 ```bash
 code --install-extension analytics-in-motion.wake-word
@@ -116,9 +116,13 @@ code --install-extension analytics-in-motion.wake-word
 
 ### Prerequisites
 
-Windows 10 or later. The extension uses Windows built-in `System.Speech.Recognition` engine which ships with all modern Windows installations. No additional software is required.
+| Platform | Requirement |
+| --- | --- |
+| Windows 10/11 | No additional software. Uses built-in `System.Speech.Recognition` |
+| macOS | Node.js 18+ (for the speech engine child process) |
+| Linux | Node.js 18+ (for the speech engine child process) |
 
-macOS and Linux support is planned for a future release.
+On macOS and Linux a local speech model (~17MB) is downloaded on first use and cached. If Node.js is installed via nvm or fnm and not on VS Code's PATH, set `wakeWord.nodePath` to the full path of your `node` executable.
 
 ## First Run Consent
 
@@ -206,7 +210,7 @@ When a wake phrase is detected:
 2. The target VS Code command fires (opening the assistant)
 3. The assistant's voice mode takes over the microphone with no contention
 4. After `wakeWord.cooldownSeconds` (default: 30), wake word listening resumes
-5. Status bar shows "Wake: Active" during handoff, then returns to "Wake: Listening"
+5. Status bar shows a live countdown (`Wake: 30s → Wake: 29s → ...`) during handoff, then returns to "Wake: Listening"
 
 This ensures only one thing uses the mic at a time.
 
@@ -216,10 +220,12 @@ This ensures only one thing uses the mic at a time.
 | --- | --- | --- |
 | `wakeWord.routes` | `[]` | Wake phrase routing table. Uses defaults if empty. |
 | `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming |
-| `wakeWord.enableOnStartup` | `true` | Start listening when VS Code opens |
+| `wakeWord.enableOnStartup` | `true` | Start listening when the editor opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
-| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when VS Code loses focus, resume on regain |
+| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, resume on regain |
 | `wakeWord.confidenceThreshold` | `0.3` | Minimum confidence score (0.1–0.9) for wake phrase detection |
+| `wakeWord.engine` | `auto` | Speech engine: `auto` (platform default), `windows` (System.Speech), or `sherpa` (cross-platform) |
+| `wakeWord.nodePath` | `""` | Path to Node.js executable. Leave empty to auto-detect. Set this if the engine cannot find Node.js (macOS/Linux with nvm or fnm). |
 
 ## Commands
 
@@ -230,7 +236,7 @@ This ensures only one thing uses the mic at a time.
 
 ## Common command IDs
 
-Useful values for the `command` field in your routes:
+Useful values for the `command` field in your routes. Command IDs listed are for VS Code. Cursor and other editors may use different IDs for the same features.
 
 | Assistant / Feature | Command ID |
 | --- | --- |
@@ -245,42 +251,51 @@ Useful values for the `command` field in your routes:
 
 ## How It Works (Technical)
 
-The extension spawns a background PowerShell process that uses `System.Speech.Recognition.SpeechRecognitionEngine` to listen for wake phrases. This is the same speech engine built into Windows that powers Cortana and Windows Speech Recognition.
+The extension selects a speech engine based on platform (or the `wakeWord.engine` setting) and spawns it as a background child process. Both engines communicate via stdout using the same protocol: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, `DEBUG:<info>`.
 
-The process flow:
+### Windows engine (default on Windows)
 
-1. Extension builds a constrained grammar from the configured wake phrases
-2. The recognition script is passed to PowerShell via an encoded command
-3. PowerShell loads `System.Speech`, builds a `Choices`/`GrammarBuilder` grammar, and enters a synchronous `Recognize()` polling loop
-4. Each recognition result above the confidence threshold is written to stdout as `DETECTED:<phrase>|<confidence>`
-5. The extension reads stdout and fires the corresponding VS Code command
-6. On pause (handoff), the PowerShell process is killed to release the microphone
-7. On resume, a new PowerShell process starts
+Spawns a PowerShell process using `System.Speech.Recognition.SpeechRecognitionEngine`, the same engine built into Windows. A constrained grammar is built from your configured phrases and passed via encoded command. Zero model downloads; the speech engine ships with Windows.
 
-Zero runtime npm dependencies. Zero model downloads. The speech engine ships with Windows.
+### Sherpa engine (default on macOS/Linux, optional on Windows)
+
+Spawns `audio-engine.js` under **system Node.js** (not Electron). The child process uses `@analyticsinmotion/micstream` (PortAudio) for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use and cached.
+
+### Shared flow
+
+1. Extension builds phrase list and spawns the engine process
+2. Engine writes `READY` when the mic is open
+3. Each detection above the confidence threshold is written to stdout as `DETECTED:<phrase>|<confidence>`
+4. The extension reads stdout and fires the corresponding command
+5. On handoff, the engine process is killed to release the microphone
+6. After the cooldown countdown, a new engine process starts
+
+Zero runtime npm dependencies in the extension host. All native dependencies are isolated in the `engine/` child process.
 
 ## Troubleshooting
 
 | Problem | Solution |
 | --- | --- |
-| "Wake Word currently supports Windows only" | The extension requires Windows 10 or later. macOS and Linux support is planned. |
 | Engine starts but never detects phrases | Try lowering `wakeWord.confidenceThreshold` (e.g. `0.2`). Speak clearly and close to your microphone. |
 | Too many false positives | Raise `wakeWord.confidenceThreshold` (e.g. `0.5` or higher). Use longer, more distinctive wake phrases. |
-| "Failed to start speech engine" | Ensure your microphone is connected and not in use by another application. Check Windows sound settings. |
+| "Failed to start speech engine" | Ensure your microphone is connected and not in use by another application. Check your system sound settings. |
 | Status bar shows "Wake: Error" | Click the status bar item to retry. Check the Output panel for details. If the error persists, try **Wake Word: Reset Microphone Consent** and re-enable. |
 | Extension keeps restarting | The engine retries up to 3 times on crash with increasing delays. If it fails after 3 retries, check that your audio device is working. |
+| "Could not find Node.js" (macOS/Linux) | Set `wakeWord.nodePath` to the full path of your `node` executable (e.g. `/opt/homebrew/bin/node`). Common when using nvm or fnm. |
+| Microphone access denied (macOS) | Open System Settings → Privacy & Security → Microphone and enable access for VS Code (or your editor). |
+| Model download fails | Check your internet connection. The model is ~17MB downloaded from GitHub. If behind a proxy, ensure HTTPS traffic to `github.com` is allowed. |
 
 ## Privacy
 
-All speech recognition runs locally via Windows built-in `System.Speech.Recognition`. No audio data leaves your machine. The microphone stream is processed in memory by the Windows speech engine and never written to disk.
+All speech recognition runs locally on your machine. No audio data ever leaves your device. On Windows, speech is processed by the built-in `System.Speech.Recognition` engine in memory. On macOS and Linux, a local `sherpa-onnx` model processes audio in the engine child process. Nothing is recorded, stored, or transmitted.
 
 ## Platform Support
 
-| Platform | Status |
-| --- | --- |
-| Windows 10/11 | Supported |
-| macOS | Planned |
-| Linux | Planned |
+| Platform | Status | Engine |
+| --- | --- | --- |
+| Windows 10/11 | Supported | Windows built-in System.Speech |
+| macOS | Supported | sherpa-onnx (requires Node.js 18+) |
+| Linux | Supported | sherpa-onnx (requires Node.js 18+) |
 
 ## Compatibility
 

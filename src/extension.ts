@@ -1,10 +1,15 @@
 import * as vscode from "vscode";
-import { SpeechEngine, WakePhrase } from "./speechEngine";
+import * as os from "os";
+import { WakePhrase, ISpeechEngine } from "./speechEngineInterface";
+import { WindowsSpeechEngine } from "./windowsSpeechEngine";
+import { SherpaEngine } from "./sherpaEngine";
 
 let statusBarItem: vscode.StatusBarItem;
+let engineBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
-let resumeTimer: ReturnType<typeof setTimeout> | null = null;
-let speechEngine: SpeechEngine;
+let countdownTimer: ReturnType<typeof setInterval> | null = null;
+let countdownRemaining = 0;
+let speechEngine: ISpeechEngine;
 let isStarting = false;
 let isDevMode = false;
 let isPausedByFocus = false;
@@ -29,70 +34,57 @@ const DEFAULT_ROUTES: WakePhrase[] = [
   },
 ];
 
-// ── Activation ──────────────────────────────────────────────
+// ── Engine factory ───────────────────────────────────────────
 
-export function activate(context: vscode.ExtensionContext) {
-  isDevMode = context.extensionMode === vscode.ExtensionMode.Development;
-  console.log("[Wake Word] Activating, devMode:", isDevMode);
+function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
+  const config = vscode.workspace.getConfiguration("wakeWord");
+  const nodePath = config.get<string>("nodePath", "");
+  const engineOverride = config.get<string>("engine", "auto");
 
-  if (process.platform !== "win32") {
-    const notWindows = () =>
-      vscode.window.showInformationMessage(
-        "Wake Word currently supports Windows only."
-      );
-    context.subscriptions.push(
-      vscode.commands.registerCommand("wakeWord.enable", notWindows),
-      vscode.commands.registerCommand("wakeWord.disable", notWindows),
-      vscode.commands.registerCommand("wakeWord.toggle", notWindows),
-      vscode.commands.registerCommand("wakeWord.resetConsent", notWindows)
-    );
-    return;
+  if (engineOverride === "sherpa") {
+    return new SherpaEngine(context, nodePath);
   }
+  if (engineOverride === "windows" || (engineOverride === "auto" && os.platform() === "win32")) {
+    return new WindowsSpeechEngine();
+  }
+  return new SherpaEngine(context, nodePath);
+}
 
-  outputChannel = vscode.window.createOutputChannel("Wake Word");
-  context.subscriptions.push(outputChannel);
+// ── Engine wiring ────────────────────────────────────────────
 
-  speechEngine = new SpeechEngine();
-
-  // Wire up events from the speech engine
-  speechEngine.on("detected", (phrase: WakePhrase, confidence: number) => {
+function wireEngine(engine: ISpeechEngine): void {
+  engine.on("detected", (phrase: WakePhrase, confidence: number) => {
     onWakeWordDetected(phrase, confidence);
   });
-
-  speechEngine.on("started", () => {
-    setStatusBar("listening");
-  });
-
-  speechEngine.on("paused", () => {
-    setStatusBar("handed-off");
-  });
-
-  speechEngine.on("stopped", () => {
-    setStatusBar("off");
-  });
-
-  speechEngine.on("debug", (info: string) => {
-    log("info", info);
-  });
-
-  speechEngine.on("warning", (msg: string) => {
-    log("warn", msg);
-  });
-
-  speechEngine.on("error", (err: Error) => {
+  engine.on("started", () => setStatusBar("listening"));
+  engine.on("paused", () => setStatusBar("handed-off"));
+  engine.on("stopped", () => setStatusBar("off"));
+  engine.on("debug", (info: string) => log("info", info));
+  engine.on("warning", (msg: string) => log("warn", msg));
+  engine.on("error", (err: Error) => {
     log("error", err.message);
-    vscode.window.showErrorMessage(
-      `Wake Word error: ${err.message}`,
-      "Show Log"
-    ).then((choice) => {
+    vscode.window.showErrorMessage(`Wake Word error: ${err.message}`, "Show Log").then((choice) => {
       if (choice === "Show Log") {
         outputChannel.show();
       }
     });
     setStatusBar("error");
   });
+}
 
-  // Status bar indicator
+// ── Activation ──────────────────────────────────────────────
+
+export function activate(context: vscode.ExtensionContext) {
+  isDevMode = context.extensionMode === vscode.ExtensionMode.Development;
+  console.log("[Wake Word] Activating, devMode:", isDevMode);
+
+  outputChannel = vscode.window.createOutputChannel("Wake Word");
+  context.subscriptions.push(outputChannel);
+
+  speechEngine = createEngine(context);
+  wireEngine(speechEngine);
+
+  // Status bar indicators
   statusBarItem = vscode.window.createStatusBarItem(
     "wakeWord.status",
     vscode.StatusBarAlignment.Right,
@@ -100,9 +92,26 @@ export function activate(context: vscode.ExtensionContext) {
   );
   statusBarItem.name = "Wake Word Status";
   statusBarItem.command = "wakeWord.toggle";
+  context.subscriptions.push(statusBarItem);
+
+  engineBarItem = vscode.window.createStatusBarItem(
+    "wakeWord.engine",
+    vscode.StatusBarAlignment.Right,
+    99
+  );
+  engineBarItem.name = "Wake Word Engine";
+  engineBarItem.tooltip = "Active speech engine. Click to change.";
+  context.subscriptions.push(engineBarItem);
+  context.subscriptions.push(
+    vscode.commands.registerCommand("wakeWord.openEngineSetting", () => {
+      vscode.commands.executeCommand("workbench.action.openSettings", "wakeWord.engine");
+    })
+  );
+  engineBarItem.command = "wakeWord.openEngineSetting";
+
+  // Both items created — safe to call setStatusBar now
   setStatusBar("off");
   statusBarItem.show();
-  context.subscriptions.push(statusBarItem);
 
   // Register commands
   context.subscriptions.push(
@@ -138,11 +147,30 @@ export function activate(context: vscode.ExtensionContext) {
   // Re-init when settings change
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("wakeWord.routes")) {
-        if (speechEngine.isListening) {
-          stopListening();
-          handleConsentThenStart(context);
+      const engineChanged =
+        e.affectsConfiguration("wakeWord.engine") ||
+        e.affectsConfiguration("wakeWord.nodePath");
+
+      if (engineChanged) {
+        const wasListening = speechEngine.isListening;
+        const cooldownActive = countdownTimer !== null;
+        isPausedByFocus = false;
+        speechEngine.dispose();
+        speechEngine = createEngine(context);
+        wireEngine(speechEngine);
+        log("info", "Engine switched due to settings change");
+        updateEngineIndicator(cooldownActive);
+        if (cooldownActive) {
+          log("info", "Engine switched during cooldown — will start when cooldown expires");
+        } else if (wasListening) {
+          startListening();
         }
+        return;
+      }
+
+      if (e.affectsConfiguration("wakeWord.routes") && speechEngine.isListening) {
+        stopListening();
+        handleConsentThenStart(context);
       }
     })
   );
@@ -198,9 +226,8 @@ async function handleConsentThenStart(
   try {
     const choice = await vscode.window.showWarningMessage(
       "Wake Word uses your microphone to listen for wake phrases " +
-        "whenever VS Code is open. All audio is processed locally on " +
-        "your machine using Windows built-in speech recognition. " +
-        "Nothing is recorded or transmitted.\n\n" +
+        "whenever the editor is open. All audio is processed locally on " +
+        "your machine. Nothing is recorded or transmitted.\n\n" +
         "When a wake phrase is detected, the microphone is released " +
         "so the target assistant can use it. Wake word listening " +
         "resumes automatically after a cooldown period.\n\n" +
@@ -321,26 +348,57 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence: number) {
 
 function scheduleResume(seconds: number) {
   clearResumeTimer();
+  countdownRemaining = seconds;
 
-  resumeTimer = setTimeout(() => {
-    resumeTimer = null;
-    resumeListening();
-  }, seconds * 1000);
+  statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
+  statusBarItem.tooltip = "Mic handed off to assistant. Resuming soon.";
+  statusBarItem.backgroundColor = new vscode.ThemeColor(
+    "statusBarItem.warningBackground"
+  );
+
+  countdownTimer = setInterval(() => {
+    countdownRemaining--;
+
+    if (countdownRemaining <= 0) {
+      clearResumeTimer();
+      resumeListening();
+      log("info", "Resumed: cooldown expired");
+    } else {
+      statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
+    }
+  }, 1000);
+
+  log("info", `Cooldown: ${seconds}s`);
 }
 
 function resumeListening() {
   clearResumeTimer();
-  speechEngine.resume();
-}
-
-function clearResumeTimer() {
-  if (resumeTimer) {
-    clearTimeout(resumeTimer);
-    resumeTimer = null;
+  if (speechEngine.isPaused) {
+    speechEngine.resume();
+  } else {
+    startListening();
   }
 }
 
+function clearResumeTimer() {
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+  countdownRemaining = 0;
+}
+
 // ── Status bar ──────────────────────────────────────────────
+
+function updateEngineIndicator(visible: boolean): void {
+  if (!visible) {
+    engineBarItem.hide();
+    return;
+  }
+  const label = speechEngine instanceof SherpaEngine ? "Sherpa" : "Windows";
+  engineBarItem.text = `$(gear) ${label}`;
+  engineBarItem.show();
+}
 
 function setStatusBar(state: "off" | "listening" | "handed-off" | "error") {
   switch (state) {
@@ -348,12 +406,14 @@ function setStatusBar(state: "off" | "listening" | "handed-off" | "error") {
       statusBarItem.text = "$(mic-off) Wake: Off";
       statusBarItem.tooltip = "Click to enable wake word listening";
       statusBarItem.backgroundColor = undefined;
+      updateEngineIndicator(false);
       break;
     case "listening":
       statusBarItem.text = "$(mic) Wake: Listening";
       statusBarItem.tooltip =
         "Listening for wake words... Click to disable";
       statusBarItem.backgroundColor = undefined;
+      updateEngineIndicator(true);
       break;
     case "handed-off":
       statusBarItem.text = "$(mic-filled) Wake: Active";
@@ -362,6 +422,7 @@ function setStatusBar(state: "off" | "listening" | "handed-off" | "error") {
       statusBarItem.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.warningBackground"
       );
+      updateEngineIndicator(true);
       break;
     case "error":
       statusBarItem.text = "$(error) Wake: Error";
@@ -369,6 +430,7 @@ function setStatusBar(state: "off" | "listening" | "handed-off" | "error") {
       statusBarItem.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.errorBackground"
       );
+      updateEngineIndicator(false);
       break;
   }
 }

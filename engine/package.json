@@ -1,0 +1,12 @@
+{
+  "name": "wake-word-engine",
+  "version": "1.0.0",
+  "description": "Child process audio engine for Wake Word extension. Runs under system Node.js.",
+  "private": true,
+  "main": "audio-engine.js",
+  "dependencies": {
+    "@analyticsinmotion/micstream": "0.4.0",
+    "sentencepiece-js": "1.1.0",
+    "sherpa-onnx": "1.12.28"
+  }
+}

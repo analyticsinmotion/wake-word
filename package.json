@@ -1,8 +1,8 @@
 {
   "name": "wake-word",
   "displayName": "Wake Word",
-  "description": "Voice control for VS Code with customizable wake word. Fully local, zero config.",
-  "version": "0.3.0",
+  "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
+  "version": "0.4.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -59,7 +59,7 @@
         "wakeWord.routes": {
           "type": "array",
           "default": [],
-          "description": "Wake phrase routing table. Each entry maps a spoken phrase to a VS Code command. If empty, default routes are used (Hey Copilot, Hey Claude, Computer).",
+          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Copilot, Hey Claude, Computer).",
           "items": {
             "type": "object",
             "required": [
@@ -89,7 +89,7 @@
               },
               "command": {
                 "type": "string",
-                "description": "VS Code command ID to execute (e.g. \"workbench.action.chat.open\")"
+                "description": "Command ID to execute (e.g. \"workbench.action.chat.open\")"
               },
               "cooldownSeconds": {
                 "type": "number",
@@ -110,7 +110,7 @@
         "wakeWord.enableOnStartup": {
           "type": "boolean",
           "default": true,
-          "description": "Start listening automatically when VS Code opens."
+          "description": "Start listening automatically when the editor opens."
         },
         "wakeWord.showNotificationOnDetection": {
           "type": "boolean",
@@ -120,7 +120,7 @@
         "wakeWord.pauseOnFocusLoss": {
           "type": "boolean",
           "default": false,
-          "description": "Pause wake word listening when VS Code loses focus and resume when it regains focus."
+          "description": "Pause wake word listening when the editor loses focus and resume when it regains focus."
         },
         "wakeWord.confidenceThreshold": {
           "type": "number",
@@ -128,6 +128,22 @@
           "minimum": 0.1,
           "maximum": 0.9,
           "description": "Minimum confidence score (0.1 to 0.9) required to trigger a wake phrase. Lower values detect more but increase false positives."
+        },
+        "wakeWord.nodePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Node.js executable. Leave empty to auto-detect. Set this if Wake Word cannot find Node.js (common with nvm or fnm). macOS and Linux only."
+        },
+        "wakeWord.engine": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "windows", "sherpa"],
+          "enumDescriptions": [
+            "Use the best engine for your platform (Windows Speech on Windows, sherpa-onnx elsewhere).",
+            "Force Windows built-in System.Speech engine (Windows only).",
+            "Force sherpa-onnx keyword spotting engine (cross-platform, requires model download)."
+          ],
+          "description": "Speech engine to use. Leave on 'auto' unless testing a specific engine."
         }
       }
     }
