@@ -12,24 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Cross-platform speech engine** (SherpaEngine) using sherpa-onnx keyword spotting. Supports Windows, macOS, and Linux. Runs as a child process under system Node.js so native audio addons load against the correct Node.js ABI — no Electron conflicts.
+- **Cross-platform speech engine** (SherpaEngine) using sherpa-onnx keyword spotting. Supports Windows, macOS, and Linux. Runs as a child process under system Node.js so native audio addons load against the correct Node.js ABI, with no Electron conflicts.
 - **Cross-platform microphone capture** via `@analyticsinmotion/micstream` (PortAudio). This resolves a fundamental blocker: VS Code's Electron runtime cannot load native audio addons, so there was previously no way to capture microphone audio on macOS or Linux. Running micstream under system Node.js in the engine child process bypasses this entirely.
 - `wakeWord.engine` setting to select the speech engine: `auto` (platform default), `windows` (Windows System.Speech), or `sherpa` (sherpa-onnx, cross-platform). Defaults to `auto`.
 - `wakeWord.nodePath` setting to override the Node.js executable path used by SherpaEngine. Useful when Node.js is installed via nvm, fnm, or a non-standard location not on VS Code's PATH.
 - Engine indicator in the status bar showing the active engine (`Windows` or `Sherpa`) while listening. Click the indicator to open engine settings.
-- Changing `wakeWord.engine` or `wakeWord.nodePath` in Settings now takes effect immediately — the engine restarts without reloading the window.
+- Changing `wakeWord.engine` or `wakeWord.nodePath` in Settings now takes effect immediately; the engine restarts without reloading the window.
 - Status bar countdown during cooldown: after a wake phrase fires, the status bar shows a live second-by-second countdown (`Wake: 30s → Wake: 29s → ...`) instead of a static "Wake: Active" message. Gives clear feedback on how long until listening resumes.
 
 ### Changed
 
 - Countdown uses a clock icon (`$(clock)`) rather than the spinning sync icon. The spinning icon reset its CSS animation every second when the status bar text was updated, causing a visible jerk. The clock icon is static and appropriate for a timed countdown.
-- Documentation updated to be editor-neutral: "VS Code" replaced with "your editor" or "the editor" in settings descriptions, README subheading, and How It Works section. The extension works in Cursor, Windsurf, and other VS Code forks — the docs now reflect that. Technical content (platform requirements, command IDs, architecture) is unchanged.
+- Documentation updated to be editor-neutral: "VS Code" replaced with "your editor" or "the editor" in settings descriptions, README subheading, and How It Works section. The extension works in Cursor, Windsurf, and other VS Code forks. The docs now reflect that. Technical content (platform requirements, command IDs, architecture) is unchanged.
 - Both engines now implement a shared `ISpeechEngine` interface, enabling clean engine switching and shared event handling.
 
 ### Fixed
 
 - Switching the speech engine during an active cooldown no longer cancels the countdown or breaks subsequent detection. The countdown continues normally; the new engine starts when it expires.
-- Model download now follows HTTP redirects. GitHub release URLs return `302 → CDN` — downloads previously failed silently on first install.
+- Model download now follows HTTP redirects. GitHub release URLs return `302 → CDN`. Downloads previously failed silently on first install.
 
 ---
 
@@ -39,12 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Dedicated "Wake Word" output channel in the Output panel for all logging (debug, warnings, errors, detections).
 - Startup diagnostics logged automatically: route count, threshold, OS, VS Code version.
-- "Show Log" action on error toasts — opens the output channel directly.
+- "Show Log" action on error toasts that opens the output channel directly.
 - Dual logging: output channel always, debug console when running via F5 (dev mode).
-- Pause on focus loss (`wakeWord.pauseOnFocusLoss`) — pauses listening when VS Code loses focus, resumes on regain. Off by default.
+- Pause on focus loss (`wakeWord.pauseOnFocusLoss`): pauses listening when VS Code loses focus, resumes on regain. Off by default.
 - Phrase aliases: `phrase` field now accepts a string or array of strings, mapping multiple trigger phrases to one command.
 - Per-route cooldown: optional `cooldownSeconds` on each route entry, overrides the global setting.
-- SVG guard in `npm run lint` — catches blocked SVG references in README.md before commit.
+- SVG guard in `npm run lint` that catches blocked SVG references in README.md before commit.
 
 ### Changed
 
@@ -69,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Configurable confidence threshold (`wakeWord.confidenceThreshold`) — adjustable from 0.1 to 0.9 with safe clamping.
+- Configurable confidence threshold (`wakeWord.confidenceThreshold`), adjustable from 0.1 to 0.9 with safe clamping.
 - Automatic retry with exponential backoff when the speech engine crashes (up to 3 retries at 2s, 5s, 10s delays).
 - Non-Windows activation guard: commands register as stubs with an informational message on macOS/Linux.
 - Troubleshooting section in README with common problems and solutions.

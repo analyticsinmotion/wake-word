@@ -89,7 +89,7 @@ All audio processing happens locally on your machine. Nothing is recorded or tra
 
 ## How It Works
 
-1. Install the extension — on Windows, that's all. On macOS/Linux, a local speech model (~17MB) is downloaded on first use and cached.
+1. Install the extension. On Windows, that's all. On macOS/Linux, a local speech model (~17MB) is downloaded on first use and cached.
 2. When your editor opens, the extension starts listening on your microphone
 3. The speech engine matches recognised speech against your configured wake phrases
 4. If a phrase is detected with sufficient confidence, the extension **releases the mic** and fires the mapped command
@@ -118,7 +118,7 @@ code --install-extension analytics-in-motion.wake-word
 
 | Platform | Requirement |
 | --- | --- |
-| Windows 10/11 | No additional software — uses built-in `System.Speech.Recognition` |
+| Windows 10/11 | No additional software. Uses built-in `System.Speech.Recognition` |
 | macOS | Node.js 18+ (for the speech engine child process) |
 | Linux | Node.js 18+ (for the speech engine child process) |
 
@@ -236,7 +236,7 @@ This ensures only one thing uses the mic at a time.
 
 ## Common command IDs
 
-Useful values for the `command` field in your routes. Command IDs listed are for VS Code — Cursor and other editors may use different IDs for the same features.
+Useful values for the `command` field in your routes. Command IDs listed are for VS Code. Cursor and other editors may use different IDs for the same features.
 
 | Assistant / Feature | Command ID |
 | --- | --- |
@@ -255,7 +255,7 @@ The extension selects a speech engine based on platform (or the `wakeWord.engine
 
 ### Windows engine (default on Windows)
 
-Spawns a PowerShell process using `System.Speech.Recognition.SpeechRecognitionEngine` — the same engine built into Windows. A constrained grammar is built from your configured phrases and passed via encoded command. Zero model downloads; the speech engine ships with Windows.
+Spawns a PowerShell process using `System.Speech.Recognition.SpeechRecognitionEngine`, the same engine built into Windows. A constrained grammar is built from your configured phrases and passed via encoded command. Zero model downloads; the speech engine ships with Windows.
 
 ### Sherpa engine (default on macOS/Linux, optional on Windows)
 
@@ -287,7 +287,7 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 
 ## Privacy
 
-All speech recognition runs locally on your machine — no audio data ever leaves your device. On Windows, speech is processed by the built-in `System.Speech.Recognition` engine in memory. On macOS and Linux, a local `sherpa-onnx` model processes audio in the engine child process. Nothing is recorded, stored, or transmitted.
+All speech recognition runs locally on your machine. No audio data ever leaves your device. On Windows, speech is processed by the built-in `System.Speech.Recognition` engine in memory. On macOS and Linux, a local `sherpa-onnx` model processes audio in the engine child process. Nothing is recorded, stored, or transmitted.
 
 ## Platform Support
 
