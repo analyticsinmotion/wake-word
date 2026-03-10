@@ -6,7 +6,7 @@ export interface WakePhrase {
 }
 
 export interface ISpeechEngine {
-  start(phrases: WakePhrase[], threshold: number, debugMode: boolean): void;
+  start(phrases: WakePhrase[], threshold: number, debugMode: boolean): void | Promise<void>;
   stop(): void;
   pause(): void;
   resume(): void;
