@@ -8,16 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.4.0] - 2026-03-08
+## [0.4.0] - 2026-03-10
 
 ### Added
 
+- **Cross-platform speech engine** (SherpaEngine) using sherpa-onnx keyword spotting. Supports Windows, macOS, and Linux. Runs as a child process under system Node.js so native audio addons load against the correct Node.js ABI — no Electron conflicts.
+- **Cross-platform microphone capture** via `@analyticsinmotion/micstream` (PortAudio). This resolves a fundamental blocker: VS Code's Electron runtime cannot load native audio addons, so there was previously no way to capture microphone audio on macOS or Linux. Running micstream under system Node.js in the engine child process bypasses this entirely.
+- `wakeWord.engine` setting to select the speech engine: `auto` (platform default), `windows` (Windows System.Speech), or `sherpa` (sherpa-onnx, cross-platform). Defaults to `auto`.
+- `wakeWord.nodePath` setting to override the Node.js executable path used by SherpaEngine. Useful when Node.js is installed via nvm, fnm, or a non-standard location not on VS Code's PATH.
+- Engine indicator in the status bar showing the active engine (`Windows` or `Sherpa`) while listening. Click the indicator to open engine settings.
+- Changing `wakeWord.engine` or `wakeWord.nodePath` in Settings now takes effect immediately — the engine restarts without reloading the window.
 - Status bar countdown during cooldown: after a wake phrase fires, the status bar shows a live second-by-second countdown (`Wake: 30s → Wake: 29s → ...`) instead of a static "Wake: Active" message. Gives clear feedback on how long until listening resumes.
 
 ### Changed
 
 - Countdown uses a clock icon (`$(clock)`) rather than the spinning sync icon. The spinning icon reset its CSS animation every second when the status bar text was updated, causing a visible jerk. The clock icon is static and appropriate for a timed countdown.
 - Documentation updated to be editor-neutral: "VS Code" replaced with "your editor" or "the editor" in settings descriptions, README subheading, and How It Works section. The extension works in Cursor, Windsurf, and other VS Code forks — the docs now reflect that. Technical content (platform requirements, command IDs, architecture) is unchanged.
+- Both engines now implement a shared `ISpeechEngine` interface, enabling clean engine switching and shared event handling.
+
+### Fixed
+
+- Switching the speech engine during an active cooldown no longer cancels the countdown or breaks subsequent detection. The countdown continues normally; the new engine starts when it expires.
+- Model download now follows HTTP redirects. GitHub release URLs return `302 → CDN` — downloads previously failed silently on first install.
 
 ---
 

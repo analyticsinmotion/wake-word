@@ -3,6 +3,7 @@
 .github/**
 src/**
 node_modules/**
+prototype/**
 .gitignore
 tsconfig.json
 AGENTS.md

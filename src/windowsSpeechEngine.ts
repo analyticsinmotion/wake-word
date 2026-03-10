@@ -1,25 +1,18 @@
 import { EventEmitter } from "events";
 import { spawn, ChildProcess } from "child_process";
-import * as os from "os";
-
-export interface WakePhrase {
-  label: string;
-  phrase: string | string[];
-  command: string;
-  cooldownSeconds?: number;
-}
+import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 
 /**
- * Speech recognition engine for wake word detection.
+ * Speech recognition engine for Windows wake word detection.
  *
- * On Windows, uses the built-in System.Speech.Recognition engine
- * via a PowerShell child process. No API keys, no model downloads,
- * no system dependencies beyond what ships with Windows.
+ * Uses the built-in System.Speech.Recognition engine via a PowerShell
+ * child process. No API keys, no model downloads, no system dependencies
+ * beyond what ships with Windows.
  *
  * The engine uses a constrained grammar built from the configured
  * wake phrases for accurate matching.
  */
-export class SpeechEngine extends EventEmitter {
+export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
   private process: ChildProcess | null = null;
   private currentPhrases: WakePhrase[] = [];
   private _isListening = false;
@@ -48,23 +41,12 @@ export class SpeechEngine extends EventEmitter {
     // Clean up any orphaned process from a previous session
     this.killProcess();
 
-    if (os.platform() !== "win32") {
-      this.emit(
-        "error",
-        new Error(
-          "Wake Word currently supports Windows only. " +
-            "macOS and Linux support is planned for a future release."
-        )
-      );
-      return;
-    }
-
     this._killedIntentionally = false;
     this.currentPhrases = phrases;
     const safeThreshold = Math.max(0.1, Math.min(0.9, Number(confidenceThreshold) || 0.3));
     this.currentThreshold = safeThreshold;
     this.currentDebugMode = debugMode;
-    const phraseStrings = phrases.flatMap((p) => SpeechEngine.normalizePhrases(p.phrase));
+    const phraseStrings = phrases.flatMap((p) => WindowsSpeechEngine.normalizePhrases(p.phrase));
     const script = this.buildScript(phraseStrings, safeThreshold, debugMode);
     const encoded = Buffer.from(script, "utf16le").toString("base64");
 
@@ -102,7 +84,7 @@ export class SpeechEngine extends EventEmitter {
           const detected = (sepIndex >= 0 ? payload.substring(0, sepIndex) : payload).toLowerCase().trim();
           const confidence = sepIndex >= 0 ? parseFloat(payload.substring(sepIndex + 1)) : 0;
           const match = phrases.find((p) =>
-            SpeechEngine.normalizePhrases(p.phrase).includes(detected)
+            WindowsSpeechEngine.normalizePhrases(p.phrase).includes(detected)
           );
           if (match) {
             this.emit("detected", match, isNaN(confidence) ? 0 : confidence);
@@ -147,10 +129,10 @@ export class SpeechEngine extends EventEmitter {
         const stderrMsg = stderrBuffer.trim() ? this.parseStderr(stderrBuffer) : "";
         const msg = stderrMsg || `exit code ${code}`;
 
-        if (this.retryCount < SpeechEngine.MAX_RETRIES) {
-          const delay = SpeechEngine.RETRY_DELAYS[this.retryCount];
+        if (this.retryCount < WindowsSpeechEngine.MAX_RETRIES) {
+          const delay = WindowsSpeechEngine.RETRY_DELAYS[this.retryCount];
           this.retryCount++;
-          this.emit("warning", `Speech engine crashed: ${msg}. Retrying in ${delay / 1000}s (attempt ${this.retryCount}/${SpeechEngine.MAX_RETRIES})...`);
+          this.emit("warning", `Speech engine crashed: ${msg}. Retrying in ${delay / 1000}s (attempt ${this.retryCount}/${WindowsSpeechEngine.MAX_RETRIES})...`);
           this.retryTimer = setTimeout(() => {
             this.retryTimer = null;
             this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
@@ -158,7 +140,7 @@ export class SpeechEngine extends EventEmitter {
           return;
         }
 
-        this.emit("error", new Error(`${msg} (failed after ${SpeechEngine.MAX_RETRIES} retries)`));
+        this.emit("error", new Error(`${msg} (failed after ${WindowsSpeechEngine.MAX_RETRIES} retries)`));
         return;
       }
 

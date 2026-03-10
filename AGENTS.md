@@ -19,8 +19,13 @@ Press F5 in VS Code to launch the Extension Development Host for manual testing.
 ```text
 wake-word/
   src/
-    extension.ts       # VS Code extension entry point, commands, status bar, consent flow
-    speechEngine.ts    # SpeechEngine class, spawns PowerShell, manages mic lifecycle
+    extension.ts              # VS Code extension entry point, commands, status bar, consent flow
+    speechEngineInterface.ts  # ISpeechEngine interface (implemented by both engines)
+    windowsSpeechEngine.ts    # WindowsSpeechEngine — spawns PowerShell, Windows System.Speech
+    sherpaEngine.ts           # SherpaEngine — spawns audio-engine.js under system Node.js
+  engine/
+    audio-engine.js           # Child process: micstream mic capture + sherpa-onnx keyword spotting
+    package.json              # Engine dependencies (micstream, sherpa-onnx, sentencepiece-js)
   scripts/
     check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
   dist/                # Compiled JS output (do not edit)
@@ -28,13 +33,17 @@ wake-word/
     release.yml        # CI: build .vsix, publish to Marketplace and Open VSX
 ```
 
-Two source files. `extension.ts` owns all VS Code API interactions. `speechEngine.ts` owns the PowerShell child process and speech recognition. Keep this separation clean.
+`extension.ts` owns all VS Code API interactions. Both engines implement `ISpeechEngine` — `windowsSpeechEngine.ts` for Windows, `sherpaEngine.ts` for cross-platform. `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
 
 ## Architecture
 
-The extension spawns a background PowerShell process using Windows `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. The process communicates via stdout using four protocols: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, and `DEBUG:<info>`. The extension reads stdout, matches phrases, and fires VS Code commands. All events are logged to a dedicated "Wake Word" output channel.
+The extension selects a speech engine via `createEngine()` and wires it with `wireEngine()`. Both engines communicate via stdout using four protocols: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, and `DEBUG:<info>`. The extension reads stdout, matches phrases, and fires VS Code commands. All events are logged to a dedicated "Wake Word" output channel.
 
-On wake word detection, the PowerShell process is killed to release the microphone (handoff), then respawned after a cooldown. This ensures only one thing uses the mic at a time.
+**WindowsSpeechEngine** spawns a PowerShell process using `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. No model downloads; the engine ships with Windows.
+
+**SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `@analyticsinmotion/micstream` for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI.
+
+On wake word detection, the engine process is killed to release the microphone (handoff), then respawned after a cooldown. This ensures only one thing uses the mic at a time.
 
 **IMPORTANT**: The PowerShell process must use Windows PowerShell (`System32\WindowsPowerShell\v1.0\powershell.exe`), not PowerShell Core (`pwsh`). `System.Speech` is not available in PowerShell Core.
 
@@ -69,12 +78,14 @@ Manual testing checklist:
 
 1. F5 to launch Extension Development Host
 2. Consent dialog appears on first run
-3. Status bar shows "Wake: Listening" after consent
+3. Status bar shows "Wake: Listening" after consent; engine indicator shows active engine (Windows/Sherpa)
 4. Say a wake phrase, confirm detection notification appears
-5. Status bar transitions to "Wake: Active" during handoff
-6. Status bar returns to "Wake: Listening" after cooldown
+5. Status bar transitions to countdown (`Wake: 30s → Wake: 29s → ...`) during handoff
+6. Status bar returns to "Wake: Listening" after cooldown; target command fired correctly
 7. Toggle, enable, disable, and reset consent commands all work
 8. Output panel shows "Wake Word" channel with timestamped logs
+9. Change `wakeWord.engine` in Settings while listening — engine restarts immediately, engine indicator updates
+10. Change `wakeWord.engine` during cooldown — countdown continues, new engine starts when it expires
 
 ## Boundaries
 

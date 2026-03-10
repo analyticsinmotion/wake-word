@@ -128,6 +128,22 @@
           "minimum": 0.1,
           "maximum": 0.9,
           "description": "Minimum confidence score (0.1 to 0.9) required to trigger a wake phrase. Lower values detect more but increase false positives."
+        },
+        "wakeWord.nodePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Node.js executable. Leave empty to auto-detect. Set this if Wake Word cannot find Node.js (common with nvm or fnm). macOS and Linux only."
+        },
+        "wakeWord.engine": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "windows", "sherpa"],
+          "enumDescriptions": [
+            "Use the best engine for your platform (Windows Speech on Windows, sherpa-onnx elsewhere).",
+            "Force Windows built-in System.Speech engine (Windows only).",
+            "Force sherpa-onnx keyword spotting engine (cross-platform, requires model download)."
+          ],
+          "description": "Speech engine to use. Leave on 'auto' unless testing a specific engine."
         }
       }
     }
