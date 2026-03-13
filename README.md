@@ -87,7 +87,7 @@ Say **"Hey Claude"** and Claude opens. Say **"Hey Copilot"** and Copilot opens. 
 
 All audio processing happens locally on your machine. Nothing is recorded or transmitted.
 
-https://github.com/user-attachments/assets/d7d51414-daee-4e28-9135-feb1aab78b10
+https://github.com/user-attachments/assets/fab23f90-2c5a-467e-931e-2922b3a09d0e
 
 ## How It Works
 
