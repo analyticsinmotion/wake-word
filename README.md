@@ -87,6 +87,8 @@ Say **"Hey Claude"** and Claude opens. Say **"Hey Copilot"** and Copilot opens. 
 
 All audio processing happens locally on your machine. Nothing is recorded or transmitted.
 
+https://github.com/user-attachments/assets/d7d51414-daee-4e28-9135-feb1aab78b10
+
 ## How It Works
 
 1. Install the extension. On Windows, that's all. On macOS/Linux, a local speech model (~17MB) is downloaded on first use and cached.
