@@ -102,6 +102,8 @@ Manual testing checklist:
 
 **NEVER** add `Co-Authored-By` or any AI attribution lines to commit messages.
 
+**NEVER** run `git commit`, `git push`, or publish to any branch. The user always commits and pushes manually.
+
 ## Attribution
 
 This repository participates in the AI Attribution Protocol. See ATTRIBUTION.md for reciprocity guidelines.
