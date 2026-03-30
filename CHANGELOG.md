@@ -8,11 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.1] - 2026-03-30
+
+### Changed
+
+- Migrated audio capture dependency from deprecated `@analyticsinmotion/micstream` to `decibri` (v1.0.0). The package was renamed; the API is identical with no functional changes.
+
+### Security
+
+- Bumped `undici` from 7.22.0 to 7.24.1 — fixes 6 CVEs including 3 high-severity WebSocket and HTTP vulnerabilities (PR #8).
+- Bumped `flatted` from 3.3.4 to 3.4.2 — security patch for devDependency (PR #9).
+- Bumped `picomatch` from 4.0.3 to 4.0.4 — security patch for devDependency (PR #10).
+
+---
+
 ## [0.5.0] - 2026-03-10
 
 ### Fixed
 
-- Native engine dependencies (`sherpa-onnx`, `micstream`, `sentencepiece-js`) are now correctly bundled in the published `.vsix`. The v0.4.0 CI build omitted `engine/node_modules` because it was gitignored and never installed in CI. SherpaEngine failed with MODULE_NOT_FOUND on all platforms. Fixed by adding `cd engine && npm install` to each CI job before packaging.
+- Native engine dependencies (`sherpa-onnx`, `decibri`, `sentencepiece-js`) are now correctly bundled in the published `.vsix`. The v0.4.0 CI build omitted `engine/node_modules` because it was gitignored and never installed in CI. SherpaEngine failed with MODULE_NOT_FOUND on all platforms. Fixed by adding `cd engine && npm install` to each CI job before packaging.
 - Duplicate wake phrase detections within 3 seconds are now suppressed. A buffered `DETECTED` message could arrive on stdout after the engine process was killed, causing a second command to fire.
 
 ### Changed
@@ -26,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Cross-platform speech engine** (SherpaEngine) using sherpa-onnx keyword spotting. Supports Windows, macOS, and Linux. Runs as a child process under system Node.js so native audio addons load against the correct Node.js ABI, with no Electron conflicts.
-- **Cross-platform microphone capture** via `@analyticsinmotion/micstream` (PortAudio). This resolves a fundamental blocker: VS Code's Electron runtime cannot load native audio addons, so there was previously no way to capture microphone audio on macOS or Linux. Running micstream under system Node.js in the engine child process bypasses this entirely.
+- **Cross-platform microphone capture** via `decibri` (PortAudio). This resolves a fundamental blocker: VS Code's Electron runtime cannot load native audio addons, so there was previously no way to capture microphone audio on macOS or Linux. Running decibri under system Node.js in the engine child process bypasses this entirely.
 - `wakeWord.engine` setting to select the speech engine: `auto` (platform default), `windows` (Windows System.Speech), or `sherpa` (sherpa-onnx, cross-platform). Defaults to `auto`.
 - `wakeWord.nodePath` setting to override the Node.js executable path used by SherpaEngine. Useful when Node.js is installed via nvm, fnm, or a non-standard location not on VS Code's PATH.
 - Engine indicator in the status bar showing the active engine (`Windows` or `Sherpa`) while listening. Click the indicator to open engine settings.
