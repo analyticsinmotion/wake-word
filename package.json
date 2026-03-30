@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",

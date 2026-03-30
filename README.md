@@ -261,7 +261,7 @@ Spawns a PowerShell process using `System.Speech.Recognition.SpeechRecognitionEn
 
 ### Sherpa engine (default on macOS/Linux, optional on Windows)
 
-Spawns `audio-engine.js` under **system Node.js** (not Electron). The child process uses `@analyticsinmotion/micstream` (PortAudio) for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use and cached.
+Spawns `audio-engine.js` under **system Node.js** (not Electron). The child process uses `decibri` (PortAudio) for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use and cached.
 
 ### Shared flow
 

@@ -11,7 +11,7 @@ import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
  * Cross-platform speech recognition engine using sherpa-onnx keyword spotting.
  *
  * Spawns audio-engine.js as a child process under system Node.js (not Electron),
- * so that native addons (micstream) load against the correct Node.js ABI.
+ * so that native addons (decibri) load against the correct Node.js ABI.
  * sherpa-onnx (WASM) and sentencepiece-js (WASM) are also loaded in the child.
  *
  * Supports Windows, macOS, and Linux.

@@ -24,8 +24,8 @@ wake-word/
     windowsSpeechEngine.ts    # WindowsSpeechEngine: PowerShell child process using Windows System.Speech
     sherpaEngine.ts           # SherpaEngine: audio-engine.js child process under system Node.js
   engine/
-    audio-engine.js           # Child process: micstream mic capture + sherpa-onnx keyword spotting
-    package.json              # Engine dependencies (micstream, sherpa-onnx, sentencepiece-js)
+    audio-engine.js           # Child process: decibri mic capture + sherpa-onnx keyword spotting
+    package.json              # Engine dependencies (decibri, sherpa-onnx, sentencepiece-js)
   scripts/
     check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
   dist/                # Compiled JS output (do not edit)
@@ -41,7 +41,7 @@ The extension selects a speech engine via `createEngine()` and wires it with `wi
 
 **WindowsSpeechEngine** spawns a PowerShell process using `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. No model downloads; the engine ships with Windows.
 
-**SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `@analyticsinmotion/micstream` for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI.
+**SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI.
 
 On wake word detection, the engine process is killed to release the microphone (handoff), then respawned after a cooldown. This ensures only one thing uses the mic at a time.
 
@@ -96,9 +96,13 @@ Manual testing checklist:
 
 **NEVER** use PowerShell double-quoted strings for user-provided content (injection risk).
 
-**NEVER** add `darwin-x64` as a CI build target. Intel Mac (pre-2020) is excluded: the `macos-13` GitHub Actions runner has uncertain long-term availability, and `@analyticsinmotion/micstream` darwin-x64 pre-built binaries are unconfirmed. Revisit only if a darwin-x64 user files an issue with confirmed binary support.
+**NEVER** add `darwin-x64` as a CI build target. Intel Mac (pre-2020) is excluded: the `macos-13` GitHub Actions runner has uncertain long-term availability, and `decibri` darwin-x64 pre-built binaries are unconfirmed. Revisit only if a darwin-x64 user files an issue with confirmed binary support.
 
 **NEVER** modify the ATTRIBUTION.md protocol frontmatter without explicit instruction.
+
+**NEVER** add `Co-Authored-By` or any AI attribution lines to commit messages.
+
+**NEVER** run `git commit`, `git push`, or publish to any branch. The user always commits and pushes manually.
 
 ## Attribution
 

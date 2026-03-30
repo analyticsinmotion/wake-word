@@ -71,7 +71,7 @@ async function main(config) {
   // Load sentencepiece for BPE tokenisation
   const { SentencePieceProcessor } = require('sentencepiece-js');
   const sherpa = require('sherpa-onnx');
-  const MicStream = require('@analyticsinmotion/micstream');
+  const Decibri = require('decibri');
 
   // Tokenise each phrase and build a lookup map: DECODED_UPPER → phrase string
   const sp = new SentencePieceProcessor();
@@ -137,7 +137,7 @@ async function main(config) {
   // Open microphone
   if (debugMode) debug('opening microphone...');
   try {
-    mic = new MicStream({ sampleRate: 16000, channels: 1 });
+    mic = new Decibri({ sampleRate: 16000, channels: 1 });
   } catch (err) {
     fatal('Failed to open microphone: ' + err.message);
     return;
