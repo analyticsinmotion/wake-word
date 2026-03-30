@@ -100,6 +100,8 @@ Manual testing checklist:
 
 **NEVER** modify the ATTRIBUTION.md protocol frontmatter without explicit instruction.
 
+**NEVER** add `Co-Authored-By` or any AI attribution lines to commit messages.
+
 ## Attribution
 
 This repository participates in the AI Attribution Protocol. See ATTRIBUTION.md for reciprocity guidelines.
