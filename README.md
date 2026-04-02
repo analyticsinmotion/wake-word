@@ -65,6 +65,7 @@
       <td>
         <a href="https://github.com/analyticsinmotion/wake-word/releases"><img src="https://img.shields.io/github/v/release/analyticsinmotion/wake-word?label=Version&color=blue" alt="Version"></a>&nbsp;
         <a href="https://github.com/analyticsinmotion/wake-word/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0 License"></a>&nbsp;
+        <a href="https://wakeword.io/"><img src="https://img.shields.io/badge/Website-wakeword.io-blue" alt="wakeword.io"></a>&nbsp;
         <a href="https://github.com/analyticsinmotion"><img src="https://github.com/user-attachments/assets/616c530f-cf2a-4f26-8f6c-7397be513847" alt="Analytics in Motion" width="137" height="20"></a>
       </td>
     </tr>
