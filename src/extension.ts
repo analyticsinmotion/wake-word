@@ -3,6 +3,13 @@ import * as os from "os";
 import { WakePhrase, ISpeechEngine } from "./speechEngineInterface";
 import { WindowsSpeechEngine } from "./windowsSpeechEngine";
 import { SherpaEngine } from "./sherpaEngine";
+import {
+  DETECTION_DEBOUNCE_MS,
+  clampThreshold,
+  resolveRoutes,
+  selectEngineKind,
+  shouldDebounce,
+} from "./wakeWordCore";
 
 let statusBarItem: vscode.StatusBarItem;
 let engineBarItem: vscode.StatusBarItem;
@@ -14,11 +21,10 @@ let isStarting = false;
 let isDevMode = false;
 let isPausedByFocus = false;
 let lastDetectionTime = 0;
-const DETECTION_DEBOUNCE_MS = 3000;
 
 // ── Default routes ──────────────────────────────────────────
 
-const DEFAULT_ROUTES: WakePhrase[] = [
+export const DEFAULT_ROUTES: WakePhrase[] = [
   {
     label: "Claude",
     phrase: "hey claude",
@@ -43,10 +49,7 @@ function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
   const nodePath = config.get<string>("nodePath", "");
   const engineOverride = config.get<string>("engine", "auto");
 
-  if (engineOverride === "sherpa") {
-    return new SherpaEngine(context, nodePath);
-  }
-  if (engineOverride === "windows" || (engineOverride === "auto" && os.platform() === "win32")) {
+  if (selectEngineKind(engineOverride, os.platform()) === "windows") {
     return new WindowsSpeechEngine();
   }
   return new SherpaEngine(context, nodePath);
@@ -275,7 +278,7 @@ function startListening() {
     return;
   }
 
-  const threshold = config.get<number>("confidenceThreshold", 0.3);
+  const threshold = clampThreshold(config.get<number>("confidenceThreshold", 0.3));
   log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}`);
   log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
   speechEngine.start(routes, threshold, isDevMode);
@@ -293,24 +296,14 @@ function stopListening() {
 
 function buildRoutes(config: vscode.WorkspaceConfiguration): WakePhrase[] {
   const userRoutes = config.get<WakePhrase[]>("routes", []);
-
-  const validRoutes = userRoutes.filter((r) => {
-    const phrases = Array.isArray(r.phrase) ? r.phrase : [r.phrase];
-    return phrases.some((p) => p?.trim()) && r.label?.trim() && r.command?.trim();
-  });
-
-  if (validRoutes.length > 0) {
-    return validRoutes;
-  }
-
-  return DEFAULT_ROUTES;
+  return resolveRoutes(userRoutes, DEFAULT_ROUTES);
 }
 
 // ── Wake word triggered ─────────────────────────────────────
 
 async function onWakeWordDetected(phrase: WakePhrase, confidence: number) {
   const now = Date.now();
-  if (now - lastDetectionTime < DETECTION_DEBOUNCE_MS) {
+  if (shouldDebounce(now, lastDetectionTime, DETECTION_DEBOUNCE_MS)) {
     log("info", `Debounced duplicate detection: ${phrase.label}`);
     return;
   }

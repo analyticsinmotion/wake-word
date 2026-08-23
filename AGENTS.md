@@ -7,10 +7,13 @@ npm install                # Install dependencies
 npm run compile            # Build TypeScript to dist/
 npm run watch              # Build in watch mode
 npm run lint               # Run ESLint + SVG check on README.md. Do not use --fix.
+npm test                   # Run the unit test suite once (vitest)
+npm run test:watch         # Run the unit tests in watch mode
 npm run package            # Build .vsix package
 ```
 
-Run `npm run lint` and `npm run compile` before committing. Both must pass cleanly.
+Run `npm run lint`, `npm run compile`, and `npm test` before committing. All
+three must pass cleanly.
 
 Press F5 in VS Code to launch the Extension Development Host for manual testing.
 
@@ -26,6 +29,16 @@ wake-word/
   engine/
     audio-engine.js           # Child process: decibri VAD-gated mic capture + sherpa-onnx keyword spotting
     package.json              # Engine dependencies (decibri 5.7.0, sherpa-onnx 1.12.28, sentencepiece-js 1.1.0)
+  engine/lib/          # Pure engine logic, unit tested without a microphone
+    model-path.js      # Forward-slash model paths for the sherpa-onnx WASM VFS
+    vad-gate.js        # Pre-roll ring buffer and VAD gate state machine
+    keywords.js        # BPE piece decoding and the keyword list / lookup map
+    control.js         # stdin line draining, config parsing, threshold clamp
+    mic-errors.js      # decibri error codes to user-facing messages
+  tests/
+    unit/              # TypeScript tests for the extension host code
+    engine/            # JavaScript tests for engine/lib
+    mocks/vscode.ts    # Stub for the `vscode` module, wired up in vitest.config.mts
   scripts/
     check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
   dist/                # Compiled JS output (do not edit)
@@ -37,6 +50,8 @@ wake-word/
 ```
 
 `extension.ts` owns all VS Code API interactions. Both engines implement `ISpeechEngine`: `windowsSpeechEngine.ts` (Windows) and `sherpaEngine.ts` (cross-platform). `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
+
+`wakeWordCore.ts` holds the logic both engines and the extension host share: phrase normalisation, route validation, the stdout protocol parser, the debounce guard, engine selection, and the threshold clamp. It imports nothing from `vscode`, so it is directly unit testable. Put shared pure logic there rather than duplicating it per engine. `engine/lib/` is the same idea for the child process.
 
 ## Architecture
 
@@ -78,7 +93,19 @@ Use semantic versioning bumps. Commit changelog updates as `docs(changelog): upd
 
 ## Testing
 
-No test framework is configured yet. When adding tests, use a framework compatible with the VS Code extension testing API.
+Automated tests run under [vitest](https://vitest.dev) with `npm test`. They
+cover pure logic only: no microphone, no child processes, no network, and no
+VS Code API. `vitest.config.mts` aliases the `vscode` module to
+`tests/mocks/vscode.ts` so src modules that import it can still be loaded, and
+that stub throws if a test actually calls into the API.
+
+- `tests/unit/` is TypeScript and imports from `src/`.
+- `tests/engine/` is JavaScript and imports from `engine/lib/`.
+
+Anything that needs a real microphone, a live child process, or the extension
+host still has to be checked by hand. Add a test for pure logic first; if that
+is not possible, extract the logic into `wakeWordCore.ts` or `engine/lib/` and
+then test it.
 
 Manual testing checklist:
 

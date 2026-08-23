@@ -49,6 +49,14 @@ Module._resolveFilename = function(request, parent, isMain, options) {
 // Prepend engine/node_modules to search path
 require.main.paths.unshift(path.join(engineDir, 'node_modules'));
 
+// Pure logic lives in ./lib so it can be unit tested without a microphone.
+// These are relative requires and so bypass the resolver hook above.
+const { modelPath } = require('./lib/model-path');
+const { VadGate } = require('./lib/vad-gate');
+const { buildKeywordSpec } = require('./lib/keywords');
+const { drainLines, parseControlLine, clampKeywordThreshold } = require('./lib/control');
+const { micErrorMessage } = require('./lib/mic-errors');
+
 let mic = null;
 let kws = null;
 let kwsStream = null;
@@ -60,21 +68,6 @@ function out(msg) {
 
 function debug(msg) {
   out('DEBUG:' + msg);
-}
-
-/**
- * Build a path into the model directory that the WASM engines can open.
- *
- * sherpa-onnx is an Emscripten build. Its config validator resolves any path
- * that does not start with '/' against the WASM working directory, so a
- * Windows absolute path like C:\Users\... is never found: createKws() logs
- * "does not exist" / "Errors in config!", still returns a handle, and the
- * unusable spotter then dies with "null function or function signature
- * mismatch" on first use. Forward slashes resolve on every platform, and
- * VS Code's globalStorageUri.fsPath hands us backslashes on Windows.
- */
-function modelPath(modelDir, name) {
-  return path.join(modelDir, name).replace(/\\/g, '/');
 }
 
 function fatal(msg) {
@@ -97,30 +90,22 @@ async function main(config) {
   await sp.load(modelPath(modelDir, 'bpe.model'));
 
   // Build keyword string (one BPE-tokenised phrase per line) and reverse map
-  const phraseMap = {}; // "HEY CLAUDE" → "hey claude"
-  const keywordLines = [];
+  // ("HEY CLAUDE" -> "hey claude").
+  const spec = buildKeywordSpec(phrases, (text) => sp.encodePieces(text));
+  const phraseMap = spec.phraseMap;
 
-  for (const p of phrases) {
-    const raw = Array.isArray(p.phrase) ? p.phrase : [p.phrase];
-    for (const r of raw) {
-      const upper = r.toUpperCase().trim();
-      const tokens = sp.encodePieces(upper);
-      const tokenStr = tokens.join(' ');
-      const decoded = tokens.map(t => t.startsWith('\u2581') ? ' ' + t.slice(1) : t).join('').trim();
-      if (decoded) {
-        phraseMap[decoded] = r.toLowerCase().trim();
-        keywordLines.push(tokenStr);
-        if (debugMode) debug('phrase: ' + r + ' -> tokens: ' + tokenStr + ' -> decoded: ' + decoded);
-      }
+  if (debugMode) {
+    for (const d of spec.details) {
+      debug('phrase: ' + d.phrase + ' -> tokens: ' + d.tokens + ' -> decoded: ' + d.decoded);
     }
   }
 
-  if (keywordLines.length === 0) {
+  if (spec.keywordLines.length === 0) {
     fatal('No valid phrases to detect');
     return;
   }
 
-  const keywords = keywordLines.join('\n');
+  const keywords = spec.keywords;
 
   // Create KWS instance
   if (debugMode) debug('loading sherpa-onnx KWS model...');
@@ -143,7 +128,7 @@ async function main(config) {
       maxActivePaths: 4,
       numTrailingBlanks: 1,
       keywordsScore: 1.0,
-      keywordsThreshold: Math.max(0.1, Math.min(0.9, threshold || 0.25)),
+      keywordsThreshold: clampKeywordThreshold(threshold),
       keywords,
     });
   } catch (err) {
@@ -187,14 +172,13 @@ async function main(config) {
   // VAD gating.
   //
   // decibri emits 'data' for a chunk *before* it scores that chunk, so the
-  // chunk that trips the detector reaches this handler while `speaking` is
-  // still false. Chunks are therefore held in a short pre-roll ring and
-  // flushed into the spotter when 'speech' fires. Without the pre-roll the
-  // onset of the phrase — the syllable that carries the start of the wake
-  // word — never reaches the spotter and detection collapses.
+  // chunk that trips the detector reaches this handler while the gate is still
+  // closed. Chunks are therefore held in a short pre-roll ring and flushed
+  // into the spotter when 'speech' fires. Without the pre-roll the onset of
+  // the phrase, the syllable that carries the start of the wake word, never
+  // reaches the spotter and detection collapses. See lib/vad-gate.js.
   const PREROLL_CHUNKS = 5; // 5 x 100 ms at decibri's default framesPerBuffer
-  const preroll = [];
-  let speaking = false;
+  const gate = new VadGate(PREROLL_CHUNKS);
 
   // Push one Float32 chunk into the spotter and drain whatever it enables.
   function feed(floats) {
@@ -221,17 +205,15 @@ async function main(config) {
 
   mic.on('speech', () => {
     if (stopping) return;
-    speaking = true;
-    if (debugMode) debug('VAD: speech (' + preroll.length + ' pre-roll chunks)');
-    for (const floats of preroll) {
+    const held = gate.prerollLength;
+    if (debugMode) debug('VAD: speech (' + held + ' pre-roll chunks)');
+    for (const floats of gate.speechStarted()) {
       feed(floats);
     }
-    preroll.length = 0;
   });
 
   mic.on('silence', () => {
-    speaking = false;
-    preroll.length = 0;
+    gate.speechEnded();
     if (debugMode) debug('VAD: silence');
     // Decode each speech segment independently. Without the reset the spotter
     // sees the two sides of a gap spliced together and can spot a phrase that
@@ -253,50 +235,15 @@ async function main(config) {
       floats[i] = samples[i] / 32768.0;
     }
 
-    if (!speaking) {
-      // Silence: hold the chunk for the pre-roll and skip the decode entirely.
-      preroll.push(floats);
-      if (preroll.length > PREROLL_CHUNKS) preroll.shift();
-      return;
+    // While silent the gate retains the chunk as pre-roll and returns nothing,
+    // so the decode is skipped entirely.
+    for (const ready of gate.push(floats)) {
+      feed(ready);
     }
-
-    feed(floats);
   });
 
   out('READY');
   if (debugMode) debug('mic open, VAD-gated, listening for: ' + Object.values(phraseMap).join(', '));
-}
-
-/**
- * Map decibri's typed errors to something a user can act on.
- *
- * decibri 5.x raises DecibriError subclasses (DeviceError, OrtError,
- * OrtPathError) each carrying a stable `code`. Anything unrecognised falls
- * back to the raw message under the caller's prefix.
- */
-function micErrorMessage(err, fallbackPrefix) {
-  const code = err && err.code;
-  const message = (err && err.message) || String(err);
-
-  switch (code) {
-    case 'NO_MICROPHONE_FOUND':
-    case 'MICROPHONE_NOT_FOUND':
-      return 'No microphone found. Check your audio device settings.';
-    case 'NOT_AN_INPUT_DEVICE':
-      return 'The selected audio device is not a microphone. Check your audio device settings.';
-    case 'PERMISSION_DENIED':
-      return 'Microphone access denied. Enable microphone access for VS Code in your system privacy settings.';
-    case 'DEVICE_FAILED':
-      return 'The microphone stopped responding: ' + message;
-    case 'ORT_INIT_FAILED':
-    case 'ORT_LOAD_FAILED':
-    case 'ORT_SESSION_BUILD_FAILED':
-    case 'ORT_INFERENCE_FAILED':
-    case 'VAD_MODEL_LOAD_FAILED':
-      return 'Failed to start voice activity detection: ' + message;
-    default:
-      return fallbackPrefix + ': ' + message;
-  }
 }
 
 function shutdown() {
@@ -321,25 +268,29 @@ function shutdown() {
 let stdinBuf = '';
 process.stdin.setEncoding('utf8');
 
+// Node delivers stdin in chunks, not lines, so every complete line in the
+// chunk has to be handled. Taking only the first line dropped the rest: a
+// "stop" that arrived behind another line was never seen and the child kept
+// running with the microphone open.
 process.stdin.on('data', (chunk) => {
   stdinBuf += chunk;
-  const nl = stdinBuf.indexOf('\n');
-  if (nl !== -1) {
-    const line = stdinBuf.substring(0, nl).trim();
-    stdinBuf = stdinBuf.substring(nl + 1);
-    if (line === 'stop') {
+  const drained = drainLines(stdinBuf);
+  stdinBuf = drained.rest;
+
+  for (const line of drained.lines) {
+    const control = parseControlLine(line);
+    if (control.kind === 'stop') {
       shutdown();
       return;
     }
-    if (!line) return;
-    let config;
-    try {
-      config = JSON.parse(line);
-    } catch (e) {
-      fatal('Invalid config JSON: ' + e.message);
+    if (control.kind === 'empty') {
+      continue;
+    }
+    if (control.kind === 'invalid') {
+      fatal(control.message);
       return;
     }
-    main(config).catch((err) => fatal('Startup error: ' + err.message));
+    main(control.config).catch((err) => fatal('Startup error: ' + err.message));
   }
 });
 
