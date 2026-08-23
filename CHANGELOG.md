@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Dependabot configuration covering both the root and `engine/`
   dependency trees. `engine/` is the only tree that reaches end users
   and previously had no coverage at all.
+- CI now runs lint, compile, and the engine dependency install on all
+  three platforms (Windows, macOS, Linux) instead of Ubuntu only. The
+  matrix mirrors release.yml so a platform-specific break surfaces on
+  the pull request rather than at publish time.
 
 ### Fixed
 
@@ -39,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.vscodeignore`.
 - Fixed `package-lock.json` version drift; the lockfile root version was
   never regenerated for the 0.5.1 bump.
+
+### Security
+
+- Upgraded `@vscode/vsce` from 2.32.0 to 3.9.2 and `ovsx` from 0.8.4 to
+  1.1.1, clearing the `markdown-it`/`linkify-it` advisory chain that
+  could only be reached through a major bump. Both now require Node 20,
+  which CI and release already pin.
+- Cleared all 14 remaining npm audit advisories in the root dev
+  dependency tree (`brace-expansion`, `follow-redirects`, `form-data`,
+  `js-yaml`, `qs`, `tmp`, `undici`, `uuid`). `npm audit` now reports 0
+  vulnerabilities. These are build and publish tooling only and never
+  shipped to users, but they run with `VSCE_PAT` and `OVSX_PAT` in
+  scope during a release.
 
 ---
 

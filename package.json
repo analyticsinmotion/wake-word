@@ -162,8 +162,8 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
-    "@vscode/vsce": "^2.22.0",
-    "ovsx": "^0.8.0",
+    "@vscode/vsce": "^3.9.2",
+    "ovsx": "^1.0.1",
     "typescript": "^5.3.3",
     "eslint": "^8.56.0",
     "@typescript-eslint/parser": "^8.56.1",
