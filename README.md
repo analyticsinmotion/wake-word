@@ -94,7 +94,7 @@ https://github.com/user-attachments/assets/fb007095-5c4c-4927-aaa6-fa76550d7cb2
 
 1. Install the extension. On Windows, that's all. On macOS/Linux, a local speech model (~17MB) is downloaded on first use and cached.
 2. When your editor opens, the extension starts listening on your microphone
-3. The speech engine matches recognised speech against your configured wake phrases
+3. Audio is processed locally -- through voice activity detection and keyword spotting on macOS/Linux, or the built-in recogniser on Windows -- and matched against your configured wake phrases
 4. If a phrase is detected with sufficient confidence, the extension **releases the mic** and fires the mapped command
 5. The target assistant (Claude, Copilot, etc.) takes over the microphone with no contention
 6. After a configurable cooldown, wake word listening resumes automatically
@@ -262,7 +262,9 @@ Spawns a PowerShell process using `System.Speech.Recognition.SpeechRecognitionEn
 
 ### Sherpa engine (default on macOS/Linux, optional on Windows)
 
-Spawns `audio-engine.js` under **system Node.js** (not Electron). The child process uses `decibri` (PortAudio) for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use and cached.
+Spawns `audio-engine.js` under **system Node.js** (not Electron). The child process uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use and cached.
+
+Captured audio passes through voice activity detection (Silero VAD) before it reaches the keyword spotter, so the spotter only runs while someone is speaking and an idle editor does not decode silence. decibri also conditions the signal on the way through: DC offset removal, an 80 Hz high-pass to drop rumble below the voice band, and automatic gain control targeting -18 dBFS so the confidence threshold sees a consistent level.
 
 ### Shared flow
 
@@ -287,6 +289,7 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 | "Could not find Node.js" (macOS/Linux) | Set `wakeWord.nodePath` to the full path of your `node` executable (e.g. `/opt/homebrew/bin/node`). Common when using nvm or fnm. |
 | Microphone access denied (macOS) | Open System Settings → Privacy & Security → Microphone and enable access for VS Code (or your editor). |
 | Model download fails | Check your internet connection. The model is ~17MB downloaded from GitHub. If behind a proxy, ensure HTTPS traffic to `github.com` is allowed. |
+| High CPU while idle (macOS/Linux) | The sherpa engine gates keyword spotting on voice activity detection, so a quiet room should cost close to nothing. Sustained CPU with no one speaking usually means a noisy input: check the correct microphone is selected and lower its input gain. |
 
 ## Privacy
 
