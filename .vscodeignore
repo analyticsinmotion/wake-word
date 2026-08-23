@@ -10,6 +10,9 @@ prototype/**
 tsconfig.json
 AGENTS.md
 scripts/**
+tests/**
+coverage/**
+vitest.config.mts
 test-*.js
 **/*.ts
 **/*.map

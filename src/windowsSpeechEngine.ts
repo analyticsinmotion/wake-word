@@ -1,6 +1,14 @@
 import { EventEmitter } from "events";
 import { spawn, ChildProcess } from "child_process";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
+import {
+  clampThreshold,
+  matchRoute,
+  normalizePhrases,
+  parseEngineLine,
+  parsePowerShellError,
+  splitLines,
+} from "./wakeWordCore";
 
 /**
  * Speech recognition engine for Windows wake word detection.
@@ -43,10 +51,10 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
 
     this._killedIntentionally = false;
     this.currentPhrases = phrases;
-    const safeThreshold = Math.max(0.1, Math.min(0.9, Number(confidenceThreshold) || 0.3));
+    const safeThreshold = clampThreshold(confidenceThreshold);
     this.currentThreshold = safeThreshold;
     this.currentDebugMode = debugMode;
-    const phraseStrings = phrases.flatMap((p) => WindowsSpeechEngine.normalizePhrases(p.phrase));
+    const phraseStrings = phrases.flatMap((p) => normalizePhrases(p.phrase));
     const script = this.buildScript(phraseStrings, safeThreshold, debugMode);
     const encoded = Buffer.from(script, "utf16le").toString("base64");
 
@@ -63,31 +71,30 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
 
     this.process.stdout?.on("data", (data: Buffer) => {
       stdoutBuffer += data.toString();
-      const lines = stdoutBuffer.split("\n");
-      stdoutBuffer = lines.pop() || "";
+      const split = splitLines(stdoutBuffer);
+      stdoutBuffer = split.rest;
 
-      for (const line of lines) {
-        const trimmed = line.trim();
+      for (const line of split.lines) {
+        // A malformed DETECTED line defaults to confidence 0 so it can never
+        // clear the configured threshold.
+        const event = parseEngineLine(line, 0);
+        if (!event) {
+          continue;
+        }
 
-        if (trimmed === "READY") {
+        if (event.type === "ready") {
           this._isListening = true;
           this._isPaused = false;
           this.retryCount = 0;
           this.emit("started");
-        } else if (trimmed.startsWith("DEBUG:")) {
-          this.emit("debug", trimmed.substring(6));
-        } else if (trimmed.startsWith("ERROR:")) {
-          this.emit("error", new Error(trimmed.substring(6)));
-        } else if (trimmed.startsWith("DETECTED:")) {
-          const payload = trimmed.substring(9);
-          const sepIndex = payload.lastIndexOf("|");
-          const detected = (sepIndex >= 0 ? payload.substring(0, sepIndex) : payload).toLowerCase().trim();
-          const confidence = sepIndex >= 0 ? parseFloat(payload.substring(sepIndex + 1)) : 0;
-          const match = phrases.find((p) =>
-            WindowsSpeechEngine.normalizePhrases(p.phrase).includes(detected)
-          );
+        } else if (event.type === "debug") {
+          this.emit("debug", event.message);
+        } else if (event.type === "error") {
+          this.emit("error", new Error(event.message));
+        } else {
+          const match = matchRoute(phrases, event.phrase);
           if (match) {
-            this.emit("detected", match, isNaN(confidence) ? 0 : confidence);
+            this.emit("detected", match, event.confidence);
           }
         }
       }
@@ -126,7 +133,7 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
 
       // Non-zero exit = crash. Retry or report error.
       if (code !== 0) {
-        const stderrMsg = stderrBuffer.trim() ? this.parseStderr(stderrBuffer) : "";
+        const stderrMsg = stderrBuffer.trim() ? parsePowerShellError(stderrBuffer) : "";
         const msg = stderrMsg || `exit code ${code}`;
 
         if (this.retryCount < WindowsSpeechEngine.MAX_RETRIES) {
@@ -201,22 +208,6 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
     this.clearRetryTimer();
     this.stop();
     this.removeAllListeners();
-  }
-
-  static normalizePhrases(phrase: string | string[]): string[] {
-    const arr = Array.isArray(phrase) ? phrase : [phrase];
-    return arr.map((p) => p.toLowerCase().trim()).filter((p) => p.length > 0);
-  }
-
-  private parseStderr(raw: string): string {
-    // Extract error text from PowerShell CLIXML wrapper
-    const match = raw.match(/<S S="Error">(.+?)<\/S>/s);
-    if (match) {
-      return match[1].replace(/_x000D_/g, "").replace(/&#xA;/g, " ").trim();
-    }
-
-    // Fall back to raw text, stripping the CLIXML header
-    return raw.replace(/#< CLIXML\s*/g, "").trim();
   }
 
   private clearRetryTimer(): void {

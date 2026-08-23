@@ -38,6 +38,9 @@ jobs:
       - name: Compile
         run: npm run compile
 
+      - name: Test
+        run: npm test
+
       # The engine tree is the only dependency tree that ships to users, and a
       # broken engine dependency has shipped a dead release before (v0.5.0).
       - name: Install engine dependencies

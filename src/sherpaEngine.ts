@@ -6,6 +6,12 @@ import * as https from "https";
 import { pipeline } from "stream/promises";
 import * as vscode from "vscode";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
+import {
+  clampThreshold,
+  matchRoute,
+  parseEngineLine,
+  splitLines,
+} from "./wakeWordCore";
 
 /**
  * Cross-platform speech recognition engine using sherpa-onnx keyword spotting.
@@ -53,7 +59,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
     this._killedIntentionally = false;
     this.currentPhrases = phrases;
-    const safeThreshold = Math.max(0.1, Math.min(0.9, Number(confidenceThreshold) || 0.3));
+    const safeThreshold = clampThreshold(confidenceThreshold);
     this.currentThreshold = safeThreshold;
     this.currentDebugMode = debugMode;
 
@@ -91,31 +97,30 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
     this.process.stdout?.on("data", (data: Buffer) => {
       stdoutBuffer += data.toString();
-      const lines = stdoutBuffer.split("\n");
-      stdoutBuffer = lines.pop() || "";
+      const split = splitLines(stdoutBuffer);
+      stdoutBuffer = split.rest;
 
-      for (const line of lines) {
-        const trimmed = line.trim();
+      for (const line of split.lines) {
+        // audio-engine.js always reports 1.0: the keyword spotter has already
+        // applied the threshold, so a missing score means "accepted".
+        const event = parseEngineLine(line, 1.0);
+        if (!event) {
+          continue;
+        }
 
-        if (trimmed === "READY") {
+        if (event.type === "ready") {
           this._isListening = true;
           this._isPaused = false;
           this.retryCount = 0;
           this.emit("started");
-        } else if (trimmed.startsWith("DEBUG:")) {
-          this.emit("debug", trimmed.substring(6));
-        } else if (trimmed.startsWith("ERROR:")) {
-          this.emit("error", new Error(trimmed.substring(6)));
-        } else if (trimmed.startsWith("DETECTED:")) {
-          const payload = trimmed.substring(9);
-          const sepIndex = payload.lastIndexOf("|");
-          const detected = (sepIndex >= 0 ? payload.substring(0, sepIndex) : payload).toLowerCase().trim();
-          const confidence = sepIndex >= 0 ? parseFloat(payload.substring(sepIndex + 1)) : 1.0;
-          const match = phrases.find((p) =>
-            normalizePhrases(p.phrase).includes(detected)
-          );
+        } else if (event.type === "debug") {
+          this.emit("debug", event.message);
+        } else if (event.type === "error") {
+          this.emit("error", new Error(event.message));
+        } else {
+          const match = matchRoute(phrases, event.phrase);
           if (match) {
-            this.emit("detected", match, isNaN(confidence) ? 1.0 : confidence);
+            this.emit("detected", match, event.confidence);
           }
         }
       }
@@ -265,11 +270,6 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
 // ── Helpers ─────────────────────────────────────────────────
 
-function normalizePhrases(phrase: string | string[]): string[] {
-  const arr = Array.isArray(phrase) ? phrase : [phrase];
-  return arr.map((p) => p.toLowerCase().trim()).filter((p) => p.length > 0);
-}
-
 /**
  * Locate the system Node.js executable.
  *
@@ -319,6 +319,25 @@ const MODEL_FILES = [
   "tokens.txt",
   "bpe.model",
 ];
+
+/**
+ * True when an HTTP response is a redirect the downloader should follow.
+ *
+ * GitHub release assets answer with a 302 to a CDN host, so the model
+ * download has to follow at least one hop to reach the tarball.
+ */
+export function shouldFollowRedirect(
+  statusCode: number | undefined,
+  location: string | undefined
+): boolean {
+  return (
+    statusCode !== undefined &&
+    statusCode >= 300 &&
+    statusCode < 400 &&
+    typeof location === "string" &&
+    location.length > 0
+  );
+}
 
 /**
  * Ensure the KWS model is downloaded to globalStorage.
@@ -379,8 +398,8 @@ async function downloadModel(
 
         function get(url: string): void {
           https.get(url, (res) => {
-            if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-              get(res.headers.location);
+            if (shouldFollowRedirect(res.statusCode, res.headers.location)) {
+              get(res.headers.location as string);
               return;
             }
             if (res.statusCode !== 200) {

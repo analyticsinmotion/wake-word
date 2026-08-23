@@ -153,6 +153,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts && node scripts/check-readme.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "package": "vsce package",
     "publish:vscode": "vsce publish",
     "publish:openvsx": "ovsx publish",
@@ -161,13 +163,14 @@
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "@types/vscode": "^1.134.0",
+    "@types/vscode": "~1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.67.0",
+    "@typescript-eslint/parser": "^8.67.0",
     "@vscode/vsce": "^3.9.2",
+    "eslint": "^8.56.0",
     "ovsx": "^1.0.1",
     "typescript": "^5.3.3",
-    "eslint": "^8.56.0",
-    "@typescript-eslint/parser": "^8.67.0",
-    "@typescript-eslint/eslint-plugin": "^8.67.0"
+    "vitest": "^4.1.11"
   },
   "dependencies": {}
 }

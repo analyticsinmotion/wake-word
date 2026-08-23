@@ -10,7 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Automated unit test suite (vitest, `npm test`) covering phrase
+  normalisation, route validation, the engine stdout protocol parser, the
+  detection debounce guard, engine selection, the confidence threshold
+  clamp, PowerShell CLIXML error extraction, Node.js executable
+  resolution, model download redirect handling, the sherpa-onnx model
+  path normalisation, the VAD pre-roll ring buffer, stdin config
+  parsing, and BPE keyword tokenisation. The suite needs no microphone,
+  no child process, no network, and no VS Code API, and runs on all
+  three platforms in CI.
+
 ### Changed
+
+- Extracted the logic shared by the extension host and both engines into
+  `src/wakeWordCore.ts`, and the pure logic of the audio engine child
+  process into `engine/lib/`. Phrase normalisation and stdout protocol
+  parsing were previously duplicated per engine and drifting; both now
+  have one implementation.
 
 - Upgraded `decibri` from 1.0.0 to 5.7.0 with VAD-gated keyword spotting.
   Audio is now only fed to the keyword spotter while speech is present,
@@ -35,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The audio engine child process now handles every complete line in a
+  stdin chunk instead of only the first. Node delivers stdin in chunks,
+  not lines, so a `stop` command arriving behind any other line was
+  silently dropped and the child kept running with the microphone open.
+- Phrase normalisation and route validation no longer throw on a
+  non-string phrase. `wakeWord.routes` is user-edited JSON and VS Code
+  does not enforce the contributed schema, so a number or `null` in a
+  phrase array raised `p.toLowerCase is not a function` and took the
+  extension down during activation. Bad entries are now discarded.
+- Model paths are now built with a POSIX join after separator rewriting,
+  so the path handed to the sherpa-onnx WASM engines is identical on
+  every platform rather than depending on the host separator.
 - `stop()` now cancels pending retry timers in both engines. Previously,
   disabling listening during crash backoff left the retry timer running
   and it reopened the microphone after the user explicitly disabled it.
