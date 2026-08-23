@@ -152,13 +152,22 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
   }
 
   stop(): void {
+    // Cancel any pending retry first, before the state guard below.
+    //
+    // During crash backoff both _isListening and _isPaused are false while a
+    // retry timer is armed, so the guard is true. Returning there left the
+    // timer running: "Disable Listening" set the status bar to Off and the
+    // timer then called start() and reopened the microphone. For an
+    // always-listening extension, a disable command that does not disable is
+    // a privacy defect, so this runs unconditionally.
+    this.clearRetryTimer();
+    this.retryCount = 0;
+
     if (!this._isListening && !this._isPaused) {
       return;
     }
 
     this._isPaused = false;
-    this.retryCount = 0;
-    this.clearRetryTimer();
     this.killProcess();
     this._isListening = false;
     this.emit("stopped");

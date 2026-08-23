@@ -24,13 +24,16 @@ wake-word/
     windowsSpeechEngine.ts    # WindowsSpeechEngine: PowerShell child process using Windows System.Speech
     sherpaEngine.ts           # SherpaEngine: audio-engine.js child process under system Node.js
   engine/
-    audio-engine.js           # Child process: decibri mic capture + sherpa-onnx keyword spotting
-    package.json              # Engine dependencies (decibri, sherpa-onnx, sentencepiece-js)
+    audio-engine.js           # Child process: decibri VAD-gated mic capture + sherpa-onnx keyword spotting
+    package.json              # Engine dependencies (decibri 5.7.0, sherpa-onnx 1.12.28, sentencepiece-js 1.1.0)
   scripts/
     check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
   dist/                # Compiled JS output (do not edit)
-  .github/workflows/
-    release.yml        # CI: build .vsix, publish to Marketplace and Open VSX
+  .github/
+    dependabot.yml     # Dependency updates for both / and /engine
+    workflows/
+      ci.yml           # CI: lint, compile, install engine deps on push and PR
+      release.yml      # CI: build .vsix, publish to Marketplace and Open VSX
 ```
 
 `extension.ts` owns all VS Code API interactions. Both engines implement `ISpeechEngine`: `windowsSpeechEngine.ts` (Windows) and `sherpaEngine.ts` (cross-platform). `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
@@ -41,7 +44,9 @@ The extension selects a speech engine via `createEngine()` and wires it with `wi
 
 **WindowsSpeechEngine** spawns a PowerShell process using `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. No model downloads; the engine ships with Windows.
 
-**SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI.
+**SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `decibri` (5.7.0) for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI.
+
+`decibri` runs with Silero VAD enabled and `audio-engine.js` only feeds audio to the keyword spotter while speech is present, so an idle editor does not run the transducer. decibri emits `'data'` for a chunk *before* it scores that chunk, so the handler holds chunks in a 500 ms pre-roll ring and flushes them when `'speech'` fires; drop the pre-roll and the onset of the wake phrase never reaches the spotter. The `'data'` listener is also what keeps the capture stream pumping, so it must stay unconditional. Capture is conditioned with `dcRemoval`, an 80 Hz `highpass`, and `agc: -18`.
 
 On wake word detection, the engine process is killed to release the microphone (handoff), then respawned after a cooldown. This ensures only one thing uses the mic at a time.
 

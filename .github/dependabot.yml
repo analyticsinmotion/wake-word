@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Build and publish toolchain. Nothing here ships in the .vsix.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The engine tree — the only dependency tree that reaches end users.
+  - package-ecosystem: npm
+    directory: "/engine"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

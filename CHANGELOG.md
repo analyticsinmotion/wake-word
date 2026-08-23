@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- Upgraded `decibri` from 1.0.0 to 5.7.0 with VAD-gated keyword spotting.
+  Audio is now only fed to the keyword spotter while speech is present,
+  so an idle editor no longer runs the transducer. Audio conditioning
+  (DC removal, 80 Hz high-pass, AGC at -18 dBFS) improves detection
+  reliability. decibri 5.x is a Rust/cpal rewrite of the 1.0.0
+  C++/PortAudio package; the platform binary ships as a per-platform
+  optional dependency, which increases the `.vsix` size.
+- Microphone failures now map decibri's typed error codes to actionable
+  messages: no microphone found, access denied, device stopped
+  responding, and VAD model load failures are each reported distinctly
+  instead of as one opaque string.
+- Added a PR and push CI workflow running lint, compile, and the engine
+  dependency install. Nothing validated pull requests before this.
+- Added Dependabot configuration covering both the root and `engine/`
+  dependency trees. `engine/` is the only tree that reaches end users
+  and previously had no coverage at all.
+
+### Fixed
+
+- `stop()` now cancels pending retry timers in both engines. Previously,
+  disabling listening during crash backoff left the retry timer running
+  and it reopened the microphone after the user explicitly disabled it.
+- Removed the `docs/` directory (703 KB, including a 560 KB demo video)
+  and the `.claude/` directory from the published `.vsix` via
+  `.vscodeignore`.
+- Fixed `package-lock.json` version drift; the lockfile root version was
+  never regenerated for the 0.5.1 bump.
+
+---
+
 ## [0.5.1] - 2026-03-30
 
 ### Changed
@@ -168,21 +202,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auto-start on VS Code launch (after consent).
 - Windows 10/11 supported; macOS and Linux planned for a future release.
 - Published to VS Code Marketplace and Open VSX Registry.
-
----
-
-## [Unreleased]
-
-### Added
-<!-- Add new features here -->
-
-### Changed
-<!-- Add changed behavior here -->
-
-### Fixed
-<!-- Add bug fixes here -->
-
-### Removed
-<!-- Add removals/deprecations here -->
 
 ---
