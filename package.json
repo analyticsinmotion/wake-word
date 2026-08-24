@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -59,7 +59,7 @@
         "wakeWord.routes": {
           "type": "array",
           "default": [],
-          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Copilot, Hey Claude, Computer).",
+          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Copilot, Hey Claude, Hey Computer).",
           "items": {
             "type": "object",
             "required": [

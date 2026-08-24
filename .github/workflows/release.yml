@@ -19,6 +19,11 @@ jobs:
           - os: ubuntu-latest
             target: linux-x64
             lint: false
+          # GitHub's public ARM runner label is ubuntu-24.04-arm, not a
+          # variant of ubuntu-latest, which is x64.
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            lint: false
 
     runs-on: ${{ matrix.os }}
 
@@ -33,6 +38,11 @@ jobs:
 
       - name: Install engine dependencies
         run: cd engine && npm install
+
+      # Fail the release before publishing if the shipped engine tree cannot
+      # load on this platform.
+      - name: Smoke test engine
+        run: node engine/audio-engine.js --self-test
 
       - name: Lint and compile
         if: matrix.lint

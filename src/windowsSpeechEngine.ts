@@ -91,12 +91,14 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
           this.emit("debug", event.message);
         } else if (event.type === "error") {
           this.emit("error", new Error(event.message));
-        } else {
+        } else if (event.type === "detected") {
           const match = matchRoute(phrases, event.phrase);
           if (match) {
+            // System.Speech returns a real score, so it is reported as given.
             this.emit("detected", match, event.confidence);
           }
         }
+        // This engine never sends RELEASED: process exit is the release.
       }
     });
 
@@ -217,14 +219,26 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
     }
   }
 
+  /**
+   * Kill the speech process, which is what releases the microphone.
+   *
+   * There is no RELEASED message to wait for here, and none is needed:
+   * System.Speech holds the capture device for the lifetime of the PowerShell
+   * process and Windows reclaims it when that process dies. Exit is the
+   * acknowledgement, so the exit is logged rather than assumed.
+   */
   private killProcess(): void {
     if (this.process) {
+      const proc = this.process;
       this._killedIntentionally = true;
-      this.process.stdout?.removeAllListeners();
-      this.process.stderr?.removeAllListeners();
-      this.process.removeAllListeners();
+      proc.stdout?.removeAllListeners();
+      proc.stderr?.removeAllListeners();
+      proc.removeAllListeners();
+      proc.once("exit", () => {
+        this.emit("debug", "Mic release: speech process exited");
+      });
       try {
-        this.process.kill();
+        proc.kill();
       } catch {
         // Process may have already exited
       }

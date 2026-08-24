@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no child process, no network, and no VS Code API, and runs on all
   three platforms in CI.
 
+- `audio-engine.js --self-test` loads decibri, sherpa-onnx, and
+  sentencepiece-js and exits without opening the microphone. CI runs it
+  on every platform, so a missing module or a native ABI mismatch in the
+  shipped engine tree fails the build instead of the user's install.
+
 ### Changed
 
 - Extracted the logic shared by the extension host and both engines into
@@ -50,6 +55,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three platforms (Windows, macOS, Linux) instead of Ubuntu only. The
   matrix mirrors release.yml so a platform-specific break surfaces on
   the pull request rather than at publish time.
+- The default terminal wake phrase is now "Hey Computer" rather than
+  "Computer". A single common English word is spoken far too often in
+  ordinary conversation to sit behind an always-listening microphone.
+  Customised routes in `settings.json` are unaffected; the defaults only
+  apply when `wakeWord.routes` is empty.
+- The sherpa engine no longer reports a confidence for its detections.
+  Its keyword spotter applies its own threshold and returns no usable
+  score, so every detection was logged as "confidence: 1.00", which made
+  the two engines' logs look comparable when they never were. Windows
+  Speech detections continue to show their real scores.
+- CI and release now build for Linux ARM64 as well, bringing both
+  matrices to four targets: win32-x64, darwin-arm64, linux-x64, and
+  linux-arm64. decibri already ships a linux-arm64 pre-built binary.
+- CI now packages the `.vsix` on every platform. The source tree passing
+  is not evidence the artifact builds: packaging has failed twice, once
+  reaching users as a dead v0.4.0 release.
 
 ### Fixed
 
@@ -73,6 +94,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.vscodeignore`.
 - Fixed `package-lock.json` version drift; the lockfile root version was
   never regenerated for the 0.5.1 bump.
+- Microphone release is now acknowledged rather than assumed. The audio
+  engine sends `RELEASED` once `mic.stop()` has returned, and the
+  extension waits for that line before force-killing the child, up to
+  500 ms. Previously the process was killed and the capture device was
+  assumed torn down by the time the target assistant asked for it, which
+  was only ever usually true. On Windows there is no `RELEASED`:
+  System.Speech holds the device for the lifetime of the PowerShell
+  process, so process exit is the confirmation and it is now logged.
+- A write to an audio engine child that had already exited could take
+  the extension host down. EPIPE arrives as an `error` event on the
+  stream rather than a thrown exception, so the existing `try`/`catch`
+  around each write never covered it and nothing listened for it.
 
 ### Security
 
@@ -86,6 +119,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vulnerabilities. These are build and publish tooling only and never
   shipped to users, but they run with `VSCE_PAT` and `OVSX_PAT` in
   scope during a release.
+- The downloaded speech model is now verified against a pinned SHA-256
+  digest before extraction, and a rejected tarball is deleted rather
+  than left on disk. The download follows HTTP redirects to a CDN host
+  and its contents are loaded straight into the keyword spotter, so
+  nothing previously stood between a hijacked redirect and a model of
+  someone else's choosing running on the user's machine.
+- The model download now follows at most 5 redirect hops. A redirect
+  loop previously recursed until the extension host ran out of stack.
 
 ---
 
