@@ -20,6 +20,10 @@ jobs:
             target: darwin-arm64
           - os: ubuntu-latest
             target: linux-x64
+          # GitHub's public ARM runner label is ubuntu-24.04-arm, not a
+          # variant of ubuntu-latest, which is x64.
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -45,3 +49,14 @@ jobs:
       # broken engine dependency has shipped a dead release before (v0.5.0).
       - name: Install engine dependencies
         run: cd engine && npm install
+
+      # Loads decibri, sherpa-onnx, and sentencepiece-js on this platform and
+      # exits. Catches MODULE_NOT_FOUND and native ABI mismatches, neither of
+      # which the source tree shows: v0.4.0 shipped exactly that failure.
+      - name: Smoke test engine
+        run: node engine/audio-engine.js --self-test
+
+      # Packaging is what actually broke twice. Building the artifact on the
+      # pull request catches a vsce failure before it reaches a release.
+      - name: Package VSIX
+        run: npx vsce package --target ${{ matrix.target }} -o wake-word-${{ matrix.target }}-ci.vsix

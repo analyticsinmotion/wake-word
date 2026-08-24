@@ -10,7 +10,13 @@ npm run lint               # Run ESLint + SVG check on README.md. Do not use --f
 npm test                   # Run the unit test suite once (vitest)
 npm run test:watch         # Run the unit tests in watch mode
 npm run package            # Build .vsix package
+
+node engine/audio-engine.js --self-test   # Load the engine dependency tree and exit
 ```
+
+`--self-test` requires `engine/node_modules` (`cd engine && npm install`). It
+opens no microphone and needs no model, so it is safe to run anywhere. CI runs
+it on all four platforms.
 
 Run `npm run lint`, `npm run compile`, and `npm test` before committing. All
 three must pass cleanly.
@@ -28,7 +34,7 @@ wake-word/
     sherpaEngine.ts           # SherpaEngine: audio-engine.js child process under system Node.js
   engine/
     audio-engine.js           # Child process: decibri VAD-gated mic capture + sherpa-onnx keyword spotting
-    package.json              # Engine dependencies (decibri 5.7.0, sherpa-onnx 1.12.28, sentencepiece-js 1.1.0)
+    package.json              # Engine dependencies (decibri 5.7.0, sherpa-onnx 1.13.6, sentencepiece-js 1.1.0)
   engine/lib/          # Pure engine logic, unit tested without a microphone
     model-path.js      # Forward-slash model paths for the sherpa-onnx WASM VFS
     vad-gate.js        # Pre-roll ring buffer and VAD gate state machine
@@ -45,7 +51,7 @@ wake-word/
   .github/
     dependabot.yml     # Dependency updates for both / and /engine
     workflows/
-      ci.yml           # CI: lint, compile, install engine deps on push and PR
+      ci.yml           # CI: lint, compile, test, engine deps, engine self-test, .vsix package
       release.yml      # CI: build .vsix, publish to Marketplace and Open VSX
 ```
 
@@ -55,7 +61,9 @@ wake-word/
 
 ## Architecture
 
-The extension selects a speech engine via `createEngine()` and wires it with `wireEngine()`. Both engines communicate via stdout using four protocols: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, and `DEBUG:<info>`. The extension reads stdout, matches phrases, and fires VS Code commands. All events are logged to a dedicated "Wake Word" output channel.
+The extension selects a speech engine via `createEngine()` and wires it with `wireEngine()`. Both engines communicate via stdout: `READY`, `DETECTED:<phrase>|<confidence>` (the confidence suffix is optional), `RELEASED`, `ERROR:<message>`, and `DEBUG:<info>`. The extension reads stdout, matches phrases, and fires VS Code commands. All events are logged to a dedicated "Wake Word" output channel.
+
+Only the Windows engine produces a real confidence score. sherpa-onnx's keyword spotter applies its own threshold and returns nothing usable, so `audio-engine.js` sends `DETECTED:<phrase>` with no suffix and `SherpaEngine` emits the detection with no confidence. Do not reintroduce a placeholder score: a fixed `confidence: 1.00` in the log made the two engines look comparable when they are not.
 
 **WindowsSpeechEngine** spawns a PowerShell process using `System.Speech.Recognition` with a synchronous `Recognize()` polling loop. No model downloads; the engine ships with Windows.
 
@@ -63,7 +71,11 @@ The extension selects a speech engine via `createEngine()` and wires it with `wi
 
 `decibri` runs with Silero VAD enabled and `audio-engine.js` only feeds audio to the keyword spotter while speech is present, so an idle editor does not run the transducer. decibri emits `'data'` for a chunk *before* it scores that chunk, so the handler holds chunks in a 500 ms pre-roll ring and flushes them when `'speech'` fires; drop the pre-roll and the onset of the wake phrase never reaches the spotter. The `'data'` listener is also what keeps the capture stream pumping, so it must stay unconditional. Capture is conditioned with `dcRemoval`, an 80 Hz `highpass`, and `agc: -18`.
 
-On wake word detection, the engine process is killed to release the microphone (handoff), then respawned after a cooldown. This ensures only one thing uses the mic at a time.
+On wake word detection the microphone is released and the engine process torn down (handoff), then respawned after a cooldown, so only one thing uses the mic at a time. The release is acknowledged, not assumed: `audio-engine.js` sends `RELEASED` once `mic.stop()` has returned and `SherpaEngine.releaseThenKill()` waits for that line before force-killing, capped at 500 ms. `forceKill()` is the unacknowledged path, used by `start()` and `stop()`. The Windows engine has no `RELEASED`, and needs none: System.Speech holds the capture device for the lifetime of the PowerShell process, so process exit is the confirmation.
+
+`pause()` stays synchronous and the target command still fires as soon as it returns; the release completes underneath within the timeout. Ordering the command strictly after `RELEASED` is a handoff policy change and should be designed separately.
+
+The model download verifies the tarball against the pinned `MODEL_SHA256` in `sherpaEngine.ts` before extraction, and follows at most `MAX_REDIRECTS` (5) hops. Changing `MODEL_URL` or `MODEL_VERSION` means recomputing that digest; the command to do so is in the constant's comment.
 
 **IMPORTANT**: The PowerShell process must use Windows PowerShell (`System32\WindowsPowerShell\v1.0\powershell.exe`), not PowerShell Core (`pwsh`). `System.Speech` is not available in PowerShell Core.
 
@@ -129,6 +141,10 @@ Manual testing checklist:
 **NEVER** use PowerShell double-quoted strings for user-provided content (injection risk).
 
 **NEVER** add `darwin-x64` as a CI build target. Intel Mac (pre-2020) is excluded: the `macos-13` GitHub Actions runner has uncertain long-term availability, and `decibri` darwin-x64 pre-built binaries are unconfirmed. Revisit only if a darwin-x64 user files an issue with confirmed binary support.
+
+CI and release build four targets: `win32-x64`, `darwin-arm64`, `linux-x64`, and `linux-arm64`. Linux ARM64 runs on the `ubuntu-24.04-arm` runner label, not a variant of `ubuntu-latest`, which is x64; `decibri` ships a `linux-arm64-gnu` pre-built binary.
+
+**NEVER** ship a model download without a verified digest. The tarball is fetched over redirects to a CDN and loaded straight into the keyword spotter.
 
 **NEVER** modify the ATTRIBUTION.md protocol frontmatter without explicit instruction.
 

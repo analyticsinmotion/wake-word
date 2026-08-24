@@ -12,9 +12,14 @@
  *
  * Protocol (stdout):
  *   READY                        — KWS loaded, mic open, listening
- *   DETECTED:<phrase>|<conf>     — keyword detected (phrase lowercase, conf 0–1)
+ *   DETECTED:<phrase>             — keyword detected (phrase lowercase)
+ *   RELEASED                     — microphone closed, safe to take the device
  *   ERROR:<msg>                  — fatal error
  *   DEBUG:<msg>                  — diagnostic info
+ *
+ * The keyword spotter applies its own threshold and returns no usable score,
+ * so DETECTED carries no confidence value. The parser still accepts the
+ * `|<conf>` suffix the Windows engine sends.
  *
  * Config: read from stdin as a single JSON line then stdin is closed.
  *   { phrases: [{phrase: string, label: string}],
@@ -23,6 +28,9 @@
  *     debugMode: boolean }
  *
  * Stop: close stdin or send "stop\n" on stdin.
+ *
+ * Self-test: `node audio-engine.js --self-test` loads every dependency and
+ * exits without opening the microphone. CI runs it on each platform.
  */
 
 // Resolve modules relative to this script's own node_modules,
@@ -73,6 +81,67 @@ function debug(msg) {
 function fatal(msg) {
   out('ERROR:' + msg);
   process.exit(1);
+}
+
+/**
+ * Exit once stdout has actually flushed.
+ *
+ * process.stdout is an asynchronous pipe on POSIX, so process.exit() straight
+ * after a write can truncate it. Both RELEASED and the self-test result are
+ * read by something on the other end of that pipe, so neither may be lost.
+ * The timer is the backstop for a pipe that never drains.
+ */
+function exitWhenFlushed(code) {
+  let exited = false;
+  const finish = () => {
+    if (exited) return;
+    exited = true;
+    process.exit(code);
+  };
+  try {
+    process.stdout.write('', finish);
+  } catch {
+    finish();
+    return;
+  }
+  setTimeout(finish, 2000);
+}
+
+/**
+ * Load every dependency the engine needs and report what resolved.
+ *
+ * The extension ships engine/node_modules to users, and a break there does not
+ * show up in the source tree: v0.4.0 shipped a MODULE_NOT_FOUND and v0.5.0 a
+ * dead engine dependency. CI runs this on every platform so a missing module
+ * or a native ABI mismatch fails the build instead of the install.
+ */
+function runSelfTest() {
+  try {
+    const { Microphone } = require('decibri');
+    const sherpa = require('sherpa-onnx');
+    const { SentencePieceProcessor } = require('sentencepiece-js');
+
+    if (typeof Microphone !== 'function') {
+      throw new Error('decibri did not export a Microphone constructor');
+    }
+    if (typeof sherpa.createKws !== 'function') {
+      throw new Error('sherpa-onnx did not export createKws');
+    }
+    if (typeof SentencePieceProcessor !== 'function') {
+      throw new Error('sentencepiece-js did not export a SentencePieceProcessor constructor');
+    }
+
+    out('SELF-TEST:OK');
+    out('SELF-TEST:platform=' + process.platform + '-' + process.arch);
+    out('SELF-TEST:node=' + process.versions.node + ' abi=' + process.versions.modules);
+    out('SELF-TEST:decibri=loaded');
+    out('SELF-TEST:sherpa-onnx=loaded');
+    out('SELF-TEST:sentencepiece-js=loaded');
+    exitWhenFlushed(0);
+  } catch (err) {
+    out('SELF-TEST:FAIL:' + err.message);
+    exitWhenFlushed(1);
+  }
 }
 
 async function main(config) {
@@ -194,7 +263,11 @@ async function main(config) {
         const phrase = phraseMap[decodedKey];
         if (phrase) {
           if (debugMode) debug('KWS result: ' + JSON.stringify(result));
-          out('DETECTED:' + phrase + '|1.0');
+          // No confidence suffix: the spotter has already applied the
+          // threshold and the score it returns is not a usable confidence.
+          // Reporting a fixed 1.0 made these lines look comparable to the
+          // Windows engine's real scores when they never were.
+          out('DETECTED:' + phrase);
         } else {
           if (debugMode) debug('Unmatched KWS result: ' + JSON.stringify(result));
         }
@@ -253,6 +326,13 @@ function shutdown() {
     try { mic.stop(); } catch { /* ignore */ }
     mic = null;
   }
+
+  // The capture device is closed. Say so before doing anything else: the
+  // extension waits for RELEASED before firing the command that takes the
+  // microphone over, rather than killing this process and trusting the OS to
+  // have reclaimed the device by then.
+  out('RELEASED');
+
   if (kwsStream) {
     try { kwsStream.free(); } catch { /* ignore */ }
     kwsStream = null;
@@ -261,7 +341,15 @@ function shutdown() {
     try { kws.free(); } catch { /* ignore */ }
     kws = null;
   }
-  process.exit(0);
+  exitWhenFlushed(0);
+}
+
+// --self-test loads the dependency tree and exits. It must run before the
+// stdin wiring below, which would otherwise hold the process open waiting for
+// a config line that CI never sends.
+if (process.argv.includes('--self-test')) {
+  runSelfTest();
+  return;
 }
 
 // Read config from stdin (single JSON line)

@@ -82,7 +82,7 @@
 
 Say a wake phrase and the right AI assistant opens -- no clicking required.
 
-Say **"Hey Claude"** and Claude opens. Say **"Hey Copilot"** and Copilot opens. Say **"Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
+Say **"Hey Claude"** and Claude opens. Say **"Hey Copilot"** and Copilot opens. Say **"Hey Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
 
 **Zero config. No API keys. No accounts. No system dependencies.** Install and go.
 
@@ -145,7 +145,7 @@ These work out of the box with no configuration:
 | --- | --- | --- |
 | "Hey Copilot" | GitHub Copilot Chat | `workbench.action.chat.open` |
 | "Hey Claude" | Claude Code | `claude-vscode.focus` |
-| "Computer" | Terminal | `workbench.action.terminal.focus` |
+| "Hey Computer" | Terminal | `workbench.action.terminal.focus` |
 
 ### Custom routes
 
@@ -199,7 +199,7 @@ Override the global cooldown for individual routes with `cooldownSeconds`:
 ```json
 {
   "label": "Terminal",
-  "phrase": "computer",
+  "phrase": "hey computer",
   "command": "workbench.action.terminal.focus",
   "cooldownSeconds": 10
 }
@@ -209,7 +209,8 @@ Override the global cooldown for individual routes with `cooldownSeconds`:
 
 When a wake phrase is detected:
 
-1. The extension **immediately kills** the speech engine process, releasing the mic
+1. The extension asks the speech engine to close the microphone and waits for it to
+   confirm, then kills the process (forcing it after 500 ms if no confirmation arrives)
 2. The target VS Code command fires (opening the assistant)
 3. The assistant's voice mode takes over the microphone with no contention
 4. After `wakeWord.cooldownSeconds` (default: 30), wake word listening resumes

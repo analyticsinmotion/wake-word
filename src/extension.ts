@@ -6,6 +6,7 @@ import { SherpaEngine } from "./sherpaEngine";
 import {
   DETECTION_DEBOUNCE_MS,
   clampThreshold,
+  formatConfidence,
   resolveRoutes,
   selectEngineKind,
   shouldDebounce,
@@ -37,7 +38,9 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
   },
   {
     label: "Terminal",
-    phrase: "computer",
+    // "Hey Computer", not "Computer": a single common English word triggers
+    // on ordinary speech far too readily for an always-listening extension.
+    phrase: "hey computer",
     command: "workbench.action.terminal.focus",
   },
 ];
@@ -58,7 +61,7 @@ function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
 // ── Engine wiring ────────────────────────────────────────────
 
 function wireEngine(engine: ISpeechEngine): void {
-  engine.on("detected", (phrase: WakePhrase, confidence: number) => {
+  engine.on("detected", (phrase: WakePhrase, confidence?: number) => {
     onWakeWordDetected(phrase, confidence);
   });
   engine.on("started", () => setStatusBar("listening"));
@@ -301,7 +304,7 @@ function buildRoutes(config: vscode.WorkspaceConfiguration): WakePhrase[] {
 
 // ── Wake word triggered ─────────────────────────────────────
 
-async function onWakeWordDetected(phrase: WakePhrase, confidence: number) {
+async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
   const now = Date.now();
   if (shouldDebounce(now, lastDetectionTime, DETECTION_DEBOUNCE_MS)) {
     log("info", `Debounced duplicate detection: ${phrase.label}`);
@@ -309,7 +312,9 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence: number) {
   }
   lastDetectionTime = now;
 
-  log("info", `Detected: "${phrase.label}" (confidence: ${confidence.toFixed(2)})`);
+  // Only the Windows engine supplies a score; formatConfidence renders
+  // nothing when there is none to show.
+  log("info", `Detected: "${phrase.label}"${formatConfidence(confidence)}`);
 
   const config = vscode.workspace.getConfiguration("wakeWord");
   const showNotification = config.get<boolean>(

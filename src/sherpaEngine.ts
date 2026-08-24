@@ -1,5 +1,6 @@
 import { EventEmitter } from "events";
 import { spawn, ChildProcess, execSync } from "child_process";
+import { createHash } from "crypto";
 import { existsSync, mkdirSync, createWriteStream, writeFileSync, readFileSync, unlinkSync } from "fs";
 import * as path from "path";
 import * as https from "https";
@@ -32,8 +33,17 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   private currentDebugMode = false;
   private retryCount = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private releaseTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly MAX_RETRIES = 3;
   private static readonly RETRY_DELAYS = [2000, 5000, 10000];
+  /**
+   * How long to wait for the child's RELEASED before force killing it.
+   *
+   * mic.stop() is a device close, not a network call: half a second is
+   * generous. The cap exists so a wedged child cannot hold the microphone
+   * open, not because the acknowledgement is expected to be slow.
+   */
+  private static readonly RELEASE_TIMEOUT_MS = 500;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -55,7 +65,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       return;
     }
 
-    this.killProcess();
+    this.forceKill();
 
     this._killedIntentionally = false;
     this.currentPhrases = phrases;
@@ -81,6 +91,15 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    // A write to a child that has already exited surfaces EPIPE as an 'error'
+    // event on the stream, not as a thrown exception, so the try/catch around
+    // each write does not cover it. Without a listener that event takes the
+    // extension host down, and the release path deliberately writes to a child
+    // that is on its way out.
+    this.process.stdin?.on("error", () => {
+      /* child is gone; nothing left to say to it */
+    });
+
     // Send config as JSON line then leave stdin open (child reads more commands)
     const config = {
       phrases: phrases.map((p) => ({
@@ -101,9 +120,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       stdoutBuffer = split.rest;
 
       for (const line of split.lines) {
-        // audio-engine.js always reports 1.0: the keyword spotter has already
-        // applied the threshold, so a missing score means "accepted".
-        const event = parseEngineLine(line, 1.0);
+        const event = parseEngineLine(line);
         if (!event) {
           continue;
         }
@@ -117,12 +134,17 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
           this.emit("debug", event.message);
         } else if (event.type === "error") {
           this.emit("error", new Error(event.message));
-        } else {
+        } else if (event.type === "detected") {
           const match = matchRoute(phrases, event.phrase);
           if (match) {
-            this.emit("detected", match, event.confidence);
+            // No confidence: the keyword spotter applied its own threshold
+            // and returns no usable score. Reporting one anyway put a
+            // meaningless "confidence: 1.00" in every log line.
+            this.emit("detected", match, undefined);
           }
         }
+        // RELEASED is only of interest while a release is in flight, and
+        // releaseThenKill() installs its own listener for it.
       }
     });
 
@@ -206,7 +228,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
 
     this._isPaused = false;
-    this.killProcess();
+    this.forceKill();
     this._isListening = false;
     this.emit("stopped");
   }
@@ -218,7 +240,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
     this._isPaused = true;
     this.clearRetryTimer();
-    this.killProcess();
+    this.releaseThenKill();
     this._isListening = false;
     this.emit("paused");
   }
@@ -234,6 +256,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
   dispose(): void {
     this.clearRetryTimer();
+    this.clearReleaseTimer();
     this.stop();
     this.removeAllListeners();
   }
@@ -245,24 +268,120 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
   }
 
-  private killProcess(): void {
-    if (this.process) {
-      this._killedIntentionally = true;
-      this.process.stdout?.removeAllListeners();
-      this.process.stderr?.removeAllListeners();
-      // Send stop command before killing so the mic is released cleanly
-      try {
-        this.process.stdin?.write("stop\n");
-        this.process.stdin?.end();
-      } catch {
-        // Process may have already exited
+  private clearReleaseTimer(): void {
+    if (this.releaseTimer) {
+      clearTimeout(this.releaseTimer);
+      this.releaseTimer = null;
+    }
+  }
+
+  /**
+   * Ask the child to close the microphone and wait until it says it has.
+   *
+   * The extension fires the target command immediately after pause() returns,
+   * and that command exists to hand the microphone to something else. The
+   * previous behaviour killed the child and assumed the OS had torn the
+   * capture device down by the time anything else asked for it, which was
+   * only ever usually true. The child now prints RELEASED once mic.stop() has
+   * returned, so wait for that line and force kill on a timeout so a wedged
+   * child cannot hold the device open indefinitely.
+   *
+   * pause() stays synchronous: the command fires as soon as it returns and
+   * the release completes within the timeout underneath. Ordering the command
+   * strictly after RELEASED is a handoff policy change, not this one.
+   */
+  private releaseThenKill(): void {
+    const proc = this.process;
+    if (!proc) {
+      return;
+    }
+
+    this._killedIntentionally = true;
+    this.clearReleaseTimer();
+
+    // Take stdout over for the duration: the normal handler must not emit a
+    // detection from a process that is already shutting down.
+    proc.stdout?.removeAllListeners("data");
+    proc.stderr?.removeAllListeners("data");
+
+    let settled = false;
+    const finish = (reason: string): void => {
+      if (settled) {
+        return;
       }
-      this.process.removeAllListeners();
-      try {
-        this.process.kill();
-      } catch {
-        // Process may have already exited
+      settled = true;
+      this.clearReleaseTimer();
+      this.emit("debug", `Mic release: ${reason}`);
+      this.forceKill(proc);
+    };
+
+    proc.stdout?.on("data", (data: Buffer) => {
+      for (const line of data.toString().split("\n")) {
+        if (parseEngineLine(line)?.type === "released") {
+          finish("acknowledged by engine");
+          return;
+        }
       }
+    });
+
+    this.releaseTimer = setTimeout(
+      () => finish(`no acknowledgement after ${SherpaEngine.RELEASE_TIMEOUT_MS}ms, forcing`),
+      SherpaEngine.RELEASE_TIMEOUT_MS
+    );
+
+    if (!this.writeStop(proc)) {
+      finish("stdin already closed");
+    }
+  }
+
+  /**
+   * Send the stop command. Returns false when the child is already gone.
+   */
+  private writeStop(proc: ChildProcess): boolean {
+    const stdin = proc.stdin;
+    if (!stdin || !stdin.writable || proc.exitCode !== null) {
+      return false;
+    }
+    try {
+      stdin.write("stop\n");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Tear the child down now, without waiting for an acknowledgement.
+   *
+   * `target` defaults to the current child. releaseThenKill() passes the
+   * process it captured, because the exit handler may already have cleared
+   * `this.process` by the time the acknowledgement or the timeout lands.
+   */
+  private forceKill(target: ChildProcess | null = this.process): void {
+    const proc = target;
+    if (!proc) {
+      return;
+    }
+
+    this._killedIntentionally = true;
+    this.clearReleaseTimer();
+    proc.stdout?.removeAllListeners();
+    proc.stderr?.removeAllListeners();
+    // Ask for a clean release first even here: a child that acts on it closes
+    // the device itself rather than leaving the OS to reclaim it.
+    this.writeStop(proc);
+    try {
+      proc.stdin?.end();
+    } catch {
+      // Process may have already exited
+    }
+    proc.removeAllListeners();
+    try {
+      proc.kill();
+    } catch {
+      // Process may have already exited
+    }
+    if (this.process === proc) {
       this.process = null;
     }
   }
@@ -312,6 +431,30 @@ const MODEL_URL =
   "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/" +
   MODEL_NAME + ".tar.bz2";
 
+/**
+ * SHA-256 of the model tarball at MODEL_URL (17,626,723 bytes).
+ *
+ * The download follows HTTP redirects to a CDN host and the result is fed
+ * straight into the keyword spotter, so nothing but this digest stands
+ * between a hijacked redirect and a model of someone else's choosing loading
+ * on the user's machine. Recompute and update this whenever MODEL_URL or
+ * MODEL_VERSION changes:
+ *
+ *   curl -L -o model.tar.bz2 "<MODEL_URL>"
+ *   shasum -a 256 model.tar.bz2      # certutil -hashfile model.tar.bz2 SHA256
+ */
+export const MODEL_SHA256 =
+  "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a";
+
+/**
+ * Redirect hops the model download will follow before giving up.
+ *
+ * GitHub answers a release asset with one 302 to a CDN host, so at least one
+ * hop is required. The cap stops a redirect loop from recursing until the
+ * extension host runs out of stack.
+ */
+export const MAX_REDIRECTS = 5;
+
 const MODEL_FILES = [
   "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
   "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
@@ -337,6 +480,29 @@ export function shouldFollowRedirect(
     typeof location === "string" &&
     location.length > 0
   );
+}
+
+/** True once the downloader has followed as many redirects as it will. */
+export function redirectLimitExceeded(hops: number, max: number = MAX_REDIRECTS): boolean {
+  return hops >= max;
+}
+
+/**
+ * Throw unless the downloaded tarball matches the expected digest.
+ *
+ * Runs before extraction, so a tampered or truncated download never reaches
+ * `tar` and never reaches the keyword spotter. The message carries a prefix
+ * of each digest: enough to tell a corrupted download from a substituted one
+ * in a bug report, without a wall of hex in a notification.
+ */
+export function verifyModelHash(actual: string, expected: string = MODEL_SHA256): void {
+  if (actual.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error(
+      "Model integrity check failed. Expected SHA-256 " +
+        `${expected.substring(0, 16)}..., got ${actual.substring(0, 16)}...: ` +
+        "the download may be corrupted or tampered with."
+    );
+  }
 }
 
 /**
@@ -396,10 +562,17 @@ async function downloadModel(
       await new Promise<void>((resolve, reject) => {
         const file = createWriteStream(tarballPath);
 
-        function get(url: string): void {
+        function get(url: string, hops = 0): void {
           https.get(url, (res) => {
             if (shouldFollowRedirect(res.statusCode, res.headers.location)) {
-              get(res.headers.location as string);
+              if (redirectLimitExceeded(hops)) {
+                res.resume();
+                reject(
+                  new Error(`Too many redirects (over ${MAX_REDIRECTS}) downloading model`)
+                );
+                return;
+              }
+              get(res.headers.location as string, hops + 1);
               return;
             }
             if (res.statusCode !== 200) {
@@ -424,9 +597,30 @@ async function downloadModel(
         get(MODEL_URL);
       });
 
+      // Verify before extraction. The download followed redirects to a CDN
+      // host and the files inside are loaded straight into the keyword
+      // spotter, so a bad tarball must never reach `tar`.
+      progress.report({ message: "Verifying..." });
+      const actualHash = createHash("sha256").update(readFileSync(tarballPath)).digest("hex");
+      debugLog?.("Model SHA-256: " + actualHash);
+      try {
+        verifyModelHash(actualHash);
+      } catch (err) {
+        // Leaving a rejected tarball on disk would have the next attempt
+        // resume against a file that is already known bad.
+        try {
+          unlinkSync(tarballPath);
+        } catch {
+          // non-fatal
+        }
+        throw err;
+      }
+
       progress.report({ message: "Extracting..." });
       debugLog?.("Extracting " + tarballPath);
 
+      // The tarball's entries are all under a single MODEL_NAME directory, so
+      // this lands on modelDir directly.
       // Use system tar (available on macOS and Linux where SherpaEngine is used)
       execSync(`tar -xjf "${tarballPath}" -C "${storageDir}"`);
 

@@ -143,6 +143,7 @@ export function selectEngineKind(override: string, platform: string): EngineKind
 
 export type EngineEvent =
   | { type: "ready" }
+  | { type: "released" }
   | { type: "detected"; phrase: string; confidence: number }
   | { type: "error"; message: string }
   | { type: "debug"; message: string };
@@ -150,19 +151,25 @@ export type EngineEvent =
 /**
  * Parse one line of an engine's stdout.
  *
- * Both engines emit the same four-verb protocol:
+ * Both engines emit the same protocol:
  *   READY
- *   DETECTED:<phrase>|<confidence>
+ *   DETECTED:<phrase>|<confidence>   (the suffix is optional)
+ *   RELEASED
  *   ERROR:<message>
  *   DEBUG:<message>
+ *
+ * RELEASED is sent by the sherpa engine's child once the microphone has been
+ * closed. The Windows engine has no equivalent: System.Speech holds the
+ * device for the lifetime of the PowerShell process, so process exit is the
+ * release confirmation there.
  *
  * Anything else (blank lines, stray output from a child's dependencies)
  * returns null and is ignored by the caller.
  *
  * `defaultConfidence` is used when a DETECTED line carries no `|<confidence>`
- * suffix or an unparseable one. The sherpa engine's child always reports 1.0,
- * so it passes 1.0; the Windows engine reports a real score and passes 0 so a
- * malformed line can never clear a threshold.
+ * suffix or an unparseable one. The sherpa engine's child sends no suffix at
+ * all and its caller discards the value; the Windows engine reports a real
+ * score and passes 0 so a malformed line can never clear a threshold.
  */
 export function parseEngineLine(
   line: string,
@@ -172,6 +179,9 @@ export function parseEngineLine(
 
   if (trimmed === "READY") {
     return { type: "ready" };
+  }
+  if (trimmed === "RELEASED") {
+    return { type: "released" };
   }
   if (trimmed.startsWith("DEBUG:")) {
     return { type: "debug", message: trimmed.substring(6) };
@@ -194,6 +204,22 @@ export function parseEngineLine(
   }
 
   return null;
+}
+
+/**
+ * Render the confidence suffix for a detection log line.
+ *
+ * Only the Windows engine produces a real score. sherpa-onnx's keyword
+ * spotter applies its own threshold and returns nothing usable, so
+ * SherpaEngine reports no confidence rather than a fabricated 1.0 that made
+ * the two engines' logs look comparable when they are not. An absent or
+ * non-finite value renders as nothing at all.
+ */
+export function formatConfidence(confidence: number | undefined): string {
+  if (typeof confidence !== "number" || !isFinite(confidence)) {
+    return "";
+  }
+  return ` (confidence: ${confidence.toFixed(2)})`;
 }
 
 /**

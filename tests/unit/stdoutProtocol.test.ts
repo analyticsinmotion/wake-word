@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseEngineLine, splitLines } from "../../src/wakeWordCore";
+import { formatConfidence, parseEngineLine, splitLines } from "../../src/wakeWordCore";
 
 describe("parseEngineLine", () => {
   it("parses READY", () => {
@@ -57,6 +57,33 @@ describe("parseEngineLine", () => {
       type: "detected",
       phrase: "a|b|c",
       confidence: 0.75,
+    });
+  });
+
+  it("parses RELEASED", () => {
+    // The sherpa child sends this once mic.stop() has returned. The extension
+    // waits for it before firing the command that takes the microphone.
+    expect(parseEngineLine("RELEASED")).toEqual({ type: "released" });
+    expect(parseEngineLine("  RELEASED\r")).toEqual({ type: "released" });
+  });
+
+  it("does not mistake other output for RELEASED", () => {
+    expect(parseEngineLine("released")).toBeNull();
+    expect(parseEngineLine("RELEASED:now")).toBeNull();
+    expect(parseEngineLine("DEBUG:RELEASED")).toEqual({
+      type: "debug",
+      message: "RELEASED",
+    });
+  });
+
+  it("parses the sherpa DETECTED form, which carries no confidence", () => {
+    // audio-engine.js stopped sending a fabricated |1.0 suffix: the keyword
+    // spotter applies its own threshold and returns no usable score.
+    // SherpaEngine discards the parsed value and emits no confidence at all.
+    expect(parseEngineLine("DETECTED:hey computer")).toEqual({
+      type: "detected",
+      phrase: "hey computer",
+      confidence: 1.0,
     });
   });
 
@@ -135,5 +162,24 @@ describe("splitLines", () => {
 
   it("handles an empty buffer", () => {
     expect(splitLines("")).toEqual({ lines: [], rest: "" });
+  });
+});
+
+describe("formatConfidence", () => {
+  it("renders a real score to two decimal places", () => {
+    expect(formatConfidence(0.923)).toBe(" (confidence: 0.92)");
+    expect(formatConfidence(0)).toBe(" (confidence: 0.00)");
+    expect(formatConfidence(1)).toBe(" (confidence: 1.00)");
+  });
+
+  it("renders nothing when the engine supplied no score", () => {
+    // SherpaEngine reports no confidence rather than a fabricated 1.0, so a
+    // sherpa detection logs as `Detected: "Claude"` with nothing after it.
+    expect(formatConfidence(undefined)).toBe("");
+  });
+
+  it("renders nothing for a non-finite score", () => {
+    expect(formatConfidence(NaN)).toBe("");
+    expect(formatConfidence(Infinity)).toBe("");
   });
 });
