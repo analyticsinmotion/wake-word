@@ -122,8 +122,8 @@ code --install-extension analytics-in-motion.wake-word
 | Platform | Requirement |
 | --- | --- |
 | Windows 10/11 | No additional software. Uses built-in `System.Speech.Recognition` |
-| macOS | Node.js 18+ (for the speech engine child process) |
-| Linux | Node.js 18+ (for the speech engine child process) |
+| macOS | Node.js 22 or later (LTS) for the speech engine child process |
+| Linux | Node.js 22 or later (LTS) for the speech engine child process |
 
 On macOS and Linux a local speech model (~17MB) is downloaded on first use and cached. If Node.js is installed via nvm or fnm and not on VS Code's PATH, set `wakeWord.nodePath` to the full path of your `node` executable.
 
@@ -301,8 +301,8 @@ All speech recognition runs locally on your machine. No audio data ever leaves y
 | Platform | Status | Engine |
 | --- | --- | --- |
 | Windows 10/11 | Supported | Windows built-in System.Speech |
-| macOS | Supported | sherpa-onnx (requires Node.js 18+) |
-| Linux | Supported | sherpa-onnx (requires Node.js 18+) |
+| macOS | Supported | sherpa-onnx (requires Node.js 22 or later) |
+| Linux | Supported | sherpa-onnx (requires Node.js 22 or later) |
 
 ## Compatibility
 
