@@ -51,7 +51,7 @@ wake-word/
   .github/
     dependabot.yml     # Dependency updates for both / and /engine
     workflows/
-      ci.yml           # CI: lint, compile, test, engine deps, engine self-test, .vsix package
+      ci.yml           # CI: lint, compile, test, engine deps, binary prune, engine self-test, .vsix package
       release.yml      # CI: build .vsix, publish to Marketplace and Open VSX
 ```
 
@@ -69,7 +69,7 @@ Only the Windows engine produces a real confidence score. sherpa-onnx's keyword 
 
 **SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `decibri` (5.7.0) for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI.
 
-`decibri` runs with Silero VAD enabled and `audio-engine.js` only feeds audio to the keyword spotter while speech is present, so an idle editor does not run the transducer. decibri emits `'data'` for a chunk *before* it scores that chunk, so the handler holds chunks in a 500 ms pre-roll ring and flushes them when `'speech'` fires; drop the pre-roll and the onset of the wake phrase never reaches the spotter. The `'data'` listener is also what keeps the capture stream pumping, so it must stay unconditional. Capture is conditioned with `dcRemoval`, an 80 Hz `highpass`, and `agc: -18`.
+`decibri` runs with Silero VAD enabled and `audio-engine.js` only feeds audio to the keyword spotter while speech is present, so an idle editor does not run the transducer. decibri emits `'data'` for a chunk *before* it scores that chunk, so the handler holds chunks in a 500 ms pre-roll ring and flushes them when `'speech'` fires; drop the pre-roll and the onset of the wake phrase never reaches the spotter. The `'data'` listener is also what keeps the capture stream pumping, so it must stay unconditional. Capture is conditioned with `dcRemoval`, an 80 Hz `highpass`, and `agc: -18`. The microphone is opened with `Microphone.open()`, decibri's async factory, so the Silero model load runs on the native thread pool instead of blocking the event loop. In debug mode the engine emits `DEBUG:overruns: <n>` whenever decibri's `overrunCount` has changed, checked every 30 seconds; a rising count means the decode loop is falling behind capture.
 
 On wake word detection the microphone is released and the engine process torn down (handoff), then respawned after a cooldown, so only one thing uses the mic at a time. The release is acknowledged, not assumed: `audio-engine.js` sends `RELEASED` once `mic.stop()` has returned and `SherpaEngine.releaseThenKill()` waits for that line before force-killing, capped at 500 ms. `forceKill()` is the unacknowledged path, used by `start()` and `stop()`. The Windows engine has no `RELEASED`, and needs none: System.Speech holds the capture device for the lifetime of the PowerShell process, so process exit is the confirmation.
 
@@ -143,6 +143,8 @@ Manual testing checklist:
 **NEVER** add `darwin-x64` as a CI build target. Intel Mac (pre-2020) is excluded: the `macos-13` GitHub Actions runner has uncertain long-term availability, and `decibri` darwin-x64 pre-built binaries are unconfirmed. Revisit only if a darwin-x64 user files an issue with confirmed binary support.
 
 CI and release build four targets: `win32-x64`, `darwin-arm64`, `linux-x64`, and `linux-arm64`. Linux ARM64 runs on the `ubuntu-24.04-arm` runner label, not a variant of `ubuntu-latest`, which is x64; `decibri` ships a `linux-arm64-gnu` pre-built binary.
+
+Both workflows run on Node 22. After the engine install, each job deletes any `@decibri` platform package that does not match its build target and fails unless exactly one remains, so a `.vsix` never ships another platform's native binary. npm already installs only the package whose `os`/`cpu` fields match the runner; the step turns that into an assertion.
 
 **NEVER** ship a model download without a verified digest. The tarball is fetched over redirects to a CDN and loaded straight into the keyword spotter.
 

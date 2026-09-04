@@ -219,9 +219,14 @@ async function main(config) {
   //
   // Conditioning runs dcRemoval -> highpass -> agc on the delivered audio.
   // VAD reads the pre-conditioning signal, so the two are independent.
+  //
+  // Microphone.open() is decibri's async factory. The constructor loads the
+  // Silero model inline and blocks the event loop for the duration; the
+  // factory does the same work on the native thread pool and rejects with
+  // the same error classes, so the catch below is unchanged.
   if (debugMode) debug('opening microphone...');
   try {
-    mic = new Microphone({
+    mic = await Microphone.open({
       sampleRate: 16000,
       channels: 1,
       vad: 'silero',
@@ -231,6 +236,15 @@ async function main(config) {
     });
   } catch (err) {
     fatal(micErrorMessage(err, 'Failed to open microphone'));
+    return;
+  }
+
+  // A stop that arrived while the open was in flight found no microphone to
+  // close and has already sent RELEASED. Close this one now rather than hold
+  // the device until the process exits.
+  if (stopping) {
+    try { mic.stop(); } catch { /* ignore */ }
+    mic = null;
     return;
   }
 
@@ -314,6 +328,23 @@ async function main(config) {
       feed(ready);
     }
   });
+
+  // Debug only: decibri's overrunCount is the number of capture chunks it has
+  // dropped because the consumer fell behind the stream, so a rising figure
+  // means the decode loop cannot keep up with the microphone. Reported only
+  // when it changes, so a session with no overruns produces no output, and
+  // unref'd so the timer never holds the process open on its own.
+  if (debugMode) {
+    let reported = 0;
+    setInterval(() => {
+      if (stopping || !mic) return;
+      const count = mic.overrunCount;
+      if (count !== reported) {
+        debug('overruns: ' + count);
+        reported = count;
+      }
+    }, 30000).unref();
+  }
 
   out('READY');
   if (debugMode) debug('mic open, VAD-gated, listening for: ' + Object.values(phraseMap).join(', '));

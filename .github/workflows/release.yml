@@ -28,16 +28,42 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
 
       - run: npm ci
 
       - name: Install engine dependencies
         run: cd engine && npm install
+
+      # npm installs only the @decibri platform package whose os/cpu fields
+      # match the runner, so this directory normally holds one package already.
+      # This step turns that into a guarantee: any other platform's binary is
+      # removed, and the build fails unless exactly one package matching the
+      # target remains. The smoke test and the .vsix below then see the tree
+      # that ships.
+      - name: Prune non-target engine binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd engine/node_modules/@decibri
+          kept=0
+          for dir in */; do
+            case "$dir" in
+              *"$TARGET"*) kept=$((kept + 1)) ;;
+              *) echo "Removing $dir"; rm -rf "$dir" ;;
+            esac
+          done
+          echo "Remaining @decibri packages:"
+          ls -la
+          if [ "$kept" -ne 1 ]; then
+            echo "::error::Expected exactly one @decibri package matching $TARGET, found $kept"
+            exit 1
+          fi
 
       # Fail the release before publishing if the shipped engine tree cannot
       # load on this platform.
@@ -56,7 +82,7 @@ jobs:
 
       # Attach .vsix to the GitHub release
       - name: Upload .vsix to release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix
         env:
