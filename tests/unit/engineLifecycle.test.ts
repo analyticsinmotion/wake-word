@@ -229,6 +229,18 @@ describe("start", () => {
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
   });
 
+  it("lets a second start supersede one still checking the model", async () => {
+    // Two starts in flight used to mean two children: the first spawned
+    // after its check, then the second spawned over it and lost the handle.
+    const { engine } = makeEngine();
+    const first = engine.start(ROUTES, 0.3, false);
+    const second = engine.start(ROUTES, 0.5, false);
+    await Promise.all([first, second]);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(configLine(latest()).threshold).toBe(0.5);
+  });
+
   it("reports a missing node executable as a nodePath problem", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, false);
@@ -382,6 +394,33 @@ describe("stop", () => {
     proc.sendLine("READY");
     expect(engine.isListening).toBe(false);
     expect(events.started).toBe(0);
+  });
+
+  it("abandons a start that is still checking the model", async () => {
+    // start() awaits the model check before it spawns. A stop that lands in
+    // that window finds no child to kill and, before this was fixed, the
+    // spawn then went ahead anyway: Disable during a first-run model
+    // download ended with the engine listening and the status bar on Off.
+    const { engine, events } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    engine.stop();
+    await starting;
+    await flush();
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(engine.isListening).toBe(false);
+    expect(engine.isPaused).toBe(false);
+    expect(events.debug).toContain("Start abandoned: stopped during the model check");
+  });
+
+  it("leaves the engine startable after an abandoned start", async () => {
+    const { engine, events } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    engine.stop();
+    await starting;
+    await startAndReady(engine);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(engine.isListening).toBe(true);
+    expect(events.started).toBe(1);
   });
 });
 

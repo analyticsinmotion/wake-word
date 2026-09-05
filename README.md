@@ -97,7 +97,7 @@ https://github.com/user-attachments/assets/fb007095-5c4c-4927-aaa6-fa76550d7cb2
 3. Audio is processed locally -- through voice activity detection and keyword spotting on macOS/Linux, or the built-in recogniser on Windows -- and matched against your configured wake phrases
 4. If a phrase is detected with sufficient confidence, the extension **releases the mic** and fires the mapped command
 5. The target assistant (Claude, Copilot, etc.) takes over the microphone with no contention
-6. After a configurable cooldown, wake word listening resumes automatically
+6. Wake word listening resumes after a configurable cooldown, or, for routes set to manual handoff, when you click the status bar
 
 ## Installation
 
@@ -146,6 +146,8 @@ These work out of the box with no configuration:
 | "Hey Copilot" | GitHub Copilot Chat | `workbench.action.chat.open` |
 | "Hey Claude" | Claude Code | `claude-vscode.focus` |
 | "Hey Computer" | Terminal | `workbench.action.terminal.focus` |
+
+The Claude route uses manual handoff (see [Handoff mode](#handoff-mode)): after it fires, listening stays paused until you click **Wake: Paused** in the status bar. The other two resume after the cooldown.
 
 ### Custom routes
 
@@ -205,6 +207,24 @@ Override the global cooldown for individual routes with `cooldownSeconds`:
 }
 ```
 
+### Handoff mode
+
+`handoff` chooses how listening comes back after a route fires:
+
+- `"timer"` (default): listening resumes after `cooldownSeconds`.
+- `"manual"`: listening stays paused until you click the status bar or run **Wake Word: Enable Listening**. Use this for assistants whose voice sessions run longer than the cooldown, so Wake Word does not restart under them and compete for the microphone.
+
+```json
+{
+  "label": "Claude",
+  "phrase": "hey claude",
+  "command": "claude-vscode.focus",
+  "handoff": "manual"
+}
+```
+
+The status bar shows **Wake: Paused** while a manual route waits. The default Claude route uses manual handoff.
+
 ### The handoff
 
 When a wake phrase is detected:
@@ -213,8 +233,8 @@ When a wake phrase is detected:
    confirm, then kills the process (forcing it after 500 ms if no confirmation arrives)
 2. The target VS Code command fires (opening the assistant)
 3. The assistant's voice mode takes over the microphone with no contention
-4. After `wakeWord.cooldownSeconds` (default: 30), wake word listening resumes
-5. Status bar shows a live countdown (`Wake: 30s → Wake: 29s → ...`) during handoff, then returns to "Wake: Listening"
+4. After `wakeWord.cooldownSeconds` (default: 30), wake word listening resumes. A route with `handoff: "manual"` waits for you instead
+5. Status bar shows a live countdown (`Wake: 30s → Wake: 29s → ...`) during handoff, then returns to "Wake: Listening". A manual route shows "Wake: Paused" instead, with no countdown
 
 This ensures only one thing uses the mic at a time.
 
@@ -229,7 +249,7 @@ The lock lives in the extension's global storage, which windows of the same edit
 | Setting | Default | Description |
 | --- | --- | --- |
 | `wakeWord.routes` | `[]` | Wake phrase routing table. Uses defaults if empty. |
-| `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming |
+| `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming. Routes with `handoff: "manual"` wait for you instead |
 | `wakeWord.enableOnStartup` | `true` | Start listening when the editor opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
 | `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, resume on regain |
@@ -251,6 +271,10 @@ The lock lives in the extension's global storage, which windows of the same edit
 
 Changing it restarts the engine. If the value matches no device, or more than one, the error notification says so and names the value. The Windows engine (`System.Speech`) always uses the system default input device, so set `wakeWord.engine` to `sherpa` to choose a device on Windows.
 
+### Calibrating
+
+**Wake Word: Calibrate** listens for 15 seconds and logs every wake phrase it hears, with the time and, on the Windows engine, the confidence score, without firing any route. Say each of your phrases a few times at your normal distance, then open the Wake Word output channel: the summary groups detections by phrase with the count, the average confidence, and the minimum. No detections means the microphone, the room, or the threshold needs attention; a minimum close to `wakeWord.confidenceThreshold` means that phrase is on the edge. The sherpa engine reports no score, so its summary has counts only. Whatever the extension was doing before, listening, a cooldown, or a manual pause, is put back afterwards.
+
 ## Commands
 
 - **Wake Word: Enable Listening** -- start the detector
@@ -258,6 +282,7 @@ Changing it restarts the engine. If the value matches no device, or more than on
 - **Wake Word: Toggle Listening** -- toggle on/off (also via status bar click)
 - **Wake Word: Reset Microphone Consent** -- clear consent and re-prompt
 - **Wake Word: Open Settings** -- open the Settings editor filtered to Wake Word (also linked from the status bar tooltip)
+- **Wake Word: Calibrate** -- listen for 15 seconds and log what is heard without firing any route (see [Calibrating](#calibrating))
 
 ## Common command IDs
 
@@ -303,8 +328,9 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 
 | Problem | Solution |
 | --- | --- |
-| Engine starts but never detects phrases | Try lowering `wakeWord.confidenceThreshold` (e.g. `0.2`). Speak clearly and close to your microphone. |
+| Engine starts but never detects phrases | Run **Wake Word: Calibrate** to see what the engine hears. Try lowering `wakeWord.confidenceThreshold` (e.g. `0.2`). Speak clearly and close to your microphone. |
 | Too many false positives | Enable `wakeWord.confirmationMode`, which requires the phrase twice within 5 seconds: say it, pause about three seconds, say it again. The status bar shows `Wake: Confirm` between the two. Also try raising `wakeWord.confidenceThreshold` (e.g. `0.5` or higher) and using longer, more distinctive wake phrases. |
+| Listening does not resume after a wake phrase | The route uses `handoff: "manual"`, which the default Claude route does. Click **Wake: Paused** in the status bar or run **Wake Word: Enable Listening**. Set `handoff` to `"timer"` on that route to resume after the cooldown instead. |
 | "Failed to start speech engine" | Ensure your microphone is connected and not in use by another application. Check your system sound settings. |
 | Status bar shows "Wake: Error" | Click the status bar item to retry. Check the Output panel for details. If the error persists, try **Wake Word: Reset Microphone Consent** and re-enable. |
 | Extension keeps restarting | The engine retries up to 3 times on crash with increasing delays. If it fails after 3 retries, check that your audio device is working. |

@@ -8,6 +8,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.0] - 2026-09-05
+
+### Added
+
+- Per-route handoff mode: `handoff: "timer" | "manual"` on each entry in
+  `wakeWord.routes`. `timer` resumes listening after `cooldownSeconds`,
+  which is the existing behaviour and the default. `manual` leaves
+  listening paused, with the status bar showing `Wake: Paused`, until you
+  click the status bar or run **Wake Word: Enable Listening**. An
+  unrecognised value is treated as `timer`.
+- **Wake Word: Calibrate** command. Runs a 15 second listening session
+  and logs every wake phrase heard, with the time and, on the Windows
+  engine, the confidence score, without firing any route. The summary
+  groups detections by phrase with the count, average, and minimum
+  confidence. Results go to the Wake Word output channel. Whatever the
+  extension was doing beforehand is put back afterwards: listening stays
+  listening, an interrupted cooldown resumes with its remaining seconds,
+  a manual handoff stays paused, and Off returns to Off.
+- Acoustic benchmark framework under `tests/acoustic/`. `npm run
+  benchmark` feeds WAV recordings through the same sherpa-onnx keyword
+  spotter the extension runs and reports false rejection rate per phrase,
+  false acceptance rate per file and per hour of audio, and detection
+  latency. The framework, its unit tests, and a generated 10 second
+  silence fixture are committed; real recordings are added separately as
+  described in `tests/acoustic/README.md`. Not part of CI.
+
+### Changed
+
+- The default Claude route now uses `handoff: "manual"`, since voice
+  sessions with an assistant tend to run longer than the 30 second
+  cooldown, during which the engine would restart and compete for the
+  microphone.
+- The consent dialog now says listening resumes after a cooldown or when
+  you resume it from the status bar.
+
+### Fixed
+
+- Disabling listening while the sherpa engine was still checking for or
+  downloading its model did not stop the engine. The check is
+  asynchronous, the stop found no child process to kill, and the spawn
+  went ahead afterwards, leaving the engine listening while the status
+  bar said Off. Reachable on the first run on macOS and Linux, or with
+  `wakeWord.engine` set to `sherpa`, by disabling during the download.
+  `start()` now abandons the spawn when a `stop()` has landed in the
+  meantime, and a second `start()` during the check supersedes the first
+  instead of spawning two children. Found while wiring the calibration
+  command; covered by new lifecycle tests.
+- A change to `wakeWord.routes` made while listening was paused for a
+  handoff was never applied: resuming replayed the phrases the engine was
+  paused with, and the new list only took effect after a Disable and
+  Enable. The change is now noted and the resume performs a full start
+  with the current routes. Route changes made while listening restart the
+  engine immediately, as before.
+
 ## [0.10.0] - 2026-09-05
 
 ### Added

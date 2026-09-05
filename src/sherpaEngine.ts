@@ -34,6 +34,13 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   private retryCount = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private releaseTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Advanced by every start() and stop(). start() awaits the model check
+   * before it spawns, and a stop that lands in that window finds no child
+   * to kill; the generation is how the start notices afterwards that it
+   * has been overtaken and must not spawn.
+   */
+  private startGeneration = 0;
   private static readonly MAX_RETRIES = 3;
   private static readonly RETRY_DELAYS = [2000, 5000, 10000];
   /**
@@ -77,6 +84,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     // by then, otherwise a needless kill and respawn mid model load.
     this.clearRetryTimer();
     this.forceKill();
+    const generation = ++this.startGeneration;
 
     this._killedIntentionally = false;
     this.currentPhrases = phrases;
@@ -91,6 +99,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       this.emit("error", new Error("Model unavailable: " + message));
+      return;
+    }
+
+    // A stop() or a newer start() landed while the check above was in
+    // flight. Neither found a child to deal with, because there was none
+    // yet, so this start has to be the one that stands down: spawning now
+    // would reopen the microphone after a Disable, or put two children on
+    // it after a second start.
+    if (generation !== this.startGeneration) {
+      this.emit("debug", "Start abandoned: stopped during the model check");
       return;
     }
 
@@ -234,6 +252,8 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     // a privacy defect, so this runs unconditionally.
     this.clearRetryTimer();
     this.retryCount = 0;
+    // Likewise a start() still awaiting the model check: see startGeneration.
+    this.startGeneration++;
 
     // Kill whatever child exists before the state guard, for the same
     // reason. A child that has been spawned but has not yet said READY is
@@ -453,7 +473,8 @@ export function findSystemNode(override?: string): string {
 // ── Model management ─────────────────────────────────────────
 
 const MODEL_VERSION = "1";
-const MODEL_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
+/** Exported for tests/acoustic, which carries its own copy and checks it against this. */
+export const MODEL_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
 const MODEL_URL =
   "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/" +
   MODEL_NAME + ".tar.bz2";
@@ -482,7 +503,7 @@ export const MODEL_SHA256 =
  */
 export const MAX_REDIRECTS = 5;
 
-const MODEL_FILES = [
+export const MODEL_FILES = [
   "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
   "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
   "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",

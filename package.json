@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -55,6 +55,10 @@
       {
         "command": "wakeWord.openSettings",
         "title": "Wake Word: Open Settings"
+      },
+      {
+        "command": "wakeWord.calibrate",
+        "title": "Wake Word: Calibrate"
       }
     ],
     "configuration": {
@@ -100,6 +104,12 @@
                 "minimum": 5,
                 "maximum": 300,
                 "description": "Override the global cooldown for this route (seconds). Falls back to wakeWord.cooldownSeconds if not set."
+              },
+              "handoff": {
+                "type": "string",
+                "enum": ["timer", "manual"],
+                "default": "timer",
+                "description": "How to resume after handing off. 'timer' resumes after cooldownSeconds. 'manual' waits until you click the status bar or run Wake Word: Enable Listening."
               }
             }
           }
@@ -109,7 +119,7 @@
           "default": 30,
           "minimum": 5,
           "maximum": 300,
-          "description": "Seconds to pause wake word listening after handing off to an assistant."
+          "description": "Seconds to pause wake word listening after handing off to an assistant. Routes with handoff set to 'manual' wait for you instead."
         },
         "wakeWord.enableOnStartup": {
           "type": "boolean",
@@ -169,6 +179,7 @@
     "lint": "eslint src && node scripts/check-readme.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "benchmark": "node tests/acoustic/run-benchmark.js",
     "package": "vsce package",
     "publish:vscode": "vsce publish",
     "publish:openvsx": "ovsx publish",
