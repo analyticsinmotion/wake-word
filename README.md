@@ -218,6 +218,12 @@ When a wake phrase is detected:
 
 This ensures only one thing uses the mic at a time.
 
+### Multiple windows
+
+If you have more than one editor window open, only one listens at a time. The first window to start listening takes a lock; the others show **Wake: Other window** in the status bar and stand by. When the listening window closes, crashes, or has listening disabled, a standing-by window takes over within about ten seconds. The lock is held through the cooldown after a detection, so a second window never opens the microphone while an assistant has it.
+
+The lock lives in the extension's global storage, which windows of the same editor share. Windows of different editor products do not see each other's lock.
+
 ## Settings
 
 | Setting | Default | Description |
@@ -230,6 +236,19 @@ This ensures only one thing uses the mic at a time.
 | `wakeWord.confidenceThreshold` | `0.3` | Minimum confidence score (0.1–0.9) for wake phrase detection |
 | `wakeWord.engine` | `auto` | Speech engine: `auto` (platform default), `windows` (System.Speech), or `sherpa` (cross-platform) |
 | `wakeWord.nodePath` | `""` | Path to Node.js executable. Leave empty to auto-detect. Set this if the engine cannot find Node.js (macOS/Linux with nvm or fnm). |
+| `wakeWord.audioDevice` | `""` | Microphone to use: a case-insensitive substring of the device name (e.g. `"USB"`) or a device index. Empty for the system default. Sherpa engine only. |
+
+### Choosing a microphone
+
+`wakeWord.audioDevice` selects the input device for the sherpa engine. Use any case-insensitive substring of the device name as it appears in your system sound settings, or the device's index number:
+
+```json
+{
+  "wakeWord.audioDevice": "Blue Yeti"
+}
+```
+
+Changing it restarts the engine. If the value matches no device, or more than one, the error notification says so and names the value. The Windows engine (`System.Speech`) always uses the system default input device, so set `wakeWord.engine` to `sherpa` to choose a device on Windows.
 
 ## Commands
 
@@ -255,7 +274,7 @@ Useful values for the `command` field in your routes. Command IDs listed are for
 
 ## How It Works (Technical)
 
-The extension selects a speech engine based on platform (or the `wakeWord.engine` setting) and spawns it as a background child process. Both engines communicate via stdout using the same protocol: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, `DEBUG:<info>`.
+The extension selects a speech engine based on platform (or the `wakeWord.engine` setting) and spawns it as a background child process. Both engines communicate via stdout using the same protocol: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, `DEBUG:<info>`. The sherpa engine also sends `RELEASED` once it has closed the microphone.
 
 ### Windows engine (default on Windows)
 
@@ -291,6 +310,9 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 | Microphone access denied (macOS) | Open System Settings → Privacy & Security → Microphone and enable access for VS Code (or your editor). |
 | Model download fails | Check your internet connection. The model is ~17MB downloaded from GitHub. If behind a proxy, ensure HTTPS traffic to `github.com` is allowed. |
 | High CPU while idle (macOS/Linux) | The sherpa engine gates keyword spotting on voice activity detection, so a quiet room should cost close to nothing. Sustained CPU with no one speaking usually means a noisy input: check the correct microphone is selected and lower its input gain. |
+| Status bar shows "Wake: Other window" | Another window of the same editor is listening. Only one listens at a time, and this window takes over automatically when that one stops. To move listening here now, disable it in the other window. |
+| Wrong microphone is used | With the sherpa engine, set `wakeWord.audioDevice` to part of the device's name (e.g. `"USB"`) or its index. The Windows engine always uses the system default input; change that in Windows sound settings. |
+| "No microphone matching ... was found" | The `wakeWord.audioDevice` value did not match any input device. Compare it with the device names in your system sound settings, or clear it to use the default. |
 
 ## Privacy
 

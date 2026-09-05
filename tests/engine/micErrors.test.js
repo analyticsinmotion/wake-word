@@ -68,3 +68,87 @@ describe('micErrorMessage', () => {
     }
   });
 });
+
+/**
+ * With wakeWord.audioDevice set, a lookup failure has to name the setting and
+ * the value. "No microphone found" is the wrong diagnosis on a machine with
+ * three microphones where the name simply matched none of them.
+ */
+describe('micErrorMessage with a configured device', () => {
+  const notFound = { code: 'MICROPHONE_NOT_FOUND', message: 'No microphone found matching "Blue Yeti"' };
+
+  it('names the device that matched nothing', () => {
+    expect(micErrorMessage(notFound, 'Failed to open microphone', 'Blue Yeti')).toBe(
+      'No microphone matching "Blue Yeti" was found. ' +
+        'Check wakeWord.audioDevice against the input devices on this machine.'
+    );
+  });
+
+  it('keeps the generic message when no device was configured', () => {
+    const generic = 'No microphone found. Check your audio device settings.';
+    expect(micErrorMessage(notFound, 'prefix')).toBe(generic);
+    expect(micErrorMessage(notFound, 'prefix', '')).toBe(generic);
+    expect(micErrorMessage(notFound, 'prefix', '   ')).toBe(generic);
+    expect(micErrorMessage(notFound, 'prefix', null)).toBe(generic);
+  });
+
+  it('names an index that is past the end of the device list', () => {
+    // decibri's JS wrapper raises a plain RangeError here, with no code.
+    const err = new RangeError(
+      'device index out of range. Call Microphone.devices() to list available devices'
+    );
+    expect(micErrorMessage(err, 'Failed to open microphone', '7')).toBe(
+      'Microphone index 7 is out of range. ' +
+        'Check wakeWord.audioDevice against the input devices on this machine.'
+    );
+  });
+
+  it('falls back to the prefix for an out-of-range index when no device was configured', () => {
+    const err = new RangeError('device index out of range. Call Microphone.devices()');
+    expect(micErrorMessage(err, 'Failed to open microphone')).toBe(
+      'Failed to open microphone: device index out of range. Call Microphone.devices()'
+    );
+  });
+
+  it('explains a name that matches more than one device', () => {
+    expect(micErrorMessage({ code: 'MULTIPLE_DEVICES_MATCH' }, 'prefix', 'Mic')).toBe(
+      'More than one microphone matches "Mic". ' +
+        'Use a longer name or the device index in wakeWord.audioDevice.'
+    );
+  });
+
+  it('still explains an ambiguous match with no device recorded', () => {
+    expect(micErrorMessage({ code: 'MULTIPLE_DEVICES_MATCH' }, 'prefix')).toContain(
+      'the requested name'
+    );
+  });
+
+  it('names a device that is not an input', () => {
+    expect(micErrorMessage({ code: 'NOT_AN_INPUT_DEVICE' }, 'prefix', 'Speakers')).toBe(
+      'The audio device "Speakers" is not a microphone. Check wakeWord.audioDevice.'
+    );
+  });
+
+  it('does not blame the device for a machine with no microphone at all', () => {
+    expect(micErrorMessage({ code: 'NO_MICROPHONE_FOUND' }, 'prefix', 'USB')).toBe(
+      'No microphone found. Check your audio device settings.'
+    );
+  });
+
+  it('ignores the device for errors unrelated to selection', () => {
+    expect(micErrorMessage({ code: 'PERMISSION_DENIED' }, 'prefix', 'USB')).toBe(
+      'Microphone access denied. Enable microphone access for VS Code in your system privacy settings.'
+    );
+    expect(
+      micErrorMessage({ code: 'DEVICE_FAILED', message: 'stream closed' }, 'prefix', 'USB')
+    ).toBe('The microphone stopped responding: stream closed');
+    expect(micErrorMessage({ code: 'SOMETHING_NEW', message: 'boom' }, 'prefix', 'USB')).toBe(
+      'prefix: boom'
+    );
+  });
+
+  it('trims and stringifies whatever the setting held', () => {
+    expect(micErrorMessage(notFound, 'prefix', '  Blue Yeti ')).toContain('"Blue Yeti"');
+    expect(micErrorMessage(notFound, 'prefix', 1)).toContain('"1"');
+  });
+});

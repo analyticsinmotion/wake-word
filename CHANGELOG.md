@@ -8,6 +8,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] - 2026-09-05
+
+### Added
+
+- Multi-window listener coordination. Only one editor window listens at a
+  time. The first window to start listening writes a PID lock to the
+  extension's global storage; any other window shows "Wake: Other window"
+  in the status bar and checks every 10 seconds whether the lock holder
+  has gone. It takes over automatically when the owning window closes,
+  crashes, or has listening disabled. The lock is held through the
+  cooldown after a detection, so a second window cannot open the
+  microphone while an assistant has it. The lock is created exclusively,
+  so windows restored together on editor startup cannot both win it.
+  Windows of different editor products keep separate global storage and
+  do not see each other's lock.
+- `wakeWord.audioDevice` setting for choosing the microphone. Accepts a
+  case-insensitive substring of the device name (`"USB"`, `"Blue Yeti"`)
+  or a device index (`"1"`). Empty means the system default. The value is
+  passed to decibri's `device` option in the audio engine. A name that
+  matches nothing, a name that matches more than one device, and an index
+  past the end of the device list each produce an error that names the
+  value and the setting. Applies to the sherpa engine; the Windows engine
+  always uses the system default input.
+- Session statistics. On deactivation, and before an engine switch resets
+  the counters, the output channel gets one line: session length in
+  minutes, detections per phrase, errors, engine starts, and cooldowns.
+  Nothing is stored or sent anywhere.
+- Engine lifecycle tests against a mock child process: start, stop,
+  pause, resume, the stdout protocol, crash and retry backoff, the retry
+  cancellation that `stop()` and `pause()` must perform, and the
+  `RELEASED` handshake with its 500 ms timeout. These paths were
+  previously covered only by the manual checklist.
+
+### Changed
+
+- Changing `wakeWord.audioDevice` restarts the engine, as changing
+  `wakeWord.engine` or `wakeWord.nodePath` already did.
+
+### Fixed
+
+- `stop()` did nothing to a child that had been spawned but had not yet
+  reported `READY`, because during that window the engine is neither
+  listening nor paused and the state guard returned early. The child then
+  finished loading, opened the microphone, and reported `READY` to an
+  engine the user had stopped. Disable Listening, Reset Microphone
+  Consent, and an engine switch all reached this path if used within the
+  first second or two of a start, and the engine switch case left the old
+  child holding the microphone alongside the new one. Both engines now
+  kill any child they have before checking state. Found by the new
+  lifecycle tests.
+- `pause()` during crash backoff left the retry timer armed, so an engine
+  that had been told to pause could reopen the microphone when the timer
+  fired. The extension never reached this path, because it checks
+  `isListening` before pausing, but the engine's own contract was wrong.
+  Both engines now cancel the retry and become resumable.
+- `start()` during crash backoff also left the retry timer armed, so it
+  could fire into the fresh child: a no-op if `READY` had arrived by then,
+  otherwise a needless kill and respawn in the middle of the model load.
+  Reachable by clicking the status bar during the backoff. Both engines
+  now cancel the retry on start.
+
+---
+
 ## [0.8.0] - 2026-09-05
 
 ### Added
