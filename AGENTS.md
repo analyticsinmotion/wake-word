@@ -6,7 +6,7 @@
 npm install                # Install dependencies
 npm run compile            # Build TypeScript to dist/
 npm run watch              # Build in watch mode
-npm run lint               # Run ESLint + SVG check on README.md. Do not use --fix.
+npm run lint               # Run ESLint (flat config, eslint.config.mjs) + SVG check on README.md. Do not use --fix.
 npm test                   # Run the unit test suite once (vitest)
 npm run test:watch         # Run the unit tests in watch mode
 npm run package            # Build .vsix package
@@ -50,6 +50,7 @@ wake-word/
     mocks/childProcess.ts  # MockChildProcess: drives the engine state machine without a real process
   scripts/
     check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
+  eslint.config.mjs    # ESLint 9 flat config. Pins the ESLint 8 rule set; see the comments in the file
   dist/                # Compiled JS output (do not edit)
   .github/
     dependabot.yml     # Dependency updates for both / and /engine
@@ -60,7 +61,7 @@ wake-word/
 
 `extension.ts` owns all VS Code API interactions. Both engines implement `ISpeechEngine`: `windowsSpeechEngine.ts` (Windows) and `sherpaEngine.ts` (cross-platform). `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
 
-`wakeWordCore.ts` holds the logic both engines and the extension host share: phrase normalisation, route validation, the stdout protocol parser, the debounce guard, engine selection, and the threshold clamp. It imports nothing from `vscode`, so it is directly unit testable. Put shared pure logic there rather than duplicating it per engine. `engine/lib/` is the same idea for the child process.
+`wakeWordCore.ts` holds the logic both engines and the extension host share: phrase normalisation, route validation, the stdout protocol parser, the debounce guard, the confirmation check, engine selection, and the threshold clamp. It imports nothing from `vscode`, so it is directly unit testable. Put shared pure logic there rather than duplicating it per engine. `engine/lib/` is the same idea for the child process.
 
 ## Architecture
 
@@ -85,6 +86,10 @@ Both engines cancel a pending crash-backoff retry in `stop()`, `pause()`, and `s
 **Multi-window coordination.** Every editor window runs its own extension host and each one activates this extension, so without coordination three windows meant three engine processes on one microphone. `lockFile.ts` implements a PID lock at `<globalStorage>/wake-word.lock`. `startListening()` takes the lock before starting the engine; a window that cannot take it shows "Wake: Other window" and polls every `LOCK_CHECK_INTERVAL_MS` (10 s) until the holder's PID is gone or the file is removed, then starts. The lock is held across pause and cooldown, released by `stopListening()` (Disable, toggle off, consent reset, deactivate), and taken over when its PID is dead or the file is corrupt. Creation uses the `wx` flag so windows that start at the same moment cannot both win. Known limits: different editor products have separate global storage and do not see each other's lock; a window stuck in the error state keeps the lock until listening is disabled there or it closes; PID reuse after a crash can make a stale lock read as live until that process exits.
 
 **Session statistics.** `extension.ts` keeps a `SessionStats` record (defined in `wakeWordCore.ts`): detections per route label, errors, engine starts, cooldowns, and a start time. `formatSessionStats()` renders it as one log line, written on deactivate and before an engine switch resets the counters. No storage, no network.
+
+**Phrase confirmation.** `wakeWord.confirmationMode` (off by default) makes `onWakeWordDetected()` hold the first hearing of a phrase instead of firing. `evaluateConfirmation()` in `wakeWordCore.ts` makes the decision; the extension keeps the engine listening, shows `Wake: Confirm "<label>"` in the status bar, and starts a `CONFIRMATION_WINDOW_MS` (5 s) timer. The same label heard again inside the window fires the route as normal. A different label replaces the hold and restarts the timer. The timer expiring drops the hold and puts the status bar back to Listening, provided the engine is still listening. The debounce guard runs before the confirmation check so an engine re-firing on one utterance cannot confirm itself, which also means the second utterance has to land between `DETECTION_DEBOUNCE_MS` (3 s) and 5 s after the first. `clearConfirmation()` drops the hold in `stopListening()`, the focus-loss pause, `resumeListening()`, and the engine switch handler. Session statistics count a detection only once it fires.
+
+**Open Settings.** `wakeWord.openSettings` opens the Settings editor filtered to `wakeWord`. The Off and Listening status bar tooltips are trusted `MarkdownString`s ending in a command link to it; the status bar click itself stays the toggle.
 
 The model download verifies the tarball against the pinned `MODEL_SHA256` in `sherpaEngine.ts` before extraction, and follows at most `MAX_REDIRECTS` (5) hops. Changing `MODEL_URL` or `MODEL_VERSION` means recomputing that digest; the command to do so is in the constant's comment.
 
@@ -155,6 +160,8 @@ Manual testing checklist:
 11. Open a second window. Its status bar shows "Wake: Other window" and the first keeps listening. Close the first window; within about 10 s the second shows "Wake: Listening".
 12. With the sherpa engine, set `wakeWord.audioDevice` to part of a connected microphone's name. Confirm the engine restarts and the "Starting:" log line names the device. Set it to a name that matches nothing and confirm the error notification names that value.
 13. Switch `wakeWord.engine` after a few detections and confirm a "Session:" line with per-phrase counts appears in the output channel. The same line is written on deactivate, which in the Extension Development Host shows in the debug console.
+14. Run **Wake Word: Open Settings** from the command palette, then from the link in the status bar tooltip. Both open the Settings editor filtered to `wakeWord`.
+15. Enable `wakeWord.confirmationMode`. Say a wake phrase once: the status bar shows `Wake: Confirm "<label>"`, nothing fires, and after 5 s it returns to Listening. Say it, pause about three seconds, say it again: the second hearing fires the route and the log shows the "heard once" and "confirmed" lines. Disable the setting and confirm a single hearing fires immediately again.
 
 ## Boundaries
 

@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -51,6 +51,10 @@
       {
         "command": "wakeWord.resetConsent",
         "title": "Wake Word: Reset Microphone Consent"
+      },
+      {
+        "command": "wakeWord.openSettings",
+        "title": "Wake Word: Open Settings"
       }
     ],
     "configuration": {
@@ -129,6 +133,11 @@
           "maximum": 0.9,
           "description": "Minimum confidence score (0.1 to 0.9) required to trigger a wake phrase. Lower values detect more but increase false positives."
         },
+        "wakeWord.confirmationMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require the wake phrase to be detected twice within 5 seconds before triggering. Reduces false positives in noisy environments."
+        },
         "wakeWord.nodePath": {
           "type": "string",
           "default": "",
@@ -157,7 +166,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts && node scripts/check-readme.js",
+    "lint": "eslint src && node scripts/check-readme.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "package": "vsce package",
@@ -169,10 +178,11 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "~1.85.0",
+    "@eslint/js": "^10.0.0",
     "@typescript-eslint/eslint-plugin": "^8.68.0",
     "@typescript-eslint/parser": "^8.69.0",
     "@vscode/vsce": "^3.9.2",
-    "eslint": "^8.56.0",
+    "eslint": "^10.0.0",
     "ovsx": "^1.0.1",
     "typescript": "^5.3.3",
     "vitest": "^4.1.11"

@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.0] - 2026-09-05
+
+### Added
+
+- **Wake Word: Open Settings** command, which opens the Settings editor
+  filtered to this extension. The status bar tooltip links to it, so a
+  route can be added or changed from the status bar without knowing the
+  setting names.
+- `wakeWord.confirmationMode` setting. When enabled, a wake phrase has to
+  be detected twice within 5 seconds before it triggers. The first hearing
+  is held while the engine keeps listening and the status bar shows
+  `Wake: Confirm "<label>"`. A second hearing of the same phrase fires the
+  route, a different phrase replaces the hold, and the hold is dropped when
+  the window passes or when listening stops, pauses, resumes, or switches
+  engine. The 3 second debounce still applies, so the second hearing has
+  to be a second utterance. Disabled by default. Reduces false positives
+  in noisy environments.
+
+### Changed
+
+- Migrated ESLint from 8.x to 9.x with the flat config format:
+  `eslint.config.mjs` replaces `.eslintrc.json`. The effective rule set is
+  unchanged. Rules that ESLint 9 added to or removed from its recommended
+  set, and one whose default changed, are pinned to their ESLint 8 values,
+  verified by diffing the resolved config before and after. The lint
+  script no longer passes `--ext ts`; the config matches `src/**/*.ts`
+  itself.
+
 ## [0.9.0] - 2026-09-05
 
 ### Added
