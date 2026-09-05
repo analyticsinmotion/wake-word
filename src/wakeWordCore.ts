@@ -314,3 +314,60 @@ export function formatSessionStats(stats: SessionStats, now: number = Date.now()
     `, ${plural(stats.cooldowns, "cooldown")}`
   );
 }
+
+// -- Phrase confirmation ------------------------------------------------
+
+/** How long a first detection waits for the second one that confirms it. */
+export const CONFIRMATION_WINDOW_MS = 5000;
+
+/** The first of the two detections `wakeWord.confirmationMode` requires. */
+export interface PendingConfirmation {
+  /** Route label of the phrase heard. */
+  phrase: string;
+  /** Epoch milliseconds of that detection. */
+  time: number;
+}
+
+export interface ConfirmationResult {
+  /** True when the caller should act on this detection. */
+  confirmed: boolean;
+  /** State to carry to the next detection. Null once confirmed or when off. */
+  pending: PendingConfirmation | null;
+}
+
+/**
+ * Decide whether a detection that has already passed the debounce guard
+ * should fire now or be held for a second hearing.
+ *
+ * With confirmation off every detection fires and nothing is held. With it
+ * on, the first hearing of a phrase is held while the engine keeps
+ * listening; the same phrase heard again within `windowMs` confirms it. A
+ * different phrase replaces the held one and starts its own window. A held
+ * phrase older than the window is discarded and the new hearing becomes the
+ * first.
+ *
+ * The debounce guard runs first, so the engine repeating one utterance
+ * cannot confirm itself: the second hearing has to be a second utterance,
+ * which means it lands between DETECTION_DEBOUNCE_MS and `windowMs` after
+ * the first.
+ */
+export function evaluateConfirmation(
+  enabled: boolean,
+  pending: PendingConfirmation | null,
+  label: string,
+  now: number,
+  windowMs: number = CONFIRMATION_WINDOW_MS
+): ConfirmationResult {
+  if (!enabled) {
+    return { confirmed: true, pending: null };
+  }
+  if (pending && pending.phrase === label && now - pending.time <= windowMs) {
+    return { confirmed: true, pending: null };
+  }
+  return { confirmed: false, pending: { phrase: label, time: now } };
+}
+
+/** Status bar text while a first detection waits for its second. */
+export function formatConfirmationStatus(label: string): string {
+  return `$(question) Wake: Confirm "${label}"`;
+}

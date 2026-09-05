@@ -234,6 +234,7 @@ The lock lives in the extension's global storage, which windows of the same edit
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
 | `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, resume on regain |
 | `wakeWord.confidenceThreshold` | `0.3` | Minimum confidence score (0.1–0.9) for wake phrase detection |
+| `wakeWord.confirmationMode` | `false` | Require the wake phrase twice within 5 seconds before triggering. Reduces false positives in noisy environments. |
 | `wakeWord.engine` | `auto` | Speech engine: `auto` (platform default), `windows` (System.Speech), or `sherpa` (cross-platform) |
 | `wakeWord.nodePath` | `""` | Path to Node.js executable. Leave empty to auto-detect. Set this if the engine cannot find Node.js (macOS/Linux with nvm or fnm). |
 | `wakeWord.audioDevice` | `""` | Microphone to use: a case-insensitive substring of the device name (e.g. `"USB"`) or a device index. Empty for the system default. Sherpa engine only. |
@@ -256,6 +257,7 @@ Changing it restarts the engine. If the value matches no device, or more than on
 - **Wake Word: Disable Listening** -- stop the detector
 - **Wake Word: Toggle Listening** -- toggle on/off (also via status bar click)
 - **Wake Word: Reset Microphone Consent** -- clear consent and re-prompt
+- **Wake Word: Open Settings** -- open the Settings editor filtered to Wake Word (also linked from the status bar tooltip)
 
 ## Common command IDs
 
@@ -302,7 +304,7 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 | Problem | Solution |
 | --- | --- |
 | Engine starts but never detects phrases | Try lowering `wakeWord.confidenceThreshold` (e.g. `0.2`). Speak clearly and close to your microphone. |
-| Too many false positives | Raise `wakeWord.confidenceThreshold` (e.g. `0.5` or higher). Use longer, more distinctive wake phrases. |
+| Too many false positives | Enable `wakeWord.confirmationMode`, which requires the phrase twice within 5 seconds: say it, pause about three seconds, say it again. The status bar shows `Wake: Confirm` between the two. Also try raising `wakeWord.confidenceThreshold` (e.g. `0.5` or higher) and using longer, more distinctive wake phrases. |
 | "Failed to start speech engine" | Ensure your microphone is connected and not in use by another application. Check your system sound settings. |
 | Status bar shows "Wake: Error" | Click the status bar item to retry. Check the Output panel for details. If the error persists, try **Wake Word: Reset Microphone Consent** and re-enable. |
 | Extension keeps restarting | The engine retries up to 3 times on crash with increasing delays. If it fails after 3 retries, check that your audio device is working. |

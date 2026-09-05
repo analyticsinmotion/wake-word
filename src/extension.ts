@@ -4,11 +4,15 @@ import { WakePhrase, ISpeechEngine } from "./speechEngineInterface";
 import { WindowsSpeechEngine } from "./windowsSpeechEngine";
 import { SherpaEngine } from "./sherpaEngine";
 import {
+  CONFIRMATION_WINDOW_MS,
   DETECTION_DEBOUNCE_MS,
+  PendingConfirmation,
   SessionStats,
   clampThreshold,
   createSessionStats,
+  evaluateConfirmation,
   formatConfidence,
+  formatConfirmationStatus,
   formatSessionStats,
   recordDetection,
   resolveRoutes,
@@ -36,6 +40,8 @@ let lockPath = "";
 let lockWatchTimer: ReturnType<typeof setInterval> | null = null;
 let sessionStats: SessionStats = createSessionStats();
 let warnedDeviceIgnored = false;
+let pendingConfirmation: PendingConfirmation | null = null;
+let confirmationTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── Default routes ──────────────────────────────────────────
 
@@ -169,6 +175,9 @@ export function activate(context: vscode.ExtensionContext) {
         handleConsentThenStart(context);
       }
     }),
+    vscode.commands.registerCommand("wakeWord.openSettings", () => {
+      vscode.commands.executeCommand("workbench.action.openSettings", "wakeWord");
+    }),
     vscode.commands.registerCommand("wakeWord.resetConsent", async () => {
       await context.globalState.update(CONSENT_KEY, undefined);
       stopListening();
@@ -203,6 +212,7 @@ export function activate(context: vscode.ExtensionContext) {
         isPausedByFocus = false;
         lastDetectionTime = 0;
         warnedDeviceIgnored = false;
+        clearConfirmation();
         speechEngine.dispose();
         speechEngine = createEngine(context);
         wireEngine(speechEngine);
@@ -237,6 +247,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       if (!state.focused && speechEngine.isListening) {
         isPausedByFocus = true;
+        clearConfirmation();
         speechEngine.pause();
         log("info", "Paused: window lost focus");
       } else if (state.focused && isPausedByFocus) {
@@ -362,6 +373,7 @@ function startListening() {
 
 function stopListening() {
   clearResumeTimer();
+  clearConfirmation();
   stopLockWatcher();
   isPausedByFocus = false;
   lastDetectionTime = 0;
@@ -431,13 +443,34 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     return;
   }
   lastDetectionTime = now;
+
+  // With confirmationMode on, the first hearing is held and the engine keeps
+  // listening for a second one. The debounce above runs first, so the engine
+  // repeating a single utterance cannot confirm it.
+  const config = vscode.workspace.getConfiguration("wakeWord");
+  const wasPending = pendingConfirmation !== null;
+  const confirmation = evaluateConfirmation(
+    config.get<boolean>("confirmationMode", false),
+    pendingConfirmation,
+    phrase.label,
+    now
+  );
+  pendingConfirmation = confirmation.pending;
+  if (!confirmation.confirmed) {
+    beginConfirmationWait(phrase.label, confidence);
+    return;
+  }
+  clearConfirmationTimer();
+  if (wasPending) {
+    log("info", `Confirmation: "${phrase.label}" confirmed`);
+  }
+
   recordDetection(sessionStats, phrase.label);
 
   // Only the Windows engine supplies a score; formatConfidence renders
   // nothing when there is none to show.
   log("info", `Detected: "${phrase.label}"${formatConfidence(confidence)}`);
 
-  const config = vscode.workspace.getConfiguration("wakeWord");
   const showNotification = config.get<boolean>(
     "showNotificationOnDetection",
     true
@@ -474,6 +507,52 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
   scheduleResume(cooldownSeconds);
 }
 
+// ── Phrase confirmation ─────────────────────────────────────
+
+/**
+ * Hold a first hearing and show it in the status bar. The engine is not
+ * paused: it has to hear the phrase again. If the window passes with no
+ * second hearing the hold is dropped and the status bar returns to Listening.
+ */
+function beginConfirmationWait(label: string, confidence?: number): void {
+  clearConfirmationTimer();
+  log(
+    "info",
+    `Confirmation: heard "${label}" once${formatConfidence(confidence)}, waiting for a second detection`
+  );
+  statusBarItem.text = formatConfirmationStatus(label);
+  statusBarItem.tooltip =
+    `Heard "${label}". Say it again within ${CONFIRMATION_WINDOW_MS / 1000} seconds to confirm.`;
+  statusBarItem.backgroundColor = undefined;
+  confirmationTimer = setTimeout(() => {
+    confirmationTimer = null;
+    pendingConfirmation = null;
+    log("info", `Confirmation: "${label}" expired, resuming`);
+    // Only put Listening back if that is still the state underneath. An
+    // error during the wait has already set the bar itself.
+    if (speechEngine.isListening) {
+      setStatusBar("listening");
+    }
+  }, CONFIRMATION_WINDOW_MS);
+}
+
+function clearConfirmationTimer(): void {
+  if (confirmationTimer) {
+    clearTimeout(confirmationTimer);
+    confirmationTimer = null;
+  }
+}
+
+/**
+ * Forget a held first hearing. Called wherever listening stops, pauses,
+ * resumes, or changes engine, so a phrase heard before one of those cannot
+ * be confirmed by one heard after it.
+ */
+function clearConfirmation(): void {
+  clearConfirmationTimer();
+  pendingConfirmation = null;
+}
+
 // ── Pause / Resume management ───────────────────────────────
 
 function scheduleResume(seconds: number) {
@@ -504,6 +583,7 @@ function scheduleResume(seconds: number) {
 
 function resumeListening() {
   clearResumeTimer();
+  clearConfirmation();
   lastDetectionTime = 0;
   if (speechEngine.isPaused) {
     speechEngine.resume();
@@ -532,18 +612,34 @@ function updateEngineIndicator(visible: boolean): void {
   engineBarItem.show();
 }
 
+/**
+ * Tooltip that ends with a link to the extension's settings, so the status
+ * bar is a way into configuring wake phrases as well as toggling them.
+ * Command links in a tooltip only work when the markdown is trusted; the
+ * text here is ours, never the user's.
+ */
+function tooltipWithSettingsLink(text: string): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(
+    `${text}\n\n[Open Settings](command:wakeWord.openSettings "Wake Word: Open Settings") ` +
+      "to change wake phrases and routes."
+  );
+  tooltip.isTrusted = true;
+  return tooltip;
+}
+
 function setStatusBar(state: "off" | "listening" | "handed-off" | "error" | "other-window") {
   switch (state) {
     case "off":
       statusBarItem.text = "$(mic-off) Wake: Off";
-      statusBarItem.tooltip = "Click to enable wake word listening";
+      statusBarItem.tooltip = tooltipWithSettingsLink("Click to enable wake word listening.");
       statusBarItem.backgroundColor = undefined;
       updateEngineIndicator(false);
       break;
     case "listening":
       statusBarItem.text = "$(mic) Wake: Listening";
-      statusBarItem.tooltip =
-        "Listening for wake words... Click to disable";
+      statusBarItem.tooltip = tooltipWithSettingsLink(
+        "Listening for wake words. Click to disable."
+      );
       statusBarItem.backgroundColor = undefined;
       updateEngineIndicator(true);
       break;
