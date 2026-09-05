@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -144,6 +144,11 @@
             "Force sherpa-onnx keyword spotting engine (cross-platform, requires model download)."
           ],
           "description": "Speech engine to use. Leave on 'auto' unless testing a specific engine."
+        },
+        "wakeWord.audioDevice": {
+          "type": "string",
+          "default": "",
+          "description": "Microphone to listen on. Leave empty for the system default. Use a case-insensitive substring of the device name (e.g. 'USB' or 'Blue Yeti') or the device index number. Applies to the sherpa engine; the Windows engine always uses the system default."
         }
       }
     }

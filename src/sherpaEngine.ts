@@ -45,9 +45,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    */
   private static readonly RELEASE_TIMEOUT_MS = 500;
 
+  /**
+   * `audioDevice` is the `wakeWord.audioDevice` setting: empty for the
+   * system default, otherwise a device index or a case-insensitive name
+   * substring. It is fixed for the life of the engine; the extension builds
+   * a new engine when the setting changes, as it does for `nodePath`.
+   */
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly nodePathOverride: string = ""
+    private readonly nodePathOverride: string = "",
+    private readonly audioDevice: string = ""
   ) {
     super();
   }
@@ -65,6 +72,10 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       return;
     }
 
+    // A start supersedes any retry still scheduled from a crash. Left armed,
+    // it would fire into the fresh child below: a no-op if READY has arrived
+    // by then, otherwise a needless kill and respawn mid model load.
+    this.clearRetryTimer();
     this.forceKill();
 
     this._killedIntentionally = false;
@@ -109,6 +120,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       threshold: safeThreshold,
       modelDir,
       debugMode,
+      audioDevice: this.audioDevice,
     };
     this.process.stdin?.write(JSON.stringify(config) + "\n");
 
@@ -223,18 +235,33 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     this.clearRetryTimer();
     this.retryCount = 0;
 
+    // Kill whatever child exists before the state guard, for the same
+    // reason. A child that has been spawned but has not yet said READY is
+    // neither listening nor paused, and returning early left it to finish
+    // loading, open the microphone, and report READY to a stopped engine:
+    // Disable, Reset Consent, and an engine switch during that window all
+    // ended with the microphone open.
+    this.forceKill();
+
     if (!this._isListening && !this._isPaused) {
       return;
     }
 
     this._isPaused = false;
-    this.forceKill();
     this._isListening = false;
     this.emit("stopped");
   }
 
   pause(): void {
     if (!this._isListening) {
+      // Not listening, but a crash-backoff retry may still be armed. A pause
+      // must stop that retry reopening the microphone, and must leave the
+      // engine resumable, so it becomes a paused engine with no process.
+      if (this.retryTimer) {
+        this.clearRetryTimer();
+        this._isPaused = true;
+        this.emit("paused");
+      }
       return;
     }
 

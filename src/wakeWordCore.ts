@@ -245,3 +245,72 @@ export function parsePowerShellError(raw: string): string {
   }
   return raw.replace(/#< CLIXML\s*/g, "").trim();
 }
+
+// -- Session statistics -------------------------------------------------
+
+/**
+ * Counters the extension host keeps for one listening session and writes to
+ * the output channel as a single line on deactivation. No telemetry, no
+ * network, no storage: the line exists so a user can see how the extension
+ * behaved over a day without reading the whole log.
+ */
+export interface SessionStats {
+  detections: number;
+  detectionsByPhrase: Map<string, number>;
+  errors: number;
+  engineStarts: number;
+  cooldowns: number;
+  /** Epoch milliseconds at which the counters were created. */
+  startedAt: number;
+}
+
+export function createSessionStats(startedAt: number = Date.now()): SessionStats {
+  return {
+    detections: 0,
+    detectionsByPhrase: new Map(),
+    errors: 0,
+    engineStarts: 0,
+    cooldowns: 0,
+    startedAt,
+  };
+}
+
+/** Count one accepted detection against its route label. */
+export function recordDetection(stats: SessionStats, label: string): void {
+  stats.detections++;
+  stats.detectionsByPhrase.set(label, (stats.detectionsByPhrase.get(label) ?? 0) + 1);
+}
+
+/** Whole minutes since the counters were created. Never negative. */
+export function sessionDurationMinutes(stats: SessionStats, now: number = Date.now()): number {
+  return Math.max(0, Math.round((now - stats.startedAt) / 60_000));
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Render the session summary line:
+ *
+ *   Session: 342min, 14 detections (Claude: 8, Copilot: 4, Terminal: 2),
+ *   0 errors, 17 engine starts, 14 cooldowns
+ *
+ * Phrases are listed most-detected first, ties in the order first heard.
+ * The breakdown is omitted entirely when nothing was detected.
+ */
+export function formatSessionStats(stats: SessionStats, now: number = Date.now()): string {
+  const breakdown = Array.from(stats.detectionsByPhrase.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, count]) => `${label}: ${count}`)
+    .join(", ");
+
+  return (
+    `Session: ${sessionDurationMinutes(stats, now)}min, ` +
+    plural(stats.detections, "detection") +
+    (breakdown ? ` (${breakdown})` : "") +
+    `, ${plural(stats.errors, "error")}` +
+    `, ${plural(stats.engineStarts, "engine start")}` +
+    `, ${plural(stats.cooldowns, "cooldown")}`
+  );
+}

@@ -25,7 +25,9 @@
  *   { phrases: [{phrase: string, label: string}],
  *     threshold: number,
  *     modelDir: string,
- *     debugMode: boolean }
+ *     debugMode: boolean,
+ *     audioDevice: string }     "" for the system default, otherwise a
+ *                               device index or a name substring
  *
  * Stop: close stdin or send "stop\n" on stdin.
  *
@@ -62,7 +64,12 @@ require.main.paths.unshift(path.join(engineDir, 'node_modules'));
 const { modelPath } = require('./lib/model-path');
 const { VadGate } = require('./lib/vad-gate');
 const { buildKeywordSpec } = require('./lib/keywords');
-const { drainLines, parseControlLine, clampKeywordThreshold } = require('./lib/control');
+const {
+  drainLines,
+  parseControlLine,
+  clampKeywordThreshold,
+  withAudioDevice,
+} = require('./lib/control');
 const { micErrorMessage } = require('./lib/mic-errors');
 
 let mic = null;
@@ -145,7 +152,7 @@ function runSelfTest() {
 }
 
 async function main(config) {
-  const { phrases, threshold, modelDir, debugMode } = config;
+  const { phrases, threshold, modelDir, debugMode, audioDevice } = config;
 
   if (debugMode) debug('audio-engine starting, modelDir=' + modelDir);
 
@@ -224,18 +231,32 @@ async function main(config) {
   // Silero model inline and blocks the event loop for the duration; the
   // factory does the same work on the native thread pool and rejects with
   // the same error classes, so the catch below is unchanged.
-  if (debugMode) debug('opening microphone...');
-  try {
-    mic = await Microphone.open({
+  //
+  // `device` is added only when wakeWord.audioDevice names one: a device
+  // index or a case-insensitive name substring. Absent, decibri opens the
+  // system default input. See lib/control.js.
+  const micOptions = withAudioDevice(
+    {
       sampleRate: 16000,
       channels: 1,
       vad: 'silero',
       dcRemoval: true,
       highpass: 80,
       agc: -18,
-    });
+    },
+    audioDevice
+  );
+  if (debugMode) {
+    debug(
+      'opening microphone' +
+        (micOptions.device === undefined ? '' : ' (device: ' + JSON.stringify(micOptions.device) + ')') +
+        '...'
+    );
+  }
+  try {
+    mic = await Microphone.open(micOptions);
   } catch (err) {
-    fatal(micErrorMessage(err, 'Failed to open microphone'));
+    fatal(micErrorMessage(err, 'Failed to open microphone', audioDevice));
     return;
   }
 
@@ -249,7 +270,7 @@ async function main(config) {
   }
 
   mic.on('error', (err) => {
-    fatal(micErrorMessage(err, 'Microphone error'));
+    fatal(micErrorMessage(err, 'Microphone error', audioDevice));
   });
 
   // VAD gating.

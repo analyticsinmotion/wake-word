@@ -5,12 +5,22 @@ import { WindowsSpeechEngine } from "./windowsSpeechEngine";
 import { SherpaEngine } from "./sherpaEngine";
 import {
   DETECTION_DEBOUNCE_MS,
+  SessionStats,
   clampThreshold,
+  createSessionStats,
   formatConfidence,
+  formatSessionStats,
+  recordDetection,
   resolveRoutes,
   selectEngineKind,
   shouldDebounce,
 } from "./wakeWordCore";
+import {
+  LOCK_CHECK_INTERVAL_MS,
+  lockFilePath,
+  releaseLock,
+  tryAcquireLock,
+} from "./lockFile";
 
 let statusBarItem: vscode.StatusBarItem;
 let engineBarItem: vscode.StatusBarItem;
@@ -22,6 +32,10 @@ let isStarting = false;
 let isDevMode = false;
 let isPausedByFocus = false;
 let lastDetectionTime = 0;
+let lockPath = "";
+let lockWatchTimer: ReturnType<typeof setInterval> | null = null;
+let sessionStats: SessionStats = createSessionStats();
+let warnedDeviceIgnored = false;
 
 // ── Default routes ──────────────────────────────────────────
 
@@ -55,7 +69,19 @@ function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
   if (selectEngineKind(engineOverride, os.platform()) === "windows") {
     return new WindowsSpeechEngine();
   }
-  return new SherpaEngine(context, nodePath);
+  return new SherpaEngine(context, nodePath, readAudioDevice(config));
+}
+
+/**
+ * The configured microphone, trimmed, always as a string.
+ *
+ * The schema says string, but settings.json is not validated against it, so
+ * a bare number is accepted and rendered as its digits; the child reads a
+ * digit-only string as a device index.
+ */
+function readAudioDevice(config: vscode.WorkspaceConfiguration): string {
+  const value = config.get<unknown>("audioDevice", "");
+  return value === undefined || value === null ? "" : String(value).trim();
 }
 
 // ── Engine wiring ────────────────────────────────────────────
@@ -64,12 +90,16 @@ function wireEngine(engine: ISpeechEngine): void {
   engine.on("detected", (phrase: WakePhrase, confidence?: number) => {
     onWakeWordDetected(phrase, confidence);
   });
-  engine.on("started", () => setStatusBar("listening"));
+  engine.on("started", () => {
+    sessionStats.engineStarts++;
+    setStatusBar("listening");
+  });
   engine.on("paused", () => setStatusBar("handed-off"));
   engine.on("stopped", () => setStatusBar("off"));
   engine.on("debug", (info: string) => log("info", info));
   engine.on("warning", (msg: string) => log("warn", msg));
   engine.on("error", (err: Error) => {
+    sessionStats.errors++;
     log("error", err.message);
     vscode.window.showErrorMessage(`Wake Word error: ${err.message}`, "Show Log").then((choice) => {
       if (choice === "Show Log") {
@@ -88,6 +118,11 @@ export function activate(context: vscode.ExtensionContext) {
 
   outputChannel = vscode.window.createOutputChannel("Wake Word");
   context.subscriptions.push(outputChannel);
+
+  // Shared by every window of this editor, which is what lets them agree on
+  // who holds the microphone. See lockFile.ts.
+  lockPath = lockFilePath(context.globalStorageUri.fsPath);
+  sessionStats = createSessionStats();
 
   speechEngine = createEngine(context);
   wireEngine(speechEngine);
@@ -143,7 +178,9 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Auto-start if configured (deferred to let VS Code finish initialising)
+  // Auto-start if configured (deferred to let VS Code finish initialising).
+  // If another window already holds the listener lock, startListening()
+  // stands this window down and watches for its turn.
   const config = vscode.workspace.getConfiguration("wakeWord");
   const autoStart = config.get<boolean>("enableOnStartup", true);
   if (autoStart) {
@@ -157,17 +194,23 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       const engineChanged =
         e.affectsConfiguration("wakeWord.engine") ||
-        e.affectsConfiguration("wakeWord.nodePath");
+        e.affectsConfiguration("wakeWord.nodePath") ||
+        e.affectsConfiguration("wakeWord.audioDevice");
 
       if (engineChanged) {
         const wasListening = speechEngine.isListening;
         const cooldownActive = countdownTimer !== null;
         isPausedByFocus = false;
         lastDetectionTime = 0;
+        warnedDeviceIgnored = false;
         speechEngine.dispose();
         speechEngine = createEngine(context);
         wireEngine(speechEngine);
         log("info", "Engine switched due to settings change");
+        // The counters describe one engine's run. Write them out before
+        // they are reset for the new one.
+        logSessionStats();
+        sessionStats = createSessionStats();
         updateEngineIndicator(cooldownActive);
         if (cooldownActive) {
           log("info", "Engine switched during cooldown — will start when cooldown expires");
@@ -207,6 +250,9 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   if (speechEngine) {
+    logSessionStats();
+    // stopListening() also stops the lock watcher and releases the lock, so
+    // a window that closes hands the microphone to the next one.
     stopListening();
     speechEngine.dispose();
   }
@@ -268,6 +314,10 @@ function log(level: "info" | "warn" | "error", message: string) {
   }
 }
 
+function logSessionStats(): void {
+  log("info", formatSessionStats(sessionStats));
+}
+
 // ── Core logic ──────────────────────────────────────────────
 
 function startListening() {
@@ -281,18 +331,88 @@ function startListening() {
     return;
   }
 
+  // Only one window listens at a time. The lock is held for the whole
+  // session, cooldowns included, and re-acquiring one we already hold is a
+  // no-op, so calling this on every start is safe.
+  if (!acquireListenerLock()) {
+    log("info", "Another editor window is listening. This window will take over if it stops.");
+    setStatusBar("other-window");
+    startLockWatcher();
+    return;
+  }
+  stopLockWatcher();
+
   const threshold = clampThreshold(config.get<number>("confidenceThreshold", 0.3));
-  log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}`);
+  const audioDevice = readAudioDevice(config);
+  const deviceNote = audioDevice ? `, device="${audioDevice}"` : "";
+  log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}${deviceNote}`);
   log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
+
+  if (audioDevice && !(speechEngine instanceof SherpaEngine) && !warnedDeviceIgnored) {
+    warnedDeviceIgnored = true;
+    log(
+      "warn",
+      "wakeWord.audioDevice is set, but the Windows engine always uses the system " +
+        "default microphone. Set wakeWord.engine to \"sherpa\" to choose a device."
+    );
+  }
+
   speechEngine.start(routes, threshold, isDevMode);
 }
 
 function stopListening() {
   clearResumeTimer();
+  stopLockWatcher();
   isPausedByFocus = false;
   lastDetectionTime = 0;
   speechEngine.stop();
+  releaseLock(lockPath);
   setStatusBar("off");
+}
+
+// ── Multi-window coordination ───────────────────────────────
+
+/**
+ * Take the listener lock, or report that another window holds it.
+ *
+ * A storage directory that cannot be written is not a reason to stay
+ * silent: log it and listen without coordination, which is what every
+ * version before this one did.
+ */
+function acquireListenerLock(): boolean {
+  try {
+    return tryAcquireLock(lockPath);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("warn", `Could not write the listener lock (${message}). Listening without multi-window coordination.`);
+    return true;
+  }
+}
+
+/**
+ * While another window holds the lock, check every LOCK_CHECK_INTERVAL_MS
+ * whether it has gone: closed cleanly and released, or crashed and left a
+ * lock naming a dead process. Either way this window takes over.
+ */
+function startLockWatcher(): void {
+  if (lockWatchTimer) {
+    return;
+  }
+  lockWatchTimer = setInterval(() => {
+    if (!acquireListenerLock()) {
+      return;
+    }
+    stopLockWatcher();
+    log("info", "The listening window has stopped. Taking over.");
+    startListening();
+  }, LOCK_CHECK_INTERVAL_MS);
+}
+
+function stopLockWatcher(): void {
+  if (lockWatchTimer) {
+    clearInterval(lockWatchTimer);
+    lockWatchTimer = null;
+  }
 }
 
 // ── Route configuration ─────────────────────────────────────
@@ -311,6 +431,7 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     return;
   }
   lastDetectionTime = now;
+  recordDetection(sessionStats, phrase.label);
 
   // Only the Windows engine supplies a score; formatConfidence renders
   // nothing when there is none to show.
@@ -358,6 +479,7 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
 function scheduleResume(seconds: number) {
   clearResumeTimer();
   countdownRemaining = seconds;
+  sessionStats.cooldowns++;
 
   statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
   statusBarItem.tooltip = "Mic handed off to assistant. Resuming soon.";
@@ -410,7 +532,7 @@ function updateEngineIndicator(visible: boolean): void {
   engineBarItem.show();
 }
 
-function setStatusBar(state: "off" | "listening" | "handed-off" | "error") {
+function setStatusBar(state: "off" | "listening" | "handed-off" | "error" | "other-window") {
   switch (state) {
     case "off":
       statusBarItem.text = "$(mic-off) Wake: Off";
@@ -440,6 +562,14 @@ function setStatusBar(state: "off" | "listening" | "handed-off" | "error") {
       statusBarItem.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.errorBackground"
       );
+      updateEngineIndicator(false);
+      break;
+    case "other-window":
+      statusBarItem.text = "$(mic-off) Wake: Other window";
+      statusBarItem.tooltip =
+        "Another editor window is already listening. Only one instance listens " +
+        "at a time. This window takes over automatically when that one stops.";
+      statusBarItem.backgroundColor = undefined;
       updateEngineIndicator(false);
       break;
   }

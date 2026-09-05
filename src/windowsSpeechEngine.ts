@@ -46,6 +46,11 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
       return;
     }
 
+    // A start supersedes any retry still scheduled from a crash. Left armed,
+    // it would fire into the fresh process below: a no-op if READY has
+    // arrived by then, otherwise a needless kill and respawn.
+    this.clearRetryTimer();
+
     // Clean up any orphaned process from a previous session
     this.killProcess();
 
@@ -172,18 +177,31 @@ export class WindowsSpeechEngine extends EventEmitter implements ISpeechEngine {
     this.clearRetryTimer();
     this.retryCount = 0;
 
+    // Kill whatever process exists before the state guard, for the same
+    // reason. A process that has been spawned but has not yet said READY is
+    // neither listening nor paused, and returning early left it to finish
+    // loading, open the microphone, and report READY to a stopped engine.
+    this.killProcess();
+
     if (!this._isListening && !this._isPaused) {
       return;
     }
 
     this._isPaused = false;
-    this.killProcess();
     this._isListening = false;
     this.emit("stopped");
   }
 
   pause(): void {
     if (!this._isListening) {
+      // Not listening, but a crash-backoff retry may still be armed. A pause
+      // must stop that retry reopening the microphone, and must leave the
+      // engine resumable, so it becomes a paused engine with no process.
+      if (this.retryTimer) {
+        this.clearRetryTimer();
+        this._isPaused = true;
+        this.emit("paused");
+      }
       return;
     }
 
