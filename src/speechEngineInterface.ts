@@ -3,6 +3,12 @@ export interface WakePhrase {
   phrase: string | string[];
   command: string;
   cooldownSeconds?: number;
+  /**
+   * How listening resumes after this route fires. `timer` (the default)
+   * resumes after the cooldown; `manual` waits for the user to resume from
+   * the status bar or the Enable command. See resolveHandoff().
+   */
+  handoff?: "timer" | "manual";
 }
 
 export interface ISpeechEngine {

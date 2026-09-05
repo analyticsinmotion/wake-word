@@ -10,6 +10,7 @@ npm run lint               # Run ESLint (flat config, eslint.config.mjs) + SVG c
 npm test                   # Run the unit test suite once (vitest)
 npm run test:watch         # Run the unit tests in watch mode
 npm run package            # Build .vsix package
+npm run benchmark          # Acoustic benchmark over tests/acoustic/fixtures (manual; needs the sherpa model)
 
 node engine/audio-engine.js --self-test   # Load the engine dependency tree and exit
 ```
@@ -48,6 +49,10 @@ wake-word/
     engine/            # JavaScript tests for engine/lib
     mocks/vscode.ts    # Stub for the `vscode` module, wired up in vitest.config.mts
     mocks/childProcess.ts  # MockChildProcess: drives the engine state machine without a real process
+    acoustic/          # Acoustic benchmark: FRR, FAR, and latency over WAV recordings (manual, not CI)
+      run-benchmark.js       # Drives the sherpa-onnx spotter over fixtures/positive and fixtures/negative
+      lib/benchmark-core.js  # WAV parsing, fixture naming, statistics, report; unit tested
+      fixtures/              # positive/<phrase>-<nn>.wav and negative/*.wav; only silence-10s.wav is committed
   scripts/
     check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
   eslint.config.mjs    # ESLint 9 flat config. Pins the ESLint 8 rule set; see the comments in the file
@@ -80,6 +85,10 @@ The config line carries `audioDevice`, the `wakeWord.audioDevice` setting, which
 On wake word detection the microphone is released and the engine process torn down (handoff), then respawned after a cooldown, so only one thing uses the mic at a time. The release is acknowledged, not assumed: `audio-engine.js` sends `RELEASED` once `mic.stop()` has returned and `SherpaEngine.releaseThenKill()` waits for that line before force-killing, capped at 500 ms. `forceKill()` is the unacknowledged path, used by `start()` and `stop()`. The Windows engine has no `RELEASED`, and needs none: System.Speech holds the capture device for the lifetime of the PowerShell process, so process exit is the confirmation.
 
 `pause()` stays synchronous and the target command still fires as soon as it returns; the release completes underneath within the timeout. Ordering the command strictly after `RELEASED` is a handoff policy change and should be designed separately.
+
+**Handoff modes.** Each route's `handoff` field, resolved by `resolveHandoff()` in `wakeWordCore.ts`, decides how listening comes back after the route fires. `timer`, the default and the only behaviour before 0.11.0, is the cooldown countdown above. `manual` calls `enterManualPause()`: no timer, the status bar shows `Wake: Paused`, and the `isManuallyPaused` flag makes the status bar click and the Enable command call `resumeListening()` instead of stopping or starting. `stopListening()`, `resumeListening()`, and `startCountdown()` clear the flag. An engine switch during a manual pause builds the new engine but does not start it; the user's resume does. A `wakeWord.routes` change during any handoff pause sets `routesChangedWhilePaused`, and `resumeListening()` then goes through `startListening()` rather than `resume()`, which would replay the old phrases. Anything other than the exact string `manual` is `timer`, because settings.json is not validated against the schema. The default Claude route is manual; Copilot and Terminal are timer.
+
+**Calibration.** `wakeWord.calibrate` runs `runCalibration()`. It records what the extension is doing (`capturePriorState()`), starts the engine if it is not listening and waits for `started`, then keeps a `CalibrationRun` in module state for `CALIBRATION_DURATION_MS` (15 s). `onWakeWordDetected()` checks that state right after the debounce guard and, while a run is active, records the detection and returns without firing a route or applying confirmation mode. `formatCalibrationReport()` in `wakeWordCore.ts` renders the log lines and the notification text. Afterwards `restorePriorState()` puts things back: listening stays listening, an interrupted cooldown restarts its remaining seconds through `startCountdown()` (which, unlike `scheduleResume()`, does not count a cooldown), a manual handoff stays paused, and Off stops the engine and releases the listener lock. A run ends on its timer, on the notification's Cancel, on a status bar click, on `stopListening()` or an engine switch (outcome `stopped`: nothing is reported or restored), or on an engine error. Calibration refuses to run without consent and while another window holds the lock. It starts the engine through `ISpeechEngine.start()` directly, not `startListening()`, so the "Starting:" log line is not written for a calibration start.
 
 Both engines cancel a pending crash-backoff retry in `stop()`, `pause()`, and `start()`. `stop()` is the privacy case (Disable must disable); `pause()` during backoff leaves the engine paused with no process so `resume()` restarts it; `start()` during backoff supersedes the retry rather than letting it fire into the fresh child. `stop()` also kills the child before its state guard: between spawn and `READY` the engine is neither listening nor paused, and an early return there left the child to finish starting and open the microphone after a Disable.
 
@@ -145,6 +154,14 @@ host still has to be checked by hand. Add a test for pure logic first; if that
 is not possible, extract the logic into `wakeWordCore.ts` or `engine/lib/` and
 then test it.
 
+`tests/acoustic/benchmarkCore.test.js` covers the benchmark's pure module,
+and `tests/unit/benchmarkConstants.test.ts` pins that module's copies of the
+default phrases and the model file list to `DEFAULT_ROUTES` and
+`sherpaEngine.ts`. The benchmark itself (`npm run benchmark`) needs the
+sherpa model and real recordings; `tests/acoustic/README.md` says how to add
+them. It is a manual tool, not a CI step, and `tests/**` is excluded from the
+`.vsix`.
+
 Manual testing checklist:
 
 1. F5 to launch Extension Development Host
@@ -162,6 +179,9 @@ Manual testing checklist:
 13. Switch `wakeWord.engine` after a few detections and confirm a "Session:" line with per-phrase counts appears in the output channel. The same line is written on deactivate, which in the Extension Development Host shows in the debug console.
 14. Run **Wake Word: Open Settings** from the command palette, then from the link in the status bar tooltip. Both open the Settings editor filtered to `wakeWord`.
 15. Enable `wakeWord.confirmationMode`. Say a wake phrase once: the status bar shows `Wake: Confirm "<label>"`, nothing fires, and after 5 s it returns to Listening. Say it, pause about three seconds, say it again: the second hearing fires the route and the log shows the "heard once" and "confirmed" lines. Disable the setting and confirm a single hearing fires immediately again.
+16. With the default routes, say "Hey Claude". After the handoff the status bar shows `Wake: Paused` with no countdown and stays there. Click it: listening resumes and the log shows "Resumed: user resumed after manual handoff". Repeat, and this time run **Wake Word: Enable Listening** instead of clicking. Then run **Wake Word: Disable Listening** while paused and confirm the status bar goes to Off.
+17. Say "Hey Computer" (a timer route) and confirm the countdown behaviour from step 5 is unchanged. Add `"handoff": "manual"` to a custom route and confirm it pauses like step 16. While paused, add a new route in settings: the log shows "Routes changed during a handoff", nothing starts, and after the resume the "Starting:" line counts the new route and its phrase works.
+18. Run **Wake Word: Calibrate** while listening. The status bar shows `Wake: Calibrating` and the progress notification counts detections as you say phrases; no route fires. After 15 s the notification summarises and the output channel has the per-detection lines, the per-phrase summary, and the status bar is back on Listening. Run it again after **Disable Listening**: the engine starts, the run completes, and the status bar returns to Off. Run it during a cooldown: the countdown stops, and after the run it resumes from the seconds it had left.
 
 ## Boundaries
 

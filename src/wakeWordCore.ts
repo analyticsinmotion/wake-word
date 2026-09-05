@@ -371,3 +371,117 @@ export function evaluateConfirmation(
 export function formatConfirmationStatus(label: string): string {
   return `$(question) Wake: Confirm "${label}"`;
 }
+
+// -- Handoff ------------------------------------------------------------
+
+/** How listening resumes after a route hands the microphone off. */
+export type HandoffMode = "timer" | "manual";
+
+/**
+ * Resolve a route's `handoff` field.
+ *
+ * `timer` resumes after the cooldown, which is what every version before
+ * 0.11.0 did, and is the default. `manual` leaves listening paused until
+ * the user resumes it from the status bar or the Enable command. Anything
+ * else, a missing value, a wrong-typed one, or a case variant, is `timer`:
+ * settings.json is not validated against the contributed schema, and an
+ * unrecognised value must fall back to the behaviour the user already knows.
+ */
+export function resolveHandoff(handoff: unknown): HandoffMode {
+  return handoff === "manual" ? "manual" : "timer";
+}
+
+// -- Calibration --------------------------------------------------------
+
+/** How long the Calibrate command listens for. */
+export const CALIBRATION_DURATION_MS = 15_000;
+
+/** One detection heard during a calibration run. */
+export interface CalibrationDetection {
+  /** Route label of the phrase heard. */
+  label: string;
+  /** Engine score. Absent for the sherpa engine; see formatConfidence. */
+  confidence?: number;
+  /** Milliseconds after the listening window opened. */
+  time: number;
+}
+
+export interface CalibrationReport {
+  /** Lines for the output channel, in order. */
+  lines: string[];
+  /** One line for the notification. */
+  summary: string;
+}
+
+function hasConfidence(confidence: number | undefined): confidence is number {
+  return typeof confidence === "number" && isFinite(confidence);
+}
+
+/**
+ * Render the result of a calibration run: every detection with its time
+ * and score, then a per-phrase summary with the count, the average score,
+ * and the lowest score, which is the one closest to the threshold.
+ *
+ * The sherpa engine reports no score, so its detections render with no
+ * confidence and its summary has counts only, with one note saying why.
+ * `durationMs` is how long the window was actually open, which is less
+ * than CALIBRATION_DURATION_MS when the run was cancelled.
+ */
+export function formatCalibrationReport(
+  detections: readonly CalibrationDetection[],
+  durationMs: number
+): CalibrationReport {
+  const seconds = Math.max(1, Math.round(durationMs / 1000));
+  const window = plural(seconds, "second");
+  const lines: string[] = ["=== Calibration Results ==="];
+
+  if (detections.length === 0) {
+    lines.push(`No phrases detected in ${window}.`);
+    lines.push(
+      "Try: speak closer to the microphone, reduce background noise, or lower wakeWord.confidenceThreshold."
+    );
+    lines.push("=== End Calibration ===");
+    return {
+      lines,
+      summary:
+        `Wake Word: No phrases detected in ${window}. ` +
+        "Try speaking closer to the microphone or lowering the confidence threshold.",
+    };
+  }
+
+  for (const d of detections) {
+    lines.push(`  ${(d.time / 1000).toFixed(1)}s: "${d.label}"${formatConfidence(d.confidence)}`);
+  }
+
+  const byLabel = new Map<string, CalibrationDetection[]>();
+  for (const d of detections) {
+    const list = byLabel.get(d.label) ?? [];
+    list.push(d);
+    byLabel.set(d.label, list);
+  }
+
+  lines.push("Summary:");
+  for (const [label, list] of byLabel) {
+    const scores = list.map((d) => d.confidence).filter(hasConfidence);
+    let line = `  "${label}": ${plural(list.length, "detection")}`;
+    if (scores.length > 0) {
+      const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+      line += `, avg confidence: ${avg.toFixed(2)}, min: ${Math.min(...scores).toFixed(2)}`;
+    }
+    lines.push(line);
+  }
+
+  if (detections.some((d) => !hasConfidence(d.confidence))) {
+    lines.push(
+      "Note: the sherpa engine reports no confidence score. The threshold is applied inside the keyword spotter."
+    );
+  }
+  lines.push("=== End Calibration ===");
+
+  return {
+    lines,
+    summary:
+      `Wake Word: ${plural(detections.length, "detection")} in ${window}. ` +
+      "Check the Wake Word output channel for details.",
+  };
+}

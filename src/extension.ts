@@ -4,17 +4,21 @@ import { WakePhrase, ISpeechEngine } from "./speechEngineInterface";
 import { WindowsSpeechEngine } from "./windowsSpeechEngine";
 import { SherpaEngine } from "./sherpaEngine";
 import {
+  CALIBRATION_DURATION_MS,
   CONFIRMATION_WINDOW_MS,
   DETECTION_DEBOUNCE_MS,
+  CalibrationDetection,
   PendingConfirmation,
   SessionStats,
   clampThreshold,
   createSessionStats,
   evaluateConfirmation,
+  formatCalibrationReport,
   formatConfidence,
   formatConfirmationStatus,
   formatSessionStats,
   recordDetection,
+  resolveHandoff,
   resolveRoutes,
   selectEngineKind,
   shouldDebounce,
@@ -42,6 +46,27 @@ let sessionStats: SessionStats = createSessionStats();
 let warnedDeviceIgnored = false;
 let pendingConfirmation: PendingConfirmation | null = null;
 let confirmationTimer: ReturnType<typeof setTimeout> | null = null;
+let isManuallyPaused = false;
+let routesChangedWhilePaused = false;
+let calibration: CalibrationRun | null = null;
+
+/** How long Calibrate waits for an engine it had to start before giving up. */
+const CALIBRATION_START_TIMEOUT_MS = 30_000;
+
+type CalibrationOutcome = "completed" | "cancelled" | "stopped" | "error" | "start-timeout";
+
+/** A Calibrate run in progress. See runCalibration(). */
+interface CalibrationRun {
+  detections: CalibrationDetection[];
+  /** Epoch ms at which the listening window opened; 0 while the engine is still starting. */
+  startedAt: number;
+  /** Settle the run. Safe to call more than once; the first outcome wins. */
+  finish: (outcome: CalibrationOutcome) => void;
+  /** Set while the run waits for an engine it started to report READY. */
+  onEngineStarted: (() => void) | null;
+  /** Progress hook, called after each detection is recorded. */
+  onDetection: (() => void) | null;
+}
 
 // ── Default routes ──────────────────────────────────────────
 
@@ -50,6 +75,10 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
     label: "Claude",
     phrase: "hey claude",
     command: "claude-vscode.focus",
+    // Voice sessions with an assistant run well past the 30 second cooldown,
+    // so listening waits for the user to resume rather than restarting under
+    // the assistant and competing for the microphone.
+    handoff: "manual",
   },
   {
     label: "Copilot",
@@ -99,6 +128,7 @@ function wireEngine(engine: ISpeechEngine): void {
   engine.on("started", () => {
     sessionStats.engineStarts++;
     setStatusBar("listening");
+    calibration?.onEngineStarted?.();
   });
   engine.on("paused", () => setStatusBar("handed-off"));
   engine.on("stopped", () => setStatusBar("off"));
@@ -113,6 +143,7 @@ function wireEngine(engine: ISpeechEngine): void {
       }
     });
     setStatusBar("error");
+    calibration?.finish("error");
   });
 }
 
@@ -169,7 +200,12 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand("wakeWord.disable", () => stopListening()),
     vscode.commands.registerCommand("wakeWord.toggle", () => {
-      if (speechEngine.isListening || speechEngine.isPaused) {
+      if (calibration) {
+        // The status bar reads "Click to cancel" during a run.
+        calibration.finish("cancelled");
+      } else if (isManuallyPaused) {
+        resumeFromManualHandoff();
+      } else if (speechEngine.isListening || speechEngine.isPaused) {
         stopListening();
       } else {
         handleConsentThenStart(context);
@@ -178,6 +214,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("wakeWord.openSettings", () => {
       vscode.commands.executeCommand("workbench.action.openSettings", "wakeWord");
     }),
+    vscode.commands.registerCommand("wakeWord.calibrate", () => runCalibration(context)),
     vscode.commands.registerCommand("wakeWord.resetConsent", async () => {
       await context.globalState.update(CONSENT_KEY, undefined);
       stopListening();
@@ -207,8 +244,13 @@ export function activate(context: vscode.ExtensionContext) {
         e.affectsConfiguration("wakeWord.audioDevice");
 
       if (engineChanged) {
+        // A calibration run cannot outlive its engine. Settled here it
+        // reports nothing and restores nothing; the switch below decides
+        // what the new engine does.
+        calibration?.finish("stopped");
         const wasListening = speechEngine.isListening;
         const cooldownActive = countdownTimer !== null;
+        const manualActive = isManuallyPaused;
         isPausedByFocus = false;
         lastDetectionTime = 0;
         warnedDeviceIgnored = false;
@@ -221,18 +263,28 @@ export function activate(context: vscode.ExtensionContext) {
         // they are reset for the new one.
         logSessionStats();
         sessionStats = createSessionStats();
-        updateEngineIndicator(cooldownActive);
+        updateEngineIndicator(cooldownActive || manualActive);
         if (cooldownActive) {
-          log("info", "Engine switched during cooldown — will start when cooldown expires");
+          log("info", "Engine switched during cooldown: the new engine starts when the cooldown expires");
+        } else if (manualActive) {
+          log("info", "Engine switched during a manual handoff: the new engine starts when you resume");
         } else if (wasListening) {
           startListening();
         }
         return;
       }
 
-      if (e.affectsConfiguration("wakeWord.routes") && speechEngine.isListening) {
-        stopListening();
-        handleConsentThenStart(context);
+      if (e.affectsConfiguration("wakeWord.routes")) {
+        if (speechEngine.isListening) {
+          stopListening();
+          handleConsentThenStart(context);
+        } else if (speechEngine.isPaused || countdownTimer !== null || isManuallyPaused) {
+          // The engine is paused for a handoff and must not take the
+          // microphone back now. The resume does a full start so the new
+          // routes are used; resume() alone would replay the old ones.
+          routesChangedWhilePaused = true;
+          log("info", "Routes changed during a handoff: applied when listening resumes");
+        }
       }
     })
   );
@@ -245,7 +297,8 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      if (!state.focused && speechEngine.isListening) {
+      // A calibration run keeps the microphone: it ends on its own timer.
+      if (!state.focused && speechEngine.isListening && !calibration) {
         isPausedByFocus = true;
         clearConfirmation();
         speechEngine.pause();
@@ -276,6 +329,11 @@ const CONSENT_KEY = "wakeWord.userConsented";
 async function handleConsentThenStart(
   context: vscode.ExtensionContext
 ): Promise<void> {
+  // After a manual handoff, Enable is the resume the status bar promises.
+  if (isManuallyPaused) {
+    resumeFromManualHandoff();
+    return;
+  }
   if (speechEngine.isListening || isStarting) {
     return;
   }
@@ -296,7 +354,7 @@ async function handleConsentThenStart(
         "your machine. Nothing is recorded or transmitted.\n\n" +
         "When a wake phrase is detected, the microphone is released " +
         "so the target assistant can use it. Wake word listening " +
-        "resumes automatically after a cooldown period.\n\n" +
+        "resumes after a cooldown, or when you resume it from the status bar.\n\n" +
         "You can disable this at any time from the status bar.",
       { modal: true },
       "Allow Microphone Listening",
@@ -372,10 +430,13 @@ function startListening() {
 }
 
 function stopListening() {
+  calibration?.finish("stopped");
   clearResumeTimer();
   clearConfirmation();
   stopLockWatcher();
   isPausedByFocus = false;
+  isManuallyPaused = false;
+  routesChangedWhilePaused = false;
   lastDetectionTime = 0;
   speechEngine.stop();
   releaseLock(lockPath);
@@ -444,6 +505,19 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
   }
   lastDetectionTime = now;
 
+  // A calibration run records what was heard and acts on none of it. The
+  // debounce above still applies, so the run shows what a session would.
+  if (calibration) {
+    const time = calibration.startedAt ? now - calibration.startedAt : 0;
+    calibration.detections.push({ label: phrase.label, confidence, time });
+    log(
+      "info",
+      `Calibration: heard "${phrase.label}"${formatConfidence(confidence)} at ${(time / 1000).toFixed(1)}s`
+    );
+    calibration.onDetection?.();
+    return;
+  }
+
   // With confirmationMode on, the first hearing is held and the engine keeps
   // listening for a second one. The debounce above runs first, so the engine
   // repeating a single utterance cannot confirm it.
@@ -503,8 +577,13 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     return;
   }
 
-  // Schedule resume after cooldown
-  scheduleResume(cooldownSeconds);
+  // Hand off: resume on the route's timer, or wait for the user.
+  if (resolveHandoff(phrase.handoff) === "manual") {
+    enterManualPause();
+    log("info", "Manual handoff: waiting for the user to resume");
+  } else {
+    scheduleResume(cooldownSeconds);
+  }
 }
 
 // ── Phrase confirmation ─────────────────────────────────────
@@ -556,9 +635,20 @@ function clearConfirmation(): void {
 // ── Pause / Resume management ───────────────────────────────
 
 function scheduleResume(seconds: number) {
-  clearResumeTimer();
-  countdownRemaining = seconds;
   sessionStats.cooldowns++;
+  startCountdown(seconds);
+  log("info", `Cooldown: ${seconds}s`);
+}
+
+/**
+ * Run the status bar countdown and resume when it reaches zero. Separate
+ * from scheduleResume() so a cooldown that Calibrate interrupted can pick
+ * up its remaining seconds without counting as a second cooldown.
+ */
+function startCountdown(seconds: number) {
+  clearResumeTimer();
+  isManuallyPaused = false;
+  countdownRemaining = seconds;
 
   statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
   statusBarItem.tooltip = "Mic handed off to assistant. Resuming soon.";
@@ -577,17 +667,36 @@ function scheduleResume(seconds: number) {
       statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
     }
   }, 1000);
+}
 
-  log("info", `Cooldown: ${seconds}s`);
+/**
+ * Hold the handoff until the user resumes. No timer: the status bar shows
+ * Paused, and a click on it or the Enable command calls resumeListening().
+ * Routes with `handoff: "manual"` use this so a long voice session with an
+ * assistant is never interrupted by the engine restarting under it.
+ */
+function enterManualPause(): void {
+  clearResumeTimer();
+  isManuallyPaused = true;
+  setStatusBar("paused");
+}
+
+function resumeFromManualHandoff(): void {
+  log("info", "Resumed: user resumed after manual handoff");
+  resumeListening();
 }
 
 function resumeListening() {
   clearResumeTimer();
   clearConfirmation();
+  isManuallyPaused = false;
   lastDetectionTime = 0;
-  if (speechEngine.isPaused) {
+  // resume() replays the phrases the engine was paused with. After a route
+  // change that is the wrong list, so go through a full start instead.
+  if (speechEngine.isPaused && !routesChangedWhilePaused) {
     speechEngine.resume();
   } else {
+    routesChangedWhilePaused = false;
     startListening();
   }
 }
@@ -598,6 +707,231 @@ function clearResumeTimer() {
     countdownTimer = null;
   }
   countdownRemaining = 0;
+}
+
+// ── Calibration ───────────────────────────────────────────────
+
+type PriorState =
+  | { kind: "listening" }
+  | { kind: "cooldown"; remaining: number }
+  | { kind: "manual" }
+  | { kind: "focus-paused" }
+  | { kind: "off" };
+
+/** What the extension was doing when Calibrate was run, so it can be put back. */
+function capturePriorState(): PriorState {
+  if (speechEngine.isListening) {
+    return { kind: "listening" };
+  }
+  if (countdownTimer !== null) {
+    return { kind: "cooldown", remaining: countdownRemaining };
+  }
+  if (isManuallyPaused) {
+    return { kind: "manual" };
+  }
+  if (isPausedByFocus) {
+    return { kind: "focus-paused" };
+  }
+  return { kind: "off" };
+}
+
+/**
+ * Listen for CALIBRATION_DURATION_MS and report every detection instead of
+ * acting on it, so a user can see what the engine hears with their
+ * microphone, their room, and their threshold, without any route firing.
+ *
+ * The engine is started if it is not already listening, and the state it
+ * was in is put back afterwards: listening stays listening, an interrupted
+ * cooldown picks up where it left off, a manual handoff stays paused, and
+ * Off goes back to Off with the listener lock released. Detections still
+ * pass the debounce guard, so the run shows what a real session would.
+ * Confirmation mode is not applied: the point is to see every hearing.
+ *
+ * A run ends on its timer, on the notification's Cancel, on a status bar
+ * click, when listening is disabled or the engine is switched (nothing is
+ * restored then: those have settled the state themselves), or when the
+ * engine reports an error.
+ */
+async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
+  if (calibration) {
+    vscode.window.showInformationMessage("Wake Word: Calibration is already running.");
+    return;
+  }
+  if (!context.globalState.get<boolean>(CONSENT_KEY, false)) {
+    vscode.window.showWarningMessage(
+      "Wake Word: Calibration uses the microphone. Run Wake Word: Enable Listening first to allow that."
+    );
+    return;
+  }
+  // A window standing by for another one has no microphone to calibrate with.
+  if (lockWatchTimer !== null || !acquireListenerLock()) {
+    vscode.window.showWarningMessage(
+      "Wake Word: Another editor window is listening, so this one has no microphone to calibrate with. " +
+        "Run Calibrate from that window, or disable listening there first."
+    );
+    return;
+  }
+
+  const config = vscode.workspace.getConfiguration("wakeWord");
+  const routes = buildRoutes(config);
+  if (routes.length === 0) {
+    vscode.window.showWarningMessage(
+      "Wake Word: No wake phrases configured. Add phrases in settings."
+    );
+    return;
+  }
+  const threshold = clampThreshold(config.get<number>("confidenceThreshold", 0.3));
+  const seconds = CALIBRATION_DURATION_MS / 1000;
+
+  const prior = capturePriorState();
+  clearResumeTimer();
+  clearConfirmation();
+  isManuallyPaused = false;
+  log("info", `Calibration: starting (${seconds}s, threshold=${threshold}, was ${prior.kind})`);
+
+  const run: CalibrationRun = {
+    detections: [],
+    startedAt: 0,
+    finish: () => undefined,
+    onEngineStarted: null,
+    onDetection: null,
+  };
+  calibration = run;
+
+  const outcome = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Wake Word: Calibrating",
+      cancellable: true,
+    },
+    (progress, token) =>
+      new Promise<CalibrationOutcome>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        run.finish = (result) => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          calibration = null;
+          // A promise settles once, so a later outcome is ignored.
+          resolve(result);
+        };
+        token.onCancellationRequested(() => run.finish("cancelled"));
+        run.onDetection = () => {
+          const count = run.detections.length;
+          const last = run.detections[count - 1];
+          progress.report({
+            message: `Heard "${last.label}" (${count} detection${count === 1 ? "" : "s"})`,
+          });
+        };
+
+        const openWindow = () => {
+          run.startedAt = Date.now();
+          setStatusBar("calibrating");
+          progress.report({ message: `Say your wake phrases now (${seconds} seconds)` });
+          timer = setTimeout(() => run.finish("completed"), CALIBRATION_DURATION_MS);
+        };
+
+        if (prior.kind === "listening") {
+          openWindow();
+          return;
+        }
+
+        // The window opens once the engine reports READY, so a slow start,
+        // a model download on a first run included, does not eat into it.
+        progress.report({ message: "Starting the speech engine..." });
+        run.onEngineStarted = () => {
+          run.onEngineStarted = null;
+          if (timer) {
+            clearTimeout(timer);
+          }
+          openWindow();
+        };
+        timer = setTimeout(() => run.finish("start-timeout"), CALIBRATION_START_TIMEOUT_MS);
+        Promise.resolve(speechEngine.start(routes, threshold, isDevMode)).catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          log("error", `Calibration: the engine failed to start: ${message}`);
+          run.finish("error");
+        });
+      })
+  );
+
+  reportCalibration(run, outcome);
+  restorePriorState(prior, outcome);
+}
+
+function reportCalibration(run: CalibrationRun, outcome: CalibrationOutcome): void {
+  if (outcome === "start-timeout") {
+    log(
+      "warn",
+      `Calibration: the engine did not start within ${CALIBRATION_START_TIMEOUT_MS / 1000}s. ` +
+        "Check the lines above for the reason and try again."
+    );
+    vscode.window.showWarningMessage(
+      "Wake Word: Calibration could not start the speech engine. Check the Wake Word output channel."
+    );
+    return;
+  }
+  if (outcome === "error") {
+    // The error itself was logged and shown by the engine's error handler.
+    log("warn", "Calibration: stopped by an engine error");
+    return;
+  }
+  if (outcome === "stopped") {
+    log("info", "Calibration: cancelled because listening was disabled or the engine changed");
+    return;
+  }
+  if (run.startedAt === 0) {
+    log("info", "Calibration: cancelled before the engine started");
+    return;
+  }
+
+  const elapsed = outcome === "completed" ? CALIBRATION_DURATION_MS : Date.now() - run.startedAt;
+  const report = formatCalibrationReport(run.detections, elapsed);
+  for (const line of report.lines) {
+    log("info", line);
+  }
+  vscode.window.showInformationMessage(report.summary, "Show Log").then((choice) => {
+    if (choice === "Show Log") {
+      outputChannel.show();
+    }
+  });
+}
+
+/**
+ * Put the extension back where Calibrate found it. Skipped when listening
+ * was disabled during the run or the engine failed: those have already
+ * settled the state and the status bar themselves.
+ */
+function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void {
+  if (outcome === "stopped" || outcome === "error") {
+    return;
+  }
+  lastDetectionTime = 0;
+  switch (prior.kind) {
+    case "listening":
+      if (speechEngine.isListening) {
+        setStatusBar("listening");
+      }
+      break;
+    case "cooldown":
+      speechEngine.pause();
+      startCountdown(prior.remaining);
+      log("info", `Calibration: cooldown resumed with ${prior.remaining}s left`);
+      break;
+    case "manual":
+      speechEngine.pause();
+      enterManualPause();
+      break;
+    case "focus-paused":
+      speechEngine.pause();
+      break;
+    case "off":
+      speechEngine.stop();
+      releaseLock(lockPath);
+      setStatusBar("off");
+      break;
+  }
 }
 
 // ── Status bar ──────────────────────────────────────────────
@@ -627,7 +961,16 @@ function tooltipWithSettingsLink(text: string): vscode.MarkdownString {
   return tooltip;
 }
 
-function setStatusBar(state: "off" | "listening" | "handed-off" | "error" | "other-window") {
+type StatusBarState =
+  | "off"
+  | "listening"
+  | "handed-off"
+  | "paused"
+  | "calibrating"
+  | "error"
+  | "other-window";
+
+function setStatusBar(state: StatusBarState) {
   switch (state) {
     case "off":
       statusBarItem.text = "$(mic-off) Wake: Off";
@@ -650,6 +993,21 @@ function setStatusBar(state: "off" | "listening" | "handed-off" | "error" | "oth
       statusBarItem.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.warningBackground"
       );
+      updateEngineIndicator(true);
+      break;
+    case "paused":
+      statusBarItem.text = "$(debug-pause) Wake: Paused";
+      statusBarItem.tooltip = "Mic handed to assistant. Click to resume listening.";
+      statusBarItem.backgroundColor = new vscode.ThemeColor(
+        "statusBarItem.warningBackground"
+      );
+      updateEngineIndicator(true);
+      break;
+    case "calibrating":
+      statusBarItem.text = "$(pulse) Wake: Calibrating";
+      statusBarItem.tooltip =
+        "Listening for wake phrases without acting on them. Click to cancel.";
+      statusBarItem.backgroundColor = undefined;
       updateEngineIndicator(true);
       break;
     case "error":
