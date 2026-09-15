@@ -347,7 +347,6 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 | Microphone access denied (Windows) | Open Settings → Privacy & security → Microphone and turn on **Microphone access** and **Let desktop apps access your microphone**. |
 | Microphone access denied (macOS) | Open System Settings → Privacy & Security → Microphone and enable access for VS Code (or your editor). |
 | Model download fails | Check your internet connection. The model is ~17MB downloaded from GitHub. If behind a proxy, ensure HTTPS traffic to `github.com` is allowed. |
-| "Could not extract the speech model" | The model is a `.tar.bz2` archive, unpacked with the system `tar` (on Windows, `tar.exe` in System32). The message includes tar's own error: include it, with the **Wake Word: Show Diagnostics** report, in a bug report. |
 | High CPU while idle | The engine gates keyword spotting on voice activity detection, so a quiet room should cost close to nothing. Sustained CPU with no one speaking usually means a noisy input: check the correct microphone is selected and lower its input gain. |
 | Status bar shows "Wake: Other window" | Another window of the same editor is listening. Only one listens at a time, and this window takes over automatically when that one stops. To move listening here now, disable it in the other window. |
 | Wrong microphone is used | Set `wakeWord.audioDevice` to part of the device's name (e.g. `"USB"`) or its index. |

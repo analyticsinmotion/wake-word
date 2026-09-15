@@ -31,7 +31,8 @@ wake-word/
   src/
     extension.ts              # VS Code extension entry point, commands, status bar, consent flow, diagnostics
     speechEngineInterface.ts  # ISpeechEngine interface (implemented by SherpaEngine)
-    sherpaEngine.ts           # SherpaEngine: audio-engine.js child process under system Node.js, every platform
+    sherpaEngine.ts           # SherpaEngine: audio-engine.js child process under system Node.js, every platform; model download
+    tarExtract.ts             # Model archive extraction: gzip via zlib, a minimal ustar reader, path traversal guard
     wakeWordCore.ts           # Pure logic shared by the host and the engine: protocol, handoff order, phrase checks, diagnostics, session stats
     lockFile.ts               # PID lock in globalStorage so only one editor window listens
   engine/
@@ -78,7 +79,7 @@ sherpa-onnx's keyword spotter applies its own threshold and returns no usable sc
 
 **Retired Windows engine.** Before 0.13.0 Windows ran `WindowsSpeechEngine`, System.Speech in a script child process that ended on every handoff, selected by the `wakeWord.engine` setting. 0.13.0 removed both. A value left in settings.json is still readable through `getConfiguration()`, and `retiredEngineNotice()` turns `"windows"` into one info line at activation. The engine indicator status bar item now always reads `Sherpa` and runs **Show Diagnostics** when clicked; it is kept for 0.13.0 only so Windows users can see the switch, and should be removed in 0.14.0.
 
-**SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `decibri` (5.7.0) for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI, and Node.js 22 or later is the documented requirement on every platform; a spawn that fails with ENOENT reports `NODE_NOT_FOUND_MESSAGE`, which says so and links to nodejs.org, because Windows needed no Node.js before 0.13.0. `findSystemNode()` caches the executable it finds for the session, because the lookup spawns `where node` or `which node` synchronously on the extension host thread. The `wakeWord.nodePath` override and the bare `node` fallback are never cached, and a spawn that fails with ENOENT calls `clearNodePathCache()` so the next start looks again. The child, the lookup, and model extraction are all started with `windowsHide: true`, so Windows gives none of these console programs a window.
+**SherpaEngine** spawns `engine/audio-engine.js` under system Node.js. The child uses `decibri` (5.7.0) for mic capture and `sherpa-onnx` for keyword spotting. Config is sent as a JSON line to stdin. System Node.js is required because Electron cannot load native addons at the correct ABI, and Node.js 22 or later is the documented requirement on every platform; a spawn that fails with ENOENT reports `NODE_NOT_FOUND_MESSAGE`, which says so and links to nodejs.org, because Windows needed no Node.js before 0.13.0. `findSystemNode()` caches the executable it finds for the session, because the lookup spawns `where node` or `which node` synchronously on the extension host thread. The `wakeWord.nodePath` override and the bare `node` fallback are never cached, and a spawn that fails with ENOENT calls `clearNodePathCache()` so the next start looks again. The child and the lookup are both started with `windowsHide: true`, so Windows gives neither console program a window. Model extraction starts no process at all (see below).
 
 The config line carries `audioDevice`, the `wakeWord.audioDevice` setting, which `engine/lib/control.js` resolves to decibri's `device` option: a digit-only string is a device index, anything else a case-insensitive name substring, and empty means the system default (the key is omitted). A lookup failure is reported by `engine/lib/mic-errors.js` with the value and the setting named. The extension builds a new `SherpaEngine` when the setting changes, as it does for `wakeWord.nodePath`.
 
@@ -110,7 +111,7 @@ The engine cancels a pending crash-backoff retry in `stop()`, `pause()`, and `st
 
 **Open Settings.** `wakeWord.openSettings` opens the Settings editor filtered to `wakeWord`. The Off and Listening status bar tooltips are trusted `MarkdownString`s ending in a command link to it; the status bar click itself stays the toggle.
 
-The model download verifies the tarball against the pinned `MODEL_SHA256` in `sherpaEngine.ts` before extraction, and follows at most `MAX_REDIRECTS` (5) hops. Changing `MODEL_URL` or `MODEL_VERSION` means recomputing that digest; the command to do so is in the constant's comment. Extraction runs `tar -xjf` through `execFileSync` with the arguments from `modelExtractCommand()`: on Windows that is `%SystemRoot%\System32\tar.exe` by full path whenever it exists, because a GNU tar earlier on PATH (Git for Windows, MSYS2) hands bzip2 to an external `bzip2` program and fails when that is not on PATH. The tarball is bzip2, so the tar found has to read bzip2 itself; whether the System32 tar of every Windows 10 build does is not verified (checklist item 23).
+The model download verifies the archive against the pinned `MODEL_SHA256` in `sherpaEngine.ts` before extraction, and follows at most `MAX_REDIRECTS` (5) hops. Changing `MODEL_URL` or `MODEL_VERSION` means recomputing that digest; the command to do so is in the constant's comment. `MODEL_URL` is the `model-v1` release of this repository: sherpa-onnx publishes the model only as `.tar.bz2`, and the release carries it repacked as `.tar.gz` with every file byte-identical, so `MODEL_VERSION` stayed `1`. Extraction is JavaScript, in `tarExtract.ts`, and runs no system `tar` on any platform. `extractTarGz()` decompresses the archive in memory with Node.js's zlib and `extractTar()` reads the ustar headers: regular files and directories only, with the ustar prefix field joined to the name (the archive stores its three int8 model files that way, because their paths are over 100 bytes) and every header checksum checked. Any other entry type, links and pax or GNU long-name records included, is refused rather than skipped, because a skipped long-name record would put the next file in the wrong place. `resolveTarEntryPath()` blocks an entry that would land outside the destination (`..`, an absolute path, and on Windows a backslash, drive, or UNC path), and every entry is checked before the first file is written. `downloadModel()` removes `version.txt` before extracting and writes it again after, so a failed extraction is never taken for a complete model. Replacing the archive means checking it against that reader: a tar that writes pax headers or GNU long names produces an archive it refuses.
 
 ## Conventions
 
@@ -168,6 +169,12 @@ and the retired engine notice, `tests/unit/phraseQuality.test.ts` the phrase
 warnings, collisions, and when they are reported again, and
 `tests/unit/diagnostics.test.ts` the diagnostics report, home directory
 redaction, and `describeLock()`.
+`tests/unit/tarExtract.test.ts` builds tar archives in memory and extracts
+them into a fresh directory under the system temp directory, the one place
+the suite writes real files: ustar prefixes, directories, block padding,
+checksums, truncation, refused entry types, gzip errors, and path traversal.
+`resolveTarEntryPath()` is checked under both the Windows and the POSIX path
+rules, whichever platform runs the suite.
 
 Anything that needs a real microphone, a live child process, or the extension
 host still has to be checked by hand. Add a test for pure logic first; if that
@@ -206,7 +213,7 @@ Manual testing checklist:
 20. In the Extension Development Host, check the output channel after a start, a detection, and a resume for every timing line: `modules-load`, `bpe-load`, `tokenise`, `model-load`, `mic-open`, `start-to-ready`, `detect-to-release`, `detect-to-command`, `pause-to-ack`, `resume-mic-open`, and `resume-to-ready`. Note the start and resume figures.
 21. Run **Wake Word: Disable Listening** while the engine is listening. The log shows "Mic release: acknowledged by engine" and the `node` child exits. Repeat while paused after a handoff.
 22. Enable `wakeWord.pauseOnFocusLoss`, focus another application, add a route to `wakeWord.routes` in settings.json with another editor, and focus the window again. The log shows "Routes changed during a handoff", "Resumed: window regained focus", and a "Starting:" line that counts the new route.
-23. On Windows, with no model in global storage: enable listening. The model downloads and extracts (no "Could not extract the speech model" error), no console window appears for the `node` child, and phrases are detected. Repeat on a Windows 10 machine: the System32 `tar.exe` there must be able to read the bzip2 tarball.
+23. On Windows, with no model in global storage: enable listening. The model downloads and extracts (no "Could not extract the speech model" error), no console window appears for the `node` child, and phrases are detected. Repeat on a Windows 10 machine when one is available.
 24. Say a wake phrase and confirm the output channel shows "Mic release: acknowledged by engine (paused)" and, in debug mode, `Timing: detect-to-release`, before the target command's effect (the assistant opening) and before `Timing: detect-to-command`.
 25. Run **Wake Word: Show Diagnostics**. The output channel has the report from "=== Wake Word Diagnostics ===" to "=== End Diagnostics ===", with the engine's Node.js version, the model marked downloaded, and `~` in place of your home directory. Choose **Copy to Clipboard** and paste: the same lines. Run it again and choose **Show Log**.
 26. Add a route with the single-word phrase `"search"`. When listening restarts, the output channel shows a `Phrase warning (<label>)` line and one "phrase warning found" notification appears. Disable and enable listening: no second notification. Change the phrase to `"stop"`: the notification appears again, counting two warnings.
@@ -214,6 +221,7 @@ Manual testing checklist:
 28. Put `"wakeWord.engine": "windows"` in settings.json and reload the window. The output channel shows the retired engine line, and listening works.
 29. Say "Hey Computer" and, during the countdown, run **Wake Word: Enable Listening**. The log shows "Resumed: user resumed during the cooldown", the countdown disappears, and the status bar shows "Wake: Listening".
 30. Set `wakeWord.nodePath` to a path that does not exist. The error notification says Wake Word requires Node.js 22 or later on all platforms and names `wakeWord.nodePath`.
+31. With a model already downloaded by 0.13.0, install 0.13.1 and enable listening: no download notification appears, and in debug mode the log shows "Model already present". Then delete the `sherpa-onnx` folder from global storage and enable listening on macOS or Linux: the model downloads, extracts, and phrases are detected.
 
 ## Boundaries
 

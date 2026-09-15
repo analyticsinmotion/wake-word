@@ -17,7 +17,7 @@ import {
   MODEL_FILES,
   MODEL_NAME,
   MODEL_SHA256,
-  modelExtractCommand,
+  MODEL_URL,
   modelStatus,
   redirectLimitExceeded,
   shouldFollowRedirect,
@@ -27,7 +27,10 @@ import {
 describe("shouldFollowRedirect", () => {
   it("follows the 302 GitHub returns for a release asset", () => {
     expect(
-      shouldFollowRedirect(302, "https://objects.githubusercontent.com/kws-models.tar.bz2")
+      shouldFollowRedirect(
+        302,
+        "https://release-assets.githubusercontent.com/github-production-release-asset/model.tar.gz"
+      )
     ).toBe(true);
   });
 
@@ -119,45 +122,15 @@ describe("verifyModelHash", () => {
   });
 });
 
-describe("modelExtractCommand", () => {
-  const tarball = "C:\\Users\\Ann\\AppData\\Roaming\\Code\\User\\globalStorage\\x\\sherpa-onnx\\model.tar.bz2";
-  const storage = "C:\\Users\\Ann\\AppData\\Roaming\\Code\\User\\globalStorage\\x\\sherpa-onnx";
-
-  it("uses the tar.exe in System32 on Windows, by full path", () => {
-    // A GNU tar earlier on PATH needs an external bzip2 that may not exist.
-    const exists = vi.fn((p: string) => p === "C:\\WINDOWS\\System32\\tar.exe");
-    expect(modelExtractCommand(tarball, storage, "win32", "C:\\WINDOWS", exists)).toEqual({
-      file: "C:\\WINDOWS\\System32\\tar.exe",
-      args: ["-xjf", tarball, "-C", storage],
-    });
-  });
-
-  it("assumes C:\\Windows when SystemRoot is empty", () => {
-    // Passing undefined would take the parameter's default, process.env.SystemRoot.
-    const exists = vi.fn(() => true);
-    expect(modelExtractCommand(tarball, storage, "win32", "", exists).file).toBe(
-      "C:\\Windows\\System32\\tar.exe"
+describe("MODEL_URL", () => {
+  it("is the gzip archive of MODEL_NAME from the Wake Word model-v1 release", () => {
+    // extractTarGz() reads gzip only, so the URL has to name the .tar.gz.
+    expect(MODEL_URL).toBe(
+      "https://github.com/analyticsinmotion/wake-word/releases/download/model-v1/" +
+        MODEL_NAME +
+        ".tar.gz"
     );
-  });
-
-  it("falls back to tar from PATH on a Windows without System32 tar.exe", () => {
-    expect(modelExtractCommand(tarball, storage, "win32", "C:\\WINDOWS", () => false).file).toBe("tar");
-  });
-
-  it("uses tar from PATH on macOS and Linux without probing System32", () => {
-    const exists = vi.fn(() => true);
-    for (const platform of ["darwin", "linux"]) {
-      expect(modelExtractCommand("/s/model.tar.bz2", "/s", platform, undefined, exists)).toEqual({
-        file: "tar",
-        args: ["-xjf", "/s/model.tar.bz2", "-C", "/s"],
-      });
-    }
-    expect(exists).not.toHaveBeenCalled();
-  });
-
-  it("passes paths as separate arguments, unquoted, for execFileSync", () => {
-    const spaced = "/Users/Ann Lee/Library/Application Support/Code/model.tar.bz2";
-    expect(modelExtractCommand(spaced, "/x y", "darwin").args).toEqual(["-xjf", spaced, "-C", "/x y"]);
+    expect(MODEL_URL).not.toContain(".tar.bz2");
   });
 });
 

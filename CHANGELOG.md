@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.1] - 2026-09-15
+
+### Changed
+
+- The speech model is downloaded as a `.tar.gz` archive from the Wake
+  Word repository's releases and extracted in JavaScript with Node.js's
+  built-in zlib, instead of by the system `tar`. Wake Word no longer
+  depends on `tar` on any platform, which fixes potential extraction
+  failures on Windows 10, where the built-in `tar` may not read the
+  `.tar.bz2` archive the model was published as. The files inside are
+  unchanged, so a model that is already downloaded is kept. Extraction
+  refuses an archive entry that would land outside the model's folder,
+  on top of the SHA-256 check every download already passes.
+
+### Fixed
+
+- An extraction that failed part way through replacing an earlier,
+  complete model left that model's version marker in place, so the next
+  start could take the half-written files for a complete model. The
+  marker is now removed before extraction and written again only once it
+  succeeds.
+
 ## [0.13.0] - 2026-09-15
 
 ### Added
