@@ -37,7 +37,7 @@
   </script>
   <!-- Schema.org: FAQPage -->
   <script type="application/ld+json">
-  {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Is my audio sent to the cloud?","acceptedAnswer":{"@type":"Answer","text":"No. All speech recognition runs locally on your machine. Nothing is recorded, stored, or transmitted."}},{"@type":"Question","name":"Does Wake Word work on macOS and Linux?","acceptedAnswer":{"@type":"Answer","text":"Yes. On Windows it uses the built-in System.Speech engine. On macOS and Linux it uses sherpa-onnx with a local model (~17 MB, downloaded on first use). Node.js 18+ is required on macOS and Linux."}},{"@type":"Question","name":"Can I add custom wake phrases?","acceptedAnswer":{"@type":"Answer","text":"Yes. Add entries to wakeWord.routes in settings.json. Each entry maps a spoken phrase to any VS Code command."}},{"@type":"Question","name":"Does it work with Cursor, Windsurf, and other editors?","acceptedAnswer":{"@type":"Answer","text":"Yes. Install via the Open VSX Registry or download the .vsix from GitHub Releases."}},{"@type":"Question","name":"How does the microphone handoff work?","acceptedAnswer":{"@type":"Answer","text":"When a wake phrase is detected, the extension kills its speech engine process, releasing the mic. The target assistant takes over. After a configurable cooldown (default 30 seconds), listening resumes automatically."}}]}
+  {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Is my audio sent to the cloud?","acceptedAnswer":{"@type":"Answer","text":"No. All speech recognition runs locally on your machine. Nothing is recorded, stored, or transmitted."}},{"@type":"Question","name":"Does Wake Word work on macOS and Linux?","acceptedAnswer":{"@type":"Answer","text":"Yes. Wake Word uses sherpa-onnx with a local model (~17 MB, downloaded on first use) on Windows, macOS, and Linux. Node.js 22 or later is required on every platform."}},{"@type":"Question","name":"Can I add custom wake phrases?","acceptedAnswer":{"@type":"Answer","text":"Yes. Add entries to wakeWord.routes in settings.json. Each entry maps a spoken phrase to any VS Code command."}},{"@type":"Question","name":"Does it work with Cursor, Windsurf, and other editors?","acceptedAnswer":{"@type":"Answer","text":"Yes. Install via the Open VSX Registry or download the .vsix from GitHub Releases."}},{"@type":"Question","name":"How does the microphone handoff work?","acceptedAnswer":{"@type":"Answer","text":"When a wake phrase is detected, the extension tells its speech engine to close the microphone and waits for it to confirm before opening the target assistant, which then takes over the mic. After a configurable cooldown (default 30 seconds), listening resumes automatically."}}]}
   </script>
   <!-- Schema.org: HowTo -->
   <script type="application/ld+json">
@@ -490,7 +490,7 @@
     <section class="section-alt fade-in" aria-label="Platform support">
       <div class="container">
         <h2>Works Across Every Major OS</h2>
-        <p class="section-subtitle">Native support for Windows, macOS, and Linux. On Windows, it uses the built-in speech engine. On macOS and Linux, a lightweight local model handles detection.</p>
+        <p class="section-subtitle">Native support for Windows, macOS, and Linux. On every platform, a lightweight local model handles detection.</p>
         <div class="platforms">
           <div class="platform-item">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M0 3.449L9.75 2.1v9.45H0m10.949-9.6L24 0v11.4H10.949M0 12.6h9.75v9.45L0 20.699M10.949 12.6H24V24l-12.9-1.801"/></svg>
@@ -630,7 +630,7 @@
           <div class="feature-card">
             <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
             <h3>Zero config</h3>
-            <p>No API keys. No accounts. No system dependencies on Windows. Install and go.</p>
+            <p>No API keys. No accounts. Just Node.js 22 or later. Install and go.</p>
           </div>
           <div class="feature-card">
             <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></div>
@@ -698,7 +698,7 @@
           </div>
           <div class="faq-item">
             <button class="faq-question" aria-expanded="false"><span>Does it work on macOS and Linux?</span><svg class="faq-chevron" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg></button>
-            <div class="faq-answer"><p>Yes. On Windows it uses built-in System.Speech. On macOS and Linux it uses sherpa-onnx with a local model (~17 MB, downloaded on first use). Node.js 18+ required.</p></div>
+            <div class="faq-answer"><p>Yes. Wake Word uses sherpa-onnx with a local model (~17 MB, downloaded on first use) on Windows, macOS, and Linux. Node.js 22 or later required.</p></div>
           </div>
           <div class="faq-item">
             <button class="faq-question" aria-expanded="false"><span>Can I add custom wake phrases?</span><svg class="faq-chevron" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg></button>
@@ -710,7 +710,7 @@
           </div>
           <div class="faq-item">
             <button class="faq-question" aria-expanded="false"><span>How does the microphone handoff work?</span><svg class="faq-chevron" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg></button>
-            <div class="faq-answer"><p>When a wake phrase is detected, the extension kills its speech engine, releasing the mic. The target assistant takes over. After a configurable cooldown (default 30s), listening resumes.</p></div>
+            <div class="faq-answer"><p>When a wake phrase is detected, the extension tells its speech engine to close the mic and waits for it to confirm. Only then does the target assistant open and take over. After a configurable cooldown (default 30s), listening resumes.</p></div>
           </div>
         </div>
       </div>

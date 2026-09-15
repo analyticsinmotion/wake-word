@@ -42,8 +42,8 @@ describe("parseEngineLine", () => {
   });
 
   it("honours a caller-supplied default confidence", () => {
-    // The Windows engine passes 0 so a malformed line can never clear the
-    // configured threshold.
+    // A caller that acts on scores passes 0, so a malformed line can never
+    // clear a threshold.
     expect(parseEngineLine("DETECTED:hey claude", 0)).toMatchObject({ confidence: 0 });
     expect(parseEngineLine("DETECTED:hey claude|", 0)).toMatchObject({ confidence: 0 });
     expect(parseEngineLine("DETECTED:hey claude|oops", 0)).toMatchObject({ confidence: 0 });

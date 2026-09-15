@@ -71,7 +71,7 @@ function resolveModelDir(explicit) {
     throw new Error(
       'No downloaded model found. Looked in:\n' +
         candidates.map((c) => `  ${c}`).join('\n') +
-        '\nEither run the extension with wakeWord.engine set to "sherpa" once so it downloads the model, ' +
+        '\nEither enable listening in the extension once so it downloads the model, ' +
         'or pass --model-dir <path> pointing at an extracted copy of ' +
         core.MODEL_NAME +
         '.tar.bz2 (the URL is in src/sherpaEngine.ts).'

@@ -56,7 +56,7 @@ describe("findSystemNode", () => {
     setPlatform("linux");
     mocks.execSync.mockReturnValue("/usr/bin/node\n");
     expect(findSystemNode("")).toBe("/usr/bin/node");
-    expect(mocks.execSync).toHaveBeenCalledWith("which node", { encoding: "utf8" });
+    expect(mocks.execSync).toHaveBeenCalledWith("which node", { encoding: "utf8", windowsHide: true });
   });
 
   it("falls through to the shell lookup when no override is passed", () => {
@@ -69,7 +69,7 @@ describe("findSystemNode", () => {
     setPlatform("win32");
     mocks.execSync.mockReturnValue("C:\\Program Files\\nodejs\\node.exe\r\n");
     expect(findSystemNode()).toBe("C:\\Program Files\\nodejs\\node.exe");
-    expect(mocks.execSync).toHaveBeenCalledWith("where node", { encoding: "utf8" });
+    expect(mocks.execSync).toHaveBeenCalledWith("where node", { encoding: "utf8", windowsHide: true });
   });
 
   it("takes the first result when `where node` returns several", () => {

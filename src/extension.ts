@@ -1,8 +1,14 @@
 import * as vscode from "vscode";
 import * as os from "os";
 import { WakePhrase, ISpeechEngine } from "./speechEngineInterface";
-import { WindowsSpeechEngine } from "./windowsSpeechEngine";
-import { SherpaEngine } from "./sherpaEngine";
+import {
+  MODEL_NAME,
+  MODEL_SHA256,
+  SherpaEngine,
+  findSystemNode,
+  modelStatus,
+  probeNodeVersion,
+} from "./sherpaEngine";
 import {
   CALIBRATION_DURATION_MS,
   CONFIRMATION_WINDOW_MS,
@@ -12,26 +18,37 @@ import {
   SessionStats,
   clampThreshold,
   createSessionStats,
+  detectPhraseCollisions,
   evaluateConfirmation,
+  filterValidRoutes,
   formatCalibrationReport,
   formatConfidence,
   formatConfirmationStatus,
+  formatDiagnostics,
+  formatPhraseChecks,
+  formatPhraseChecksSummary,
   formatSessionStats,
+  phraseChecksKey,
   recordDetection,
+  releaseThenFire,
   resolveHandoff,
   resolveRoutes,
-  selectEngineKind,
+  retiredEngineNotice,
   shouldDebounce,
+  validatePhraseQuality,
 } from "./wakeWordCore";
 import {
   LOCK_CHECK_INTERVAL_MS,
+  describeLock,
   lockFilePath,
+  readLock,
   releaseLock,
   tryAcquireLock,
 } from "./lockFile";
 
 let statusBarItem: vscode.StatusBarItem;
 let engineBarItem: vscode.StatusBarItem;
+let statusBarState: StatusBarState = "off";
 let outputChannel: vscode.OutputChannel;
 let countdownTimer: ReturnType<typeof setInterval> | null = null;
 let countdownRemaining = 0;
@@ -43,12 +60,15 @@ let lastDetectionTime = 0;
 let lockPath = "";
 let lockWatchTimer: ReturnType<typeof setInterval> | null = null;
 let sessionStats: SessionStats = createSessionStats();
-let warnedDeviceIgnored = false;
 let pendingConfirmation: PendingConfirmation | null = null;
 let confirmationTimer: ReturnType<typeof setTimeout> | null = null;
 let isManuallyPaused = false;
 let routesChangedWhilePaused = false;
 let calibration: CalibrationRun | null = null;
+/** Advanced by each detection's handoff and by cancelPendingHandoff(). */
+let handoffGeneration = 0;
+/** phraseChecksKey() of the routes whose phrase checks were last reported. */
+let lastPhraseChecksKey = "";
 
 /** How long Calibrate waits for an engine it had to start before giving up. */
 const CALIBRATION_START_TIMEOUT_MS = 30_000;
@@ -96,15 +116,14 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
 
 // ── Engine factory ───────────────────────────────────────────
 
+/**
+ * Build the speech engine. Every platform runs the sherpa-onnx engine:
+ * decibri for capture and a keyword spotter, in a child process under
+ * system Node.js.
+ */
 function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
   const config = vscode.workspace.getConfiguration("wakeWord");
-  const nodePath = config.get<string>("nodePath", "");
-  const engineOverride = config.get<string>("engine", "auto");
-
-  if (selectEngineKind(engineOverride, os.platform()) === "windows") {
-    return new WindowsSpeechEngine();
-  }
-  return new SherpaEngine(context, nodePath, readAudioDevice(config));
+  return new SherpaEngine(context, config.get<string>("nodePath", ""), readAudioDevice(config));
 }
 
 /**
@@ -156,6 +175,13 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("Wake Word");
   context.subscriptions.push(outputChannel);
 
+  // wakeWord.engine is no longer contributed, but a value left in
+  // settings.json is still readable.
+  const notice = retiredEngineNotice(vscode.workspace.getConfiguration("wakeWord").get<unknown>("engine"));
+  if (notice) {
+    log("info", notice);
+  }
+
   // Shared by every window of this editor, which is what lets them agree on
   // who holds the microphone. See lockFile.ts.
   lockPath = lockFilePath(context.globalStorageUri.fsPath);
@@ -174,20 +200,19 @@ export function activate(context: vscode.ExtensionContext) {
   statusBarItem.command = "wakeWord.toggle";
   context.subscriptions.push(statusBarItem);
 
+  // Every platform has run the same engine since 0.13.0. The indicator stays
+  // for that release so Windows users, who ran a different engine before,
+  // can see which one they are on now. Remove it in 0.14.0.
   engineBarItem = vscode.window.createStatusBarItem(
     "wakeWord.engine",
     vscode.StatusBarAlignment.Right,
     99
   );
   engineBarItem.name = "Wake Word Engine";
-  engineBarItem.tooltip = "Active speech engine. Click to change.";
+  engineBarItem.text = "$(gear) Sherpa";
+  engineBarItem.tooltip = "Speech engine: sherpa-onnx. Click to show Wake Word diagnostics.";
+  engineBarItem.command = "wakeWord.diagnostics";
   context.subscriptions.push(engineBarItem);
-  context.subscriptions.push(
-    vscode.commands.registerCommand("wakeWord.openEngineSetting", () => {
-      vscode.commands.executeCommand("workbench.action.openSettings", "wakeWord.engine");
-    })
-  );
-  engineBarItem.command = "wakeWord.openEngineSetting";
 
   // Both items created — safe to call setStatusBar now
   setStatusBar("off");
@@ -215,6 +240,7 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.commands.executeCommand("workbench.action.openSettings", "wakeWord");
     }),
     vscode.commands.registerCommand("wakeWord.calibrate", () => runCalibration(context)),
+    vscode.commands.registerCommand("wakeWord.diagnostics", () => runDiagnostics(context)),
     vscode.commands.registerCommand("wakeWord.resetConsent", async () => {
       await context.globalState.update(CONSENT_KEY, undefined);
       stopListening();
@@ -238,14 +264,15 @@ export function activate(context: vscode.ExtensionContext) {
   // Re-init when settings change
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
+      // The engine is built with the node path and the microphone, so a
+      // change to either needs a new one.
       const engineChanged =
-        e.affectsConfiguration("wakeWord.engine") ||
         e.affectsConfiguration("wakeWord.nodePath") ||
         e.affectsConfiguration("wakeWord.audioDevice");
 
       if (engineChanged) {
         // A calibration run cannot outlive its engine. Settled here it
-        // reports nothing and restores nothing; the switch below decides
+        // reports nothing and restores nothing; the rebuild below decides
         // what the new engine does.
         calibration?.finish("stopped");
         const wasListening = speechEngine.isListening;
@@ -253,21 +280,20 @@ export function activate(context: vscode.ExtensionContext) {
         const manualActive = isManuallyPaused;
         isPausedByFocus = false;
         lastDetectionTime = 0;
-        warnedDeviceIgnored = false;
         clearConfirmation();
         speechEngine.dispose();
         speechEngine = createEngine(context);
         wireEngine(speechEngine);
-        log("info", "Engine switched due to settings change");
+        log("info", "Engine rebuilt due to settings change");
         // The counters describe one engine's run. Write them out before
         // they are reset for the new one.
         logSessionStats();
         sessionStats = createSessionStats();
         updateEngineIndicator(cooldownActive || manualActive);
         if (cooldownActive) {
-          log("info", "Engine switched during cooldown: the new engine starts when the cooldown expires");
+          log("info", "Engine rebuilt during cooldown: the new engine starts when the cooldown expires");
         } else if (manualActive) {
-          log("info", "Engine switched during a manual handoff: the new engine starts when you resume");
+          log("info", "Engine rebuilt during a manual handoff: the new engine starts when you resume");
         } else if (wasListening) {
           startListening();
         }
@@ -337,6 +363,14 @@ async function handleConsentThenStart(
     resumeFromManualHandoff();
     return;
   }
+  // During a cooldown, Enable resumes early. A plain start here reopened the
+  // microphone but left the countdown running, which kept overwriting the
+  // status bar and, when it expired, left it on the last second.
+  if (countdownTimer !== null) {
+    log("info", "Resumed: user resumed during the cooldown");
+    resumeListening();
+    return;
+  }
   if (speechEngine.isListening || isStarting) {
     return;
   }
@@ -393,6 +427,7 @@ function logSessionStats(): void {
 // ── Core logic ──────────────────────────────────────────────
 
 function startListening() {
+  cancelPendingHandoff();
   const config = vscode.workspace.getConfiguration("wakeWord");
   const routes = buildRoutes(config);
 
@@ -419,21 +454,14 @@ function startListening() {
   const deviceNote = audioDevice ? `, device="${audioDevice}"` : "";
   log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}${deviceNote}`);
   log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
-
-  if (audioDevice && !(speechEngine instanceof SherpaEngine) && !warnedDeviceIgnored) {
-    warnedDeviceIgnored = true;
-    log(
-      "warn",
-      "wakeWord.audioDevice is set, but the Windows engine always uses the system " +
-        "default microphone. Set wakeWord.engine to \"sherpa\" to choose a device."
-    );
-  }
+  reportPhraseChecks(routes);
 
   speechEngine.start(routes, threshold, isDevMode);
 }
 
 function stopListening() {
   calibration?.finish("stopped");
+  cancelPendingHandoff();
   clearResumeTimer();
   clearConfirmation();
   stopLockWatcher();
@@ -498,6 +526,38 @@ function buildRoutes(config: vscode.WorkspaceConfiguration): WakePhrase[] {
   return resolveRoutes(userRoutes, DEFAULT_ROUTES);
 }
 
+/** Phrase quality warnings and collisions for these routes, as log lines. */
+function checkPhrases(routes: readonly WakePhrase[]): string[] {
+  return formatPhraseChecks(validatePhraseQuality(routes), detectPhraseCollisions(routes));
+}
+
+/**
+ * Log the phrase checks for these routes and show one notification pointing
+ * at them. Called on every start, but reports only when the phrases differ
+ * from the ones last checked: once per session, and again after the routes
+ * change, not on every resume, restart, or lock takeover.
+ */
+function reportPhraseChecks(routes: readonly WakePhrase[]): void {
+  const key = phraseChecksKey(routes);
+  if (key === lastPhraseChecksKey) {
+    return;
+  }
+  lastPhraseChecksKey = key;
+
+  const lines = checkPhrases(routes);
+  if (lines.length === 0) {
+    return;
+  }
+  for (const line of lines) {
+    log("warn", line);
+  }
+  vscode.window.showWarningMessage(formatPhraseChecksSummary(lines.length), "Show Log").then((choice) => {
+    if (choice === "Show Log") {
+      outputChannel.show();
+    }
+  });
+}
+
 // ── Wake word triggered ─────────────────────────────────────
 
 async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
@@ -544,8 +604,8 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
 
   recordDetection(sessionStats, phrase.label);
 
-  // Only the Windows engine supplies a score; formatConfidence renders
-  // nothing when there is none to show.
+  // The engine supplies no score today; formatConfidence renders nothing
+  // when there is none to show.
   log("info", `Detected: "${phrase.label}"${formatConfidence(confidence)}`);
 
   const showNotification = config.get<boolean>(
@@ -561,20 +621,36 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     );
   }
 
-  // Pause: release the microphone. The sherpa engine closes it and keeps its
-  // process and models loaded for the resume; the Windows engine ends its
-  // process.
-  speechEngine.pause();
+  // Release the microphone, wait until the engine confirms it is closed,
+  // then fire the target command, so the assistant never asks for the
+  // microphone while this extension still holds it. The engine keeps its
+  // process and models loaded for the resume. If listening is stopped or
+  // started while the release is under way, the handoff is abandoned.
+  const handoff = ++handoffGeneration;
+  const outcome = await releaseThenFire(
+    async () => {
+      await speechEngine.pause();
+      if (isDevMode) {
+        log("info", `Timing: detect-to-release ${Date.now() - now}ms`);
+      }
+    },
+    () => handoff === handoffGeneration,
+    () => vscode.commands.executeCommand(phrase.command)
+  );
 
-  // Fire the target command
-  try {
-    await vscode.commands.executeCommand(phrase.command);
-  } catch (err: unknown) {
+  if (outcome.kind === "superseded") {
+    log(
+      "info",
+      `Handoff abandoned: listening changed while the microphone was being released, so "${phrase.command}" was not run`
+    );
+    return;
+  }
+  if (outcome.kind === "failed") {
     console.error(
       `[Wake Word] Failed to execute command "${phrase.command}":`,
-      err
+      outcome.error
     );
-    const message = err instanceof Error ? err.message : String(err);
+    const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
     vscode.window.showErrorMessage(
       `Wake Word: Could not execute "${phrase.command}" -- ${message}`
     );
@@ -592,6 +668,15 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
   } else {
     scheduleResume(cooldownSeconds);
   }
+}
+
+/**
+ * Abandon a handoff still waiting for the microphone release, so it fires
+ * nothing when the release settles. Called wherever listening is stopped,
+ * started, or resumed, and by Calibrate.
+ */
+function cancelPendingHandoff(): void {
+  handoffGeneration++;
 }
 
 // ── Phrase confirmation ─────────────────────────────────────
@@ -695,6 +780,7 @@ function resumeFromManualHandoff(): void {
 }
 
 function resumeListening() {
+  cancelPendingHandoff();
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
@@ -756,7 +842,7 @@ function capturePriorState(): PriorState {
  * Confirmation mode is not applied: the point is to see every hearing.
  *
  * A run ends on its timer, on the notification's Cancel, on a status bar
- * click, when listening is disabled or the engine is switched (nothing is
+ * click, when listening is disabled or the engine is rebuilt (nothing is
  * restored then: those have settled the state themselves), or when the
  * engine reports an error.
  */
@@ -792,6 +878,9 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
   const seconds = CALIBRATION_DURATION_MS / 1000;
 
   const prior = capturePriorState();
+  // A handoff still releasing the microphone would fire its command and
+  // start a cooldown in the middle of the run.
+  cancelPendingHandoff();
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
@@ -942,16 +1031,109 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
   }
 }
 
+// ── Diagnostics ─────────────────────────────────────────────
+
+/** What the extension is doing, in words, for Show Diagnostics. */
+function describeState(): string {
+  if (calibration) {
+    return "calibrating";
+  }
+  if (lockWatchTimer !== null) {
+    return "standing by: another window is listening";
+  }
+  if (statusBarState === "error") {
+    return "error (see the error lines earlier in this channel)";
+  }
+  if (speechEngine.isListening) {
+    return pendingConfirmation
+      ? `listening, waiting to confirm "${pendingConfirmation.phrase}"`
+      : "listening";
+  }
+  if (countdownTimer !== null) {
+    return `handed off, resuming in ${countdownRemaining}s`;
+  }
+  if (isManuallyPaused) {
+    return "handed off, waiting for you to resume";
+  }
+  if (isPausedByFocus) {
+    return "paused while the window is unfocused";
+  }
+  if (speechEngine.isPaused) {
+    return "paused";
+  }
+  return "not listening";
+}
+
+/**
+ * Write a diagnostics report to the output channel and offer to show it or
+ * copy it for an issue. Local only: it reads settings, state, and files the
+ * extension owns, and runs `node --version`. No audio, no network, and the
+ * home directory is redacted from every line.
+ */
+async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
+  const config = vscode.workspace.getConfiguration("wakeWord");
+  const nodePath = findSystemNode(config.get<string>("nodePath", ""));
+  const engineNodeVersion = await probeNodeVersion(nodePath);
+  const routes = buildRoutes(config);
+  const model = modelStatus(context.globalStorageUri.fsPath);
+
+  const lines = formatDiagnostics({
+    extensionVersion: String(context.extension.packageJSON.version),
+    platform: os.platform(),
+    arch: os.arch(),
+    osRelease: os.release(),
+    editorName: vscode.env.appName,
+    vscodeVersion: vscode.version,
+    hostNodeVersion: process.version,
+    engineNodePath: nodePath,
+    engineNodeVersion,
+    state: describeState(),
+    isListening: speechEngine.isListening,
+    isPaused: speechEngine.isPaused,
+    modelName: MODEL_NAME,
+    modelDir: model.dir,
+    modelPresent: model.present,
+    modelSha256: MODEL_SHA256,
+    audioDevice: readAudioDevice(config),
+    threshold: clampThreshold(config.get<number>("confidenceThreshold", 0.3)),
+    cooldownSeconds: config.get<number>("cooldownSeconds", 30),
+    confirmationMode: config.get<boolean>("confirmationMode", false),
+    pauseOnFocusLoss: config.get<boolean>("pauseOnFocusLoss", false),
+    enableOnStartup: config.get<boolean>("enableOnStartup", true),
+    routes,
+    usingDefaultRoutes: filterValidRoutes(config.get<WakePhrase[]>("routes", [])).length === 0,
+    phraseChecks: checkPhrases(routes),
+    lock: describeLock(readLock(lockPath)),
+    sessionStats,
+    now: Date.now(),
+    homeDir: os.homedir(),
+  });
+
+  for (const line of lines) {
+    log("info", line);
+  }
+
+  const choice = await vscode.window.showInformationMessage(
+    "Wake Word diagnostics written to the output channel.",
+    "Show Log",
+    "Copy to Clipboard"
+  );
+  if (choice === "Show Log") {
+    outputChannel.show();
+  } else if (choice === "Copy to Clipboard") {
+    await vscode.env.clipboard.writeText(lines.join("\n"));
+    vscode.window.showInformationMessage("Wake Word: Diagnostics copied to the clipboard.");
+  }
+}
+
 // ── Status bar ──────────────────────────────────────────────
 
 function updateEngineIndicator(visible: boolean): void {
-  if (!visible) {
+  if (visible) {
+    engineBarItem.show();
+  } else {
     engineBarItem.hide();
-    return;
   }
-  const label = speechEngine instanceof SherpaEngine ? "Sherpa" : "Windows";
-  engineBarItem.text = `$(gear) ${label}`;
-  engineBarItem.show();
 }
 
 /**
@@ -979,6 +1161,7 @@ type StatusBarState =
   | "other-window";
 
 function setStatusBar(state: StatusBarState) {
+  statusBarState = state;
   switch (state) {
     case "off":
       statusBarItem.text = "$(mic-off) Wake: Off";

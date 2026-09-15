@@ -8,6 +8,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.0] - 2026-09-15
+
+### Added
+
+- **Wake Word: Show Diagnostics** command. Writes the extension and
+  editor versions, the platform, the Node.js versions of the extension
+  host and of the engine process, the engine state, the model and whether
+  it is downloaded, the audio device, settings, routes, phrase warnings,
+  the listener lock holder, and session statistics to the output channel,
+  then offers to show the log or copy the report to the clipboard. The
+  home directory is replaced with `~` in every line. The report holds no
+  audio and makes no network request. Clicking the engine indicator in
+  the status bar runs it too.
+- Phrase quality warnings when listening starts: a single-word phrase, a
+  phrase under four characters, and a common word such as "stop" or
+  "okay" on its own. Warnings never block a phrase.
+- Phrase collision warnings: the same phrase on two routes, where only
+  the first route can fire, and a phrase on one route contained in a
+  phrase on another, where the shorter one may trigger when the longer
+  one is spoken. Aliases on the same route are not compared. Warnings and
+  collisions are logged to the output channel with one notification,
+  once per session and again when the routes' phrases change.
+
+### Changed
+
+- All platforms now use the same speech engine: decibri for microphone
+  capture and sherpa-onnx for keyword spotting. The Windows-only
+  System.Speech engine has been retired. Windows users now need Node.js
+  22 or later, the same as macOS and Linux, and the speech model (~17 MB)
+  is downloaded on first use. Windows gains voice activity detection,
+  audio conditioning, microphone selection with `wakeWord.audioDevice`,
+  and the persistent engine process: resuming after a handoff reopens the
+  microphone instead of starting a new process.
+- The microphone handoff is now awaited. The target command fires only
+  after the engine confirms the microphone is closed, or after the engine
+  process has been stopped because no confirmation arrived within
+  500 ms. This removes the race in which an assistant could ask for the
+  microphone before Wake Word had released it. Disabling or enabling
+  listening while the release is under way abandons the handoff, and the
+  command does not run.
+- When Node.js cannot be found, the error now says that Wake Word
+  requires Node.js 22 or later on all platforms and where to download it.
+- A `wakeWord.engine` setting of `"windows"` left in settings.json is
+  reported in the output channel when the extension starts, with a note
+  that it can be removed. The setting has no effect.
+- The engine indicator in the status bar shows "Sherpa" on every platform
+  and opens the diagnostics report when clicked. It will be removed in
+  0.14.0.
+- On Windows the model tarball is extracted with the `tar.exe` in
+  System32, named by its full path, so a GNU tar earlier on PATH cannot
+  take its place: GNU tar needs a separate `bzip2` program to read the
+  archive and fails without one. The engine process, the Node.js lookup,
+  and the extraction are started with their console windows hidden.
+
+### Fixed
+
+- Running **Wake Word: Enable Listening** during a cooldown reopened the
+  microphone but left the countdown running. The status bar kept counting
+  down while the extension was listening, and when the countdown ended it
+  stayed on the last second. Enable now resumes listening early and ends
+  the countdown, as it already did for a manual handoff.
+
+### Removed
+
+- The `wakeWord.engine` setting. There is only one engine.
+- The Windows System.Speech engine (`WindowsSpeechEngine`) and its
+  PowerShell child process.
+
 ## [0.12.0] - 2026-09-15
 
 ### Added

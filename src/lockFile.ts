@@ -190,3 +190,33 @@ export function releaseLock(lockPath: string, ownPid: number = process.pid): voi
     // Nothing to do. See above.
   }
 }
+
+/**
+ * One line saying who holds the lock, for Show Diagnostics.
+ *
+ * A lock naming a PID that is no longer running, and one that cannot be
+ * read, both say so: either is taken over by the next window that starts.
+ */
+export function describeLock(
+  state: LockState,
+  ownPid: number = process.pid,
+  isAlive: (pid: number) => boolean = isProcessAlive
+): string {
+  switch (state.kind) {
+    case "absent":
+      return "free (no window is listening)";
+    case "corrupt":
+      return "unreadable (the next window to start listening takes it over)";
+    case "held": {
+      const { pid, startedAt } = state.lock;
+      const since = startedAt ? `, since ${startedAt}` : "";
+      if (pid === ownPid) {
+        return `held by this window (pid ${pid}${since})`;
+      }
+      if (isAlive(pid)) {
+        return `held by another window (pid ${pid}${since})`;
+      }
+      return `stale (pid ${pid} is not running; the next window to start listening takes it over)`;
+    }
+  }
+}

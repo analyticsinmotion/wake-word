@@ -2,12 +2,10 @@ import { StringDecoder } from "string_decoder";
 import { WakePhrase } from "./speechEngineInterface";
 
 /**
- * Pure logic shared by the extension host and both speech engines.
+ * Pure logic shared by the extension host and the speech engine.
  *
  * Nothing in this module touches the VS Code API, the filesystem, child
- * processes, or the microphone, so all of it is unit testable. Both engines
- * speak the same stdout protocol and normalise phrases the same way; keeping
- * one implementation here means a fix lands in both.
+ * processes, or the microphone, so all of it is unit testable.
  */
 
 /** Minimum gap between two accepted detections of any phrase. */
@@ -120,24 +118,26 @@ export function shouldDebounce(
   return now - lastDetectionTime < windowMs;
 }
 
-// -- Engine selection ---------------------------------------------------
-
-export type EngineKind = "windows" | "sherpa";
+// -- Retired settings ---------------------------------------------------
 
 /**
- * Map the `wakeWord.engine` setting plus the host platform to an engine.
+ * Logged when settings.json still carries `wakeWord.engine: "windows"`.
  *
- * `auto` picks the built-in Windows engine on Windows and sherpa-onnx
- * everywhere else. An explicit choice is honoured as given.
+ * 0.13.0 removed the setting along with the engine it selected. VS Code
+ * ignores a setting nothing contributes, so the stale value does no harm,
+ * but a user who chose that engine deliberately should be told where it went.
  */
-export function selectEngineKind(override: string, platform: string): EngineKind {
-  if (override === "sherpa") {
-    return "sherpa";
-  }
-  if (override === "windows") {
-    return "windows";
-  }
-  return platform === "win32" ? "windows" : "sherpa";
+export const RETIRED_ENGINE_NOTICE =
+  "The 'windows' engine has been retired. Wake Word now uses the sherpa-onnx " +
+  "engine on all platforms. You can remove wakeWord.engine from your settings.";
+
+/**
+ * The notice for a leftover `wakeWord.engine` value, or null when there is
+ * nothing to say. Only `windows` gets one: `auto` and `sherpa` already
+ * describe what runs now.
+ */
+export function retiredEngineNotice(value: unknown): string | null {
+  return value === "windows" ? RETIRED_ENGINE_NOTICE : null;
 }
 
 // -- stdout protocol ----------------------------------------------------
@@ -151,9 +151,9 @@ export type EngineEvent =
   | { type: "debug"; message: string };
 
 /**
- * Parse one line of an engine's stdout.
+ * Parse one line of the engine's stdout.
  *
- * Both engines emit the same protocol:
+ * The protocol:
  *   READY
  *   DETECTED:<phrase>|<confidence>   (the suffix is optional)
  *   PAUSED
@@ -161,20 +161,17 @@ export type EngineEvent =
  *   ERROR:<message>
  *   DEBUG:<message>
  *
- * PAUSED and RELEASED are sent by the sherpa engine's child: PAUSED once a
- * `pause` command has closed the microphone and the process is waiting,
- * models loaded, for `resume`; RELEASED once `stop` has closed it for good.
- * The Windows engine has neither: System.Speech holds the device for the
- * lifetime of the PowerShell process, so process exit is the release
- * confirmation there.
+ * PAUSED is sent once a `pause` command has closed the microphone and the
+ * process is waiting, models loaded, for `resume`; RELEASED once `stop` has
+ * closed it for good.
  *
  * Anything else (blank lines, stray output from a child's dependencies)
  * returns null and is ignored by the caller.
  *
  * `defaultConfidence` is used when a DETECTED line carries no `|<confidence>`
- * suffix or an unparseable one. The sherpa engine's child sends no suffix at
- * all and its caller discards the value; the Windows engine reports a real
- * score and passes 0 so a malformed line can never clear a threshold.
+ * suffix or an unparseable one. The engine's child sends no suffix at all and
+ * SherpaEngine discards the value; a caller that acts on scores should pass 0
+ * so a malformed line can never clear a threshold.
  */
 export function parseEngineLine(
   line: string,
@@ -217,11 +214,10 @@ export function parseEngineLine(
 /**
  * Render the confidence suffix for a detection log line.
  *
- * Only the Windows engine produces a real score. sherpa-onnx's keyword
- * spotter applies its own threshold and returns nothing usable, so
- * SherpaEngine reports no confidence rather than a fabricated 1.0 that made
- * the two engines' logs look comparable when they are not. An absent or
- * non-finite value renders as nothing at all.
+ * sherpa-onnx's keyword spotter applies its own threshold and returns
+ * nothing usable, so SherpaEngine reports no confidence rather than a
+ * fabricated 1.0 that read like a real score. An absent or non-finite value
+ * renders as nothing at all.
  */
 export function formatConfidence(confidence: number | undefined): string {
   if (typeof confidence !== "number" || !isFinite(confidence)) {
@@ -263,20 +259,6 @@ export function createLineReader(
       onLine(line);
     }
   };
-}
-
-// -- PowerShell stderr --------------------------------------------------
-
-/**
- * Extract readable error text from PowerShell's CLIXML stderr wrapper.
- * Falls back to the raw text with the CLIXML header stripped.
- */
-export function parsePowerShellError(raw: string): string {
-  const match = raw.match(/<S S="Error">(.+?)<\/S>/s);
-  if (match) {
-    return match[1].replace(/_x000D_/g, "").replace(/&#xA;/g, " ").trim();
-  }
-  return raw.replace(/#< CLIXML\s*/g, "").trim();
 }
 
 // -- Session statistics -------------------------------------------------
@@ -517,4 +499,339 @@ export function formatCalibrationReport(
       `Wake Word: ${plural(detections.length, "detection")} in ${window}. ` +
       "Check the Wake Word output channel for details.",
   };
+}
+
+// -- Handoff ordering ---------------------------------------------------
+
+/** What became of a detection's handoff. See releaseThenFire(). */
+export type HandoffOutcome =
+  | { kind: "fired" }
+  | { kind: "superseded" }
+  | { kind: "failed"; error: unknown };
+
+/**
+ * Hand the microphone over: release it, then fire the route's command.
+ *
+ * `release` settles once the engine has confirmed the microphone is closed,
+ * or has forced it closed, and never rejects. The command fires only after
+ * that, so an assistant that opens the microphone the moment it is focused
+ * never finds it still held.
+ *
+ * `isCurrent` is asked once the release has settled. Waiting opens a window,
+ * up to the engine's pause timeout, in which the user can disable listening
+ * or start it again, and either of those settles the release early. A
+ * handoff overtaken like that fires nothing: otherwise a Disable in that
+ * window would be followed by the command and then by a cooldown that turns
+ * listening back on.
+ *
+ * A command that throws or rejects is reported as `failed` rather than
+ * thrown, so the caller has one place to resume listening.
+ */
+export async function releaseThenFire(
+  release: () => Promise<void>,
+  isCurrent: () => boolean,
+  fire: () => PromiseLike<unknown>
+): Promise<HandoffOutcome> {
+  await release();
+  if (!isCurrent()) {
+    return { kind: "superseded" };
+  }
+  try {
+    await fire();
+    return { kind: "fired" };
+  } catch (error) {
+    return { kind: "failed", error };
+  }
+}
+
+// -- Phrase checks ------------------------------------------------------
+
+/** Phrases shorter than this many characters draw a warning. */
+export const SHORT_PHRASE_LENGTH = 4;
+
+/**
+ * Words that make poor wake phrases on their own: they turn up constantly in
+ * ordinary speech, so a route listening for one fires by accident.
+ */
+export const COMMON_WORDS: ReadonlySet<string> = new Set([
+  "yes", "no", "ok", "okay", "hello", "hi", "hey",
+  "stop", "start", "go", "run", "open", "close",
+  "the", "a", "an", "is", "it", "on", "off",
+]);
+
+/** A phrase that will work, but badly. */
+export interface PhraseWarning {
+  /** Label of the route the phrase belongs to. */
+  label: string;
+  /** The phrase, normalised as the engine hears it. */
+  phrase: string;
+  warning: string;
+}
+
+/**
+ * Warn about phrases that are likely to detect poorly: single words, very
+ * short phrases, and common words on their own.
+ *
+ * These are warnings, not errors. A user may have a good reason for a short
+ * phrase in a quiet room, so nothing is rejected. One phrase can draw more
+ * than one warning ("hi" is a single word, short, and common), and every
+ * alias of a route is checked on its own. Phrases are normalised first, so
+ * a blank alias or a non-string is skipped exactly as the engine skips it.
+ */
+export function validatePhraseQuality(routes: readonly WakePhrase[]): PhraseWarning[] {
+  const warnings: PhraseWarning[] = [];
+
+  for (const route of routes) {
+    for (const phrase of normalizePhrases(route.phrase)) {
+      const words = phrase.split(/\s+/);
+      const warn = (warning: string): void => {
+        warnings.push({ label: route.label, phrase, warning });
+      };
+
+      if (words.length === 1) {
+        const example = phrase === "hey" ? "hey computer" : `hey ${phrase}`;
+        warn(
+          `"${phrase}" is a single word. Single words cause more false positives. ` +
+            `Consider a two-word phrase like "${example}".`
+        );
+      }
+      if (phrase.length < SHORT_PHRASE_LENGTH) {
+        warn(
+          `"${phrase}" is very short (${plural(phrase.length, "character")}). ` +
+            "Short phrases are harder to detect reliably."
+        );
+      }
+      if (words.length === 1 && COMMON_WORDS.has(phrase)) {
+        warn(`"${phrase}" is a very common word and will likely trigger frequently by accident.`);
+      }
+    }
+  }
+
+  return warnings;
+}
+
+/** Two routes whose phrases the engine may confuse. */
+export interface PhraseCollision {
+  routeA: string;
+  phraseA: string;
+  routeB: string;
+  phraseB: string;
+  reason: string;
+}
+
+/**
+ * Find phrases on different routes that clash: the same phrase twice, or one
+ * phrase contained in another.
+ *
+ * An exact duplicate means the later route can never fire, because a
+ * detection goes to the first route whose phrases match. A contained phrase
+ * ("claude" inside "hey claude") means the shorter one can be heard when the
+ * longer one is said. Aliases on the same route are not compared: whichever
+ * is heard, the same command runs. Comparison is on normalised phrases, so
+ * it ignores case and surrounding whitespace.
+ */
+export function detectPhraseCollisions(routes: readonly WakePhrase[]): PhraseCollision[] {
+  const entries: Array<{ route: number; label: string; phrase: string }> = [];
+  routes.forEach((route, index) => {
+    for (const phrase of new Set(normalizePhrases(route.phrase))) {
+      entries.push({ route: index, label: route.label, phrase });
+    }
+  });
+
+  const contained = (short: { label: string; phrase: string }, long: { label: string; phrase: string }): string =>
+    `"${short.phrase}" (${short.label}) is contained within "${long.phrase}" (${long.label}). ` +
+    "The shorter phrase may trigger when the longer one is spoken.";
+
+  const collisions: PhraseCollision[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      const a = entries[i];
+      const b = entries[j];
+      if (a.route === b.route) {
+        continue;
+      }
+
+      let reason: string | null = null;
+      if (a.phrase === b.phrase) {
+        reason =
+          `"${a.label}" and "${b.label}" both use "${a.phrase}". ` +
+          `Only "${a.label}" can fire: a detection goes to the first matching route.`;
+      } else if (a.phrase.includes(b.phrase)) {
+        reason = contained(b, a);
+      } else if (b.phrase.includes(a.phrase)) {
+        reason = contained(a, b);
+      }
+
+      if (reason) {
+        collisions.push({
+          routeA: a.label,
+          phraseA: a.phrase,
+          routeB: b.label,
+          phraseB: b.phrase,
+          reason,
+        });
+      }
+    }
+  }
+
+  return collisions;
+}
+
+/**
+ * What the phrase checks depend on, as one comparable string: each route's
+ * label and normalised phrases. The extension reports the checks again only
+ * when this changes, so a resume, a restart, or a window taking over the
+ * lock does not repeat a warning, and neither does editing a route's command
+ * or cooldown.
+ */
+export function phraseChecksKey(routes: readonly WakePhrase[]): string {
+  return JSON.stringify(routes.map((r) => [r.label, normalizePhrases(r.phrase)]));
+}
+
+/** One output channel line per warning and per collision, warnings first. */
+export function formatPhraseChecks(
+  warnings: readonly PhraseWarning[],
+  collisions: readonly PhraseCollision[]
+): string[] {
+  return [
+    ...warnings.map((w) => `Phrase warning (${w.label}): ${w.warning}`),
+    ...collisions.map((c) => `Phrase collision: ${c.reason}`),
+  ];
+}
+
+/** The notification shown when the checks found anything. */
+export function formatPhraseChecksSummary(count: number): string {
+  return `Wake Word: ${plural(count, "phrase warning")} found. Check the output channel for details.`;
+}
+
+// -- Diagnostics --------------------------------------------------------
+
+/** The oldest Node.js major version the engine process is supported on. */
+export const MIN_ENGINE_NODE_MAJOR = 22;
+
+/**
+ * A note for a `node --version` string older than MIN_ENGINE_NODE_MAJOR, or
+ * nothing. Anything that does not parse as a version, such as the reason the
+ * probe could not run, gets no note.
+ */
+export function nodeVersionNote(version: string): string {
+  const match = /^v?(\d+)\./.exec(version.trim());
+  if (!match || Number(match[1]) >= MIN_ENGINE_NODE_MAJOR) {
+    return "";
+  }
+  return ` (Wake Word requires ${MIN_ENGINE_NODE_MAJOR} or later)`;
+}
+
+/**
+ * Replace the user's home directory with `~` wherever it appears in `text`.
+ *
+ * Diagnostics are meant to be pasted into an issue, and paths under the home
+ * directory (the model's global storage, a Node.js installed per user) carry
+ * the account name. Only whole path segments match, so `/home/ann` does not
+ * eat the start of `/home/anna`. A root or drive-only home would match every
+ * path and is left alone.
+ */
+export function redactHome(text: string, homeDir: string, caseInsensitive: boolean): string {
+  const home = homeDir.replace(/[\\/]+$/, "");
+  if (home.length < 3) {
+    return text;
+  }
+  const escaped = home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return text.replace(new RegExp(escaped + "(?=[\\\\/]|$)", caseInsensitive ? "gi" : "g"), "~");
+}
+
+/** Everything Show Diagnostics reports, gathered by the extension host. */
+export interface DiagnosticsInput {
+  extensionVersion: string;
+  platform: string;
+  arch: string;
+  osRelease: string;
+  /** `vscode.env.appName`: the editor product the extension is running in. */
+  editorName: string;
+  vscodeVersion: string;
+  hostNodeVersion: string;
+  engineNodePath: string;
+  /** `node --version` from the engine's executable, or why it could not run. */
+  engineNodeVersion: string;
+  /** What the extension is doing, in words. */
+  state: string;
+  isListening: boolean;
+  isPaused: boolean;
+  modelName: string;
+  modelDir: string;
+  modelPresent: boolean;
+  modelSha256: string;
+  audioDevice: string;
+  threshold: number;
+  cooldownSeconds: number;
+  confirmationMode: boolean;
+  pauseOnFocusLoss: boolean;
+  enableOnStartup: boolean;
+  routes: readonly WakePhrase[];
+  usingDefaultRoutes: boolean;
+  /** Lines from formatPhraseChecks(). */
+  phraseChecks: readonly string[];
+  /** Line from describeLock(). */
+  lock: string;
+  sessionStats: SessionStats;
+  now: number;
+  /** Replaced by `~` in every line. See redactHome(). */
+  homeDir: string;
+}
+
+/**
+ * Render the Show Diagnostics report, one line per fact.
+ *
+ * The report holds versions, settings, routes, and state: no audio, and no
+ * account name, because the home directory is redacted from every line.
+ */
+export function formatDiagnostics(input: DiagnosticsInput): string[] {
+  const onOff = (value: boolean): string => (value ? "on" : "off");
+
+  const lines = [
+    "=== Wake Word Diagnostics ===",
+    `Version: ${input.extensionVersion}`,
+    `Platform: ${input.platform} ${input.arch} (${input.osRelease})`,
+    `VS Code: ${input.vscodeVersion} (${input.editorName})`,
+    `Node.js (extension host): ${input.hostNodeVersion}`,
+    `Node.js (engine): ${input.engineNodePath} (${input.engineNodeVersion})${nodeVersionNote(input.engineNodeVersion)}`,
+    "Engine: sherpa-onnx",
+    `State: ${input.state}`,
+    `Listening: ${input.isListening}`,
+    `Paused: ${input.isPaused}`,
+    `Model: ${input.modelName} (${input.modelPresent ? "downloaded" : "not downloaded"})`,
+    `Model dir: ${input.modelDir}`,
+    `Model SHA-256: ${input.modelSha256.substring(0, 16)}...`,
+    `Audio device: ${input.audioDevice || "(system default)"}`,
+    `Threshold: ${input.threshold}`,
+    `Cooldown: ${input.cooldownSeconds}s`,
+    `Confirmation mode: ${onOff(input.confirmationMode)}`,
+    `Pause on focus loss: ${onOff(input.pauseOnFocusLoss)}`,
+    `Enable on startup: ${onOff(input.enableOnStartup)}`,
+    `Routes: ${input.routes.length}${input.usingDefaultRoutes ? " (defaults)" : ""}`,
+  ];
+
+  for (const route of input.routes) {
+    const handoff = resolveHandoff(route.handoff);
+    const cooldown =
+      handoff === "timer" && typeof route.cooldownSeconds === "number" ? `, ${route.cooldownSeconds}s` : "";
+    lines.push(
+      `  "${route.label}" [${normalizePhrases(route.phrase).join(", ")}] -> ${route.command} (${handoff}${cooldown})`
+    );
+  }
+
+  if (input.phraseChecks.length === 0) {
+    lines.push("Phrase checks: no warnings");
+  } else {
+    lines.push(`Phrase checks: ${plural(input.phraseChecks.length, "warning")}`);
+    for (const line of input.phraseChecks) {
+      lines.push(`  ${line}`);
+    }
+  }
+
+  lines.push(`Lock: ${input.lock}`);
+  lines.push(formatSessionStats(input.sessionStats, input.now));
+  lines.push("=== End Diagnostics ===");
+
+  return lines.map((line) => redactHome(line, input.homeDir, input.platform === "win32"));
 }

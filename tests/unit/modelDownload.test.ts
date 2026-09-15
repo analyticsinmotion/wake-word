@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as path from "path";
 
 vi.mock("child_process", () => ({ execSync: vi.fn(), spawn: vi.fn() }));
 vi.mock("fs", () => ({
@@ -10,9 +11,14 @@ vi.mock("fs", () => ({
   unlinkSync: vi.fn(),
 }));
 
+import { existsSync, readFileSync } from "fs";
 import {
   MAX_REDIRECTS,
+  MODEL_FILES,
+  MODEL_NAME,
   MODEL_SHA256,
+  modelExtractCommand,
+  modelStatus,
   redirectLimitExceeded,
   shouldFollowRedirect,
   verifyModelHash,
@@ -110,5 +116,100 @@ describe("verifyModelHash", () => {
   it("rejects an empty digest", () => {
     // A failed hash computation must not read as a pass.
     expect(() => verifyModelHash("")).toThrow(/Model integrity check failed/);
+  });
+});
+
+describe("modelExtractCommand", () => {
+  const tarball = "C:\\Users\\Ann\\AppData\\Roaming\\Code\\User\\globalStorage\\x\\sherpa-onnx\\model.tar.bz2";
+  const storage = "C:\\Users\\Ann\\AppData\\Roaming\\Code\\User\\globalStorage\\x\\sherpa-onnx";
+
+  it("uses the tar.exe in System32 on Windows, by full path", () => {
+    // A GNU tar earlier on PATH needs an external bzip2 that may not exist.
+    const exists = vi.fn((p: string) => p === "C:\\WINDOWS\\System32\\tar.exe");
+    expect(modelExtractCommand(tarball, storage, "win32", "C:\\WINDOWS", exists)).toEqual({
+      file: "C:\\WINDOWS\\System32\\tar.exe",
+      args: ["-xjf", tarball, "-C", storage],
+    });
+  });
+
+  it("assumes C:\\Windows when SystemRoot is empty", () => {
+    // Passing undefined would take the parameter's default, process.env.SystemRoot.
+    const exists = vi.fn(() => true);
+    expect(modelExtractCommand(tarball, storage, "win32", "", exists).file).toBe(
+      "C:\\Windows\\System32\\tar.exe"
+    );
+  });
+
+  it("falls back to tar from PATH on a Windows without System32 tar.exe", () => {
+    expect(modelExtractCommand(tarball, storage, "win32", "C:\\WINDOWS", () => false).file).toBe("tar");
+  });
+
+  it("uses tar from PATH on macOS and Linux without probing System32", () => {
+    const exists = vi.fn(() => true);
+    for (const platform of ["darwin", "linux"]) {
+      expect(modelExtractCommand("/s/model.tar.bz2", "/s", platform, undefined, exists)).toEqual({
+        file: "tar",
+        args: ["-xjf", "/s/model.tar.bz2", "-C", "/s"],
+      });
+    }
+    expect(exists).not.toHaveBeenCalled();
+  });
+
+  it("passes paths as separate arguments, unquoted, for execFileSync", () => {
+    const spaced = "/Users/Ann Lee/Library/Application Support/Code/model.tar.bz2";
+    expect(modelExtractCommand(spaced, "/x y", "darwin").args).toEqual(["-xjf", spaced, "-C", "/x y"]);
+  });
+});
+
+describe("modelStatus", () => {
+  const storage = path.join("fake", "storage");
+
+  beforeEach(() => {
+    vi.mocked(existsSync).mockReset();
+    vi.mocked(readFileSync).mockReset();
+  });
+
+  it("points at the model directory and version file in global storage", () => {
+    vi.mocked(existsSync).mockReturnValue(false);
+    const status = modelStatus(storage);
+    expect(status.dir).toBe(path.join(storage, "sherpa-onnx", MODEL_NAME));
+    expect(status.versionFile).toBe(path.join(storage, "sherpa-onnx", "version.txt"));
+    expect(status.present).toBe(false);
+  });
+
+  it("is present when every file exists and the version matches", () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue("1\n");
+    expect(modelStatus(storage).present).toBe(true);
+  });
+
+  it("is not present when one model file is missing", () => {
+    vi.mocked(existsSync).mockImplementation((p) => !String(p).endsWith("tokens.txt"));
+    vi.mocked(readFileSync).mockReturnValue("1");
+    expect(modelStatus(storage).present).toBe(false);
+    expect(readFileSync).not.toHaveBeenCalled();
+  });
+
+  it("is not present when the version is older", () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue("0");
+    expect(modelStatus(storage).present).toBe(false);
+  });
+
+  it("is not present when the version file cannot be read", () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation(() => {
+      throw new Error("EACCES");
+    });
+    expect(modelStatus(storage).present).toBe(false);
+  });
+
+  it("checks every model file", () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue("1");
+    modelStatus(storage);
+    for (const file of MODEL_FILES) {
+      expect(existsSync).toHaveBeenCalledWith(path.join(storage, "sherpa-onnx", MODEL_NAME, file));
+    }
   });
 });

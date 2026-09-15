@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -59,6 +59,10 @@
       {
         "command": "wakeWord.calibrate",
         "title": "Wake Word: Calibrate"
+      },
+      {
+        "command": "wakeWord.diagnostics",
+        "title": "Wake Word: Show Diagnostics"
       }
     ],
     "configuration": {
@@ -151,23 +155,12 @@
         "wakeWord.nodePath": {
           "type": "string",
           "default": "",
-          "description": "Path to the Node.js executable. Leave empty to auto-detect. Set this if Wake Word cannot find Node.js (common with nvm or fnm). macOS and Linux only."
-        },
-        "wakeWord.engine": {
-          "type": "string",
-          "default": "auto",
-          "enum": ["auto", "windows", "sherpa"],
-          "enumDescriptions": [
-            "Use the best engine for your platform (Windows Speech on Windows, sherpa-onnx elsewhere).",
-            "Force Windows built-in System.Speech engine (Windows only).",
-            "Force sherpa-onnx keyword spotting engine (cross-platform, requires model download)."
-          ],
-          "description": "Speech engine to use. Leave on 'auto' unless testing a specific engine."
+          "description": "Path to the Node.js executable (22 or later). Leave empty to auto-detect. Set this if Wake Word cannot find Node.js (common with nvm or fnm)."
         },
         "wakeWord.audioDevice": {
           "type": "string",
           "default": "",
-          "description": "Microphone to listen on. Leave empty for the system default. Use a case-insensitive substring of the device name (e.g. 'USB' or 'Blue Yeti') or the device index number. Applies to the sherpa engine; the Windows engine always uses the system default."
+          "description": "Microphone to listen on. Leave empty for the system default. Use a case-insensitive substring of the device name (e.g. 'USB' or 'Blue Yeti') or the device index number."
         }
       }
     }
