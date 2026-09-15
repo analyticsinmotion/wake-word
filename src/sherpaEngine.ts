@@ -1,5 +1,5 @@
 import { EventEmitter } from "events";
-import { spawn, ChildProcess, execSync } from "child_process";
+import { spawn, ChildProcess, execFile, execFileSync, execSync } from "child_process";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, createWriteStream, writeFileSync, readFileSync, unlinkSync } from "fs";
 import * as path from "path";
@@ -15,7 +15,8 @@ import {
 } from "./wakeWordCore";
 
 /**
- * Cross-platform speech recognition engine using sherpa-onnx keyword spotting.
+ * Speech recognition engine using sherpa-onnx keyword spotting, on every
+ * platform.
  *
  * Spawns audio-engine.js as a child process under system Node.js (not Electron),
  * so that native addons (decibri) load against the correct Node.js ABI.
@@ -64,6 +65,14 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   private childPaused = false;
   /** Force kills a child that has not said PAUSED in time. */
   private pauseTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Settles the promise pause() returned, while PAUSED is awaited. Every way
+   * that wait can end goes through settlePause(), so an awaited pause cannot
+   * hang.
+   */
+  private pauseSettled: (() => void) | null = null;
+  /** The promise pause() returned, while that wait is open. */
+  private pauseAcknowledged: Promise<void> | null = null;
   /** When "pause" was sent, while PAUSED is awaited. Debug timing only. */
   private pauseSentAt = 0;
   /** When "resume" was sent, while READY is awaited; 0 otherwise. */
@@ -82,8 +91,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   /**
    * How long to wait for the child's PAUSED before force killing it. The same
    * device close as RELEASED, capped for the same reason: a wedged child must
-   * not hold the microphone through a handoff. The next resume starts a new
-   * child in its place.
+   * not hold the microphone through a handoff. It is also the longest the
+   * extension waits before firing a route's command. The next resume starts
+   * a new child in place of a killed one.
    */
   private static readonly PAUSE_TIMEOUT_MS = 500;
 
@@ -156,8 +166,11 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     this.emit("debug", `Spawning: ${nodePath} ${engineScript}`);
 
     this.resetChildState();
+    // windowsHide: the child is a console program. Without it Windows can
+    // give it a console window of its own for as long as it runs.
     const proc = spawn(nodePath, [engineScript], {
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     this.process = proc;
 
@@ -206,13 +219,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         // The executable the lookup found is gone (Node.js upgraded or
         // removed), so the next start must look again rather than reuse it.
         clearNodePathCache();
-        this.emit(
-          "error",
-          new Error(
-            "Could not find Node.js. Set `wakeWord.nodePath` in Settings to " +
-              "the full path to your node executable."
-          )
-        );
+        this.emit("error", new Error(NODE_NOT_FOUND_MESSAGE));
       } else {
         this.emit("error", new Error("Failed to start audio engine: " + err.message));
       }
@@ -296,13 +303,13 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         break;
       case "paused":
         // Only a pause this engine is waiting on counts.
-        if (this.pauseTimer) {
-          this.clearPauseTimer();
+        if (this.pauseSettled) {
           this.emit("debug", "Mic release: acknowledged by engine (paused)");
           if (this.currentDebugMode) {
             this.emit("debug", `Timing: pause-to-ack ${Date.now() - this.pauseSentAt}ms`);
           }
           this.pauseSentAt = 0;
+          this.settlePause();
         }
         break;
       case "debug":
@@ -312,7 +319,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         this.emit("error", new Error(event.message));
         break;
       case "detected":
-        // Listening ended when pause() returned. A detection the child made
+        // Listening ended when pause() was called. A detection the child made
         // before the pause command reached it does not count.
         if (this._isListening) {
           const match = matchRoute(phrases, event.phrase);
@@ -368,7 +375,19 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     this.emit("stopped");
   }
 
-  pause(): void {
+  /**
+   * Release the microphone for a handoff.
+   *
+   * Listening ends at once: `paused` is emitted before this returns, and
+   * nothing the child prints from here counts as a detection. The returned
+   * promise settles once the microphone is known to be closed: the child has
+   * said PAUSED, or it did not say so within PAUSE_TIMEOUT_MS and has been
+   * killed, or it has gone some other way (a crash, stop(), dispose(), a
+   * start() that replaces it). It never rejects. The extension awaits it
+   * before firing the route's command, so the command that hands the
+   * microphone to an assistant runs after the release instead of racing it.
+   */
+  pause(): Promise<void> {
     if (!this._isListening) {
       // Not listening, but a crash-backoff retry may still be armed. A pause
       // must stop that retry reopening the microphone, and must leave the
@@ -378,14 +397,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         this._isPaused = true;
         this.emit("paused");
       }
-      return;
+      // A pause already waiting on the child settles when that one does.
+      return this.pauseAcknowledged ?? Promise.resolve();
     }
 
     this._isPaused = true;
     this._isListening = false;
     this.clearRetryTimer();
-    this.pauseChild();
+    const released = this.pauseChild();
     this.emit("paused");
+    return released;
   }
 
   resume(): void {
@@ -447,16 +468,28 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
   }
 
-  private clearPauseTimer(): void {
+  /**
+   * End the wait for PAUSED, however it ended: cancel the timeout and settle
+   * the promise pause() returned. Safe to call when nothing is waiting.
+   */
+  private settlePause(): void {
     if (this.pauseTimer) {
       clearTimeout(this.pauseTimer);
       this.pauseTimer = null;
     }
+    const settle = this.pauseSettled;
+    this.pauseSettled = null;
+    this.pauseAcknowledged = null;
+    settle?.();
   }
 
-  /** Forget everything known about the current child, timers included. */
+  /**
+   * Forget everything known about the current child, timers included. A
+   * pause still waiting on that child settles here: whatever replaced or
+   * removed the child has closed its microphone.
+   */
   private resetChildState(): void {
-    this.clearPauseTimer();
+    this.settlePause();
     this.childReady = false;
     this.childPaused = false;
     this.pauseSentAt = 0;
@@ -465,18 +498,18 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
   /**
    * Ask the child to close the microphone, keep everything else loaded, and
-   * say PAUSED.
+   * say PAUSED. Returns the promise pause() hands back.
    *
-   * The extension fires the target command as soon as pause() returns, and
-   * that command exists to hand the microphone to something else. pause()
-   * stays synchronous, so the close completes underneath the command, and a
-   * child that has not said PAUSED within PAUSE_TIMEOUT_MS is killed so it
-   * cannot hold the device through the handoff.
+   * The extension waits on that promise before it fires the target command,
+   * and that command exists to hand the microphone to something else, so the
+   * wait is capped: a child that has not said PAUSED within PAUSE_TIMEOUT_MS
+   * is killed, which closes the device just as surely, and the promise
+   * settles then.
    */
-  private pauseChild(): void {
+  private pauseChild(): Promise<void> {
     const proc = this.process;
     if (!proc) {
-      return;
+      return Promise.resolve();
     }
 
     this.childPaused = true;
@@ -484,10 +517,14 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     if (!this.writeCommand(proc, "pause")) {
       this.emit("debug", "Mic release: stdin already closed");
       this.forceKill(proc);
-      return;
+      return Promise.resolve();
     }
 
-    this.clearPauseTimer();
+    this.settlePause();
+    const acknowledged = new Promise<void>((resolve) => {
+      this.pauseSettled = resolve;
+    });
+    this.pauseAcknowledged = acknowledged;
     this.pauseSentAt = Date.now();
     this.pauseTimer = setTimeout(() => {
       this.pauseTimer = null;
@@ -497,6 +534,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         `Mic release: no acknowledgement after ${SherpaEngine.PAUSE_TIMEOUT_MS}ms, forcing`
       );
       this.forceKill(proc);
+      // forceKill() settled the wait through resetChildState(), since this
+      // child is the current one. Settle again in case it was not.
+      this.settlePause();
       // A resume sent behind the unanswered pause went to the child just
       // killed. Start a new one so that resume still happens.
       if (resumeRequested && this._isPaused) {
@@ -505,6 +545,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
       }
     }, SherpaEngine.PAUSE_TIMEOUT_MS);
+    return acknowledged;
   }
 
   /**
@@ -628,6 +669,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 // ── Helpers ─────────────────────────────────────────────────
 
 /**
+ * Shown when the Node.js executable cannot be spawned. Before 0.13.0 Windows
+ * needed no Node.js at all, so the message says what changed and where to get
+ * it as well as how to point the extension at an existing install.
+ */
+export const NODE_NOT_FOUND_MESSAGE =
+  "Could not find Node.js. Wake Word now requires Node.js 22 or later on all platforms. " +
+  "Download from https://nodejs.org/. If it is already installed, set `wakeWord.nodePath` " +
+  "in Settings to the full path to your node executable.";
+
+/**
  * The executable the last lookup found. The location of Node.js does not
  * change while the editor runs, and the lookup spawns a shell synchronously
  * on the extension host thread, so it runs once rather than on every start.
@@ -654,7 +705,7 @@ export function findSystemNode(override?: string): string {
 
   try {
     const cmd = process.platform === "win32" ? "where node" : "which node";
-    const result = execSync(cmd, { encoding: "utf8" }).trim().split("\n")[0].trim();
+    const result = execSync(cmd, { encoding: "utf8", windowsHide: true }).trim().split("\n")[0].trim();
     if (result) {
       cachedNodePath = result;
       return result;
@@ -686,6 +737,23 @@ export function findSystemNode(override?: string): string {
  */
 export function clearNodePathCache(): void {
   cachedNodePath = null;
+}
+
+/**
+ * `node --version` from the executable the engine runs under, for Show
+ * Diagnostics. Settles with the reason the probe failed rather than
+ * rejecting, and gives up after `timeoutMs`.
+ */
+export function probeNodeVersion(nodePath: string, timeoutMs = 5000): Promise<string> {
+  return new Promise((resolve) => {
+    execFile(nodePath, ["--version"], { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+      if (err) {
+        resolve(`could not run: ${err.message}`);
+        return;
+      }
+      resolve(String(stdout).trim() || "no version reported");
+    });
+  });
 }
 
 // ── Model management ─────────────────────────────────────────
@@ -772,6 +840,66 @@ export function verifyModelHash(actual: string, expected: string = MODEL_SHA256)
 }
 
 /**
+ * The tar executable and arguments that unpack the model tarball into
+ * `storageDir`.
+ *
+ * On Windows this is the tar.exe in System32 (bsdtar, shipped with Windows
+ * since 10 version 1803), named by full path whenever it exists. A bare
+ * `tar` resolves through PATH, where a GNU tar from Git for Windows or MSYS2
+ * can come first. GNU tar does not read bzip2 itself: it runs an external
+ * `bzip2`, and fails ("bzip2: Cannot exec") when none is on PATH. bsdtar
+ * reads bzip2 in-process, provided its build includes bz2lib. Everywhere
+ * else, and on a Windows without that file, it is `tar` from PATH.
+ *
+ * The arguments go to execFileSync, not a shell, so no path needs quoting.
+ */
+export function modelExtractCommand(
+  tarballPath: string,
+  storageDir: string,
+  platform: string = process.platform,
+  systemRoot: string | undefined = process.env.SystemRoot,
+  exists: (p: string) => boolean = existsSync
+): { file: string; args: string[] } {
+  let file = "tar";
+  if (platform === "win32") {
+    const systemTar = path.win32.join(systemRoot || "C:\\Windows", "System32", "tar.exe");
+    if (exists(systemTar)) {
+      file = systemTar;
+    }
+  }
+  return { file, args: ["-xjf", tarballPath, "-C", storageDir] };
+}
+
+/** Where the model lives in global storage, and whether a usable copy is there. */
+export interface ModelStatus {
+  dir: string;
+  versionFile: string;
+  /** Every model file exists and the version file matches MODEL_VERSION. */
+  present: boolean;
+}
+
+/**
+ * Check for the model without downloading it. ensureModel() uses this before
+ * it decides to download, and Show Diagnostics uses it to report the model.
+ */
+export function modelStatus(storagePath: string): ModelStatus {
+  const dir = path.join(storagePath, "sherpa-onnx", MODEL_NAME);
+  const versionFile = path.join(storagePath, "sherpa-onnx", "version.txt");
+
+  const allFilesPresent = MODEL_FILES.every((f) => existsSync(path.join(dir, f)));
+  let present = false;
+  if (allFilesPresent && existsSync(versionFile)) {
+    try {
+      present = readFileSync(versionFile, "utf8").trim() === MODEL_VERSION;
+    } catch {
+      present = false;
+    }
+  }
+
+  return { dir, versionFile, present };
+}
+
+/**
  * Ensure the KWS model is downloaded to globalStorage.
  * Returns the path to the model directory.
  */
@@ -779,28 +907,15 @@ export async function ensureModel(
   context: vscode.ExtensionContext,
   debugLog?: (msg: string) => void
 ): Promise<string> {
-  const storageUri = context.globalStorageUri;
-  const modelDir = path.join(storageUri.fsPath, "sherpa-onnx", MODEL_NAME);
-  const versionFile = path.join(storageUri.fsPath, "sherpa-onnx", "version.txt");
+  const model = modelStatus(context.globalStorageUri.fsPath);
 
-  // Check if model is already present and version matches
-  const allFilesPresent = MODEL_FILES.every((f) => existsSync(path.join(modelDir, f)));
-  let versionMatch = false;
-  if (allFilesPresent && existsSync(versionFile)) {
-    try {
-      versionMatch = readFileSync(versionFile, "utf8").trim() === MODEL_VERSION;
-    } catch {
-      versionMatch = false;
-    }
-  }
-
-  if (allFilesPresent && versionMatch) {
-    debugLog?.("Model already present at " + modelDir);
-    return modelDir;
+  if (model.present) {
+    debugLog?.("Model already present at " + model.dir);
+    return model.dir;
   }
 
   // Model missing or outdated — download
-  return downloadModel(context, modelDir, versionFile, debugLog);
+  return downloadModel(context, model.dir, model.versionFile, debugLog);
 }
 
 async function downloadModel(
@@ -886,9 +1001,17 @@ async function downloadModel(
       debugLog?.("Extracting " + tarballPath);
 
       // The tarball's entries are all under a single MODEL_NAME directory, so
-      // this lands on modelDir directly.
-      // Use system tar (available on macOS and Linux where SherpaEngine is used)
-      execSync(`tar -xjf "${tarballPath}" -C "${storageDir}"`);
+      // this lands on modelDir directly. The tarball is bzip2-compressed, so
+      // the tar found must be able to read bzip2 itself.
+      const extract = modelExtractCommand(tarballPath, storageDir);
+      try {
+        execFileSync(extract.file, extract.args, { stdio: "pipe", windowsHide: true });
+      } catch (err: unknown) {
+        const stderr = (err as { stderr?: Buffer | string } | null)?.stderr;
+        const detail =
+          (stderr ? stderr.toString().trim() : "") || (err instanceof Error ? err.message : String(err));
+        throw new Error(`Could not extract the speech model with ${extract.file}: ${detail}`, { cause: err });
+      }
 
       // Write version file
       writeFileSync(versionFile, MODEL_VERSION, "utf8");

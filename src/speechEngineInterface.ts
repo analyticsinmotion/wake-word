@@ -14,7 +14,13 @@ export interface WakePhrase {
 export interface ISpeechEngine {
   start(phrases: WakePhrase[], threshold: number, debugMode: boolean): void | Promise<void>;
   stop(): void;
-  pause(): void;
+  /**
+   * Stop listening at once and release the microphone. The promise settles
+   * once the microphone is known to be closed, whether the engine confirmed
+   * it or forced it, and never rejects. The extension awaits it before
+   * firing a route's command.
+   */
+  pause(): Promise<void>;
   resume(): void;
   dispose(): void;
   /**

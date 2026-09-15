@@ -23,8 +23,8 @@
  *   DEBUG:<msg>                  diagnostic info
  *
  * The keyword spotter applies its own threshold and returns no usable score,
- * so DETECTED carries no confidence value. The parser still accepts the
- * `|<conf>` suffix the Windows engine sends.
+ * so DETECTED carries no confidence value. The extension's parser still
+ * accepts an optional `|<conf>` suffix.
  *
  * Config: read from stdin as a single JSON line. stdin then stays open for
  * commands.

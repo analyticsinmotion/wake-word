@@ -46,8 +46,8 @@ function createSpotter({ kws, phraseMap, send, debug = null, sampleRate = 16000 
             if (debug) debug('KWS result: ' + JSON.stringify(result));
             // No confidence suffix: the spotter has already applied the
             // threshold and the score it returns is not a usable confidence.
-            // Reporting a fixed 1.0 made these lines look comparable to the
-            // Windows engine's real scores when they never were.
+            // Reporting a fixed 1.0 made these lines look like real scores
+            // when they never were.
             send('DETECTED:' + phrase);
           } else if (debug) {
             debug('Unmatched KWS result: ' + JSON.stringify(result));

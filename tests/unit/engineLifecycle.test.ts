@@ -41,6 +41,7 @@ vi.mock("fs", () => ({
 
 import { SherpaEngine, clearNodePathCache } from "../../src/sherpaEngine";
 import { WakePhrase } from "../../src/speechEngineInterface";
+import { releaseThenFire } from "../../src/wakeWordCore";
 
 const ROUTES: WakePhrase[] = [
   { label: "Claude", phrase: "hey claude", command: "claude-vscode.focus" },
@@ -175,7 +176,8 @@ describe("start", () => {
     expect(command).toBe(NODE);
     expect(args).toHaveLength(1);
     expect(args[0]).toMatch(/audio-engine\.js$/);
-    expect(options).toEqual({ stdio: ["pipe", "pipe", "pipe"] });
+    // windowsHide: without it Windows can give the console child a window.
+    expect(options).toEqual({ stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     expect(mocks.execSync).not.toHaveBeenCalled();
   });
 
@@ -263,6 +265,9 @@ describe("start", () => {
     latest().simulateError(new Error("spawn /fake/bin/node ENOENT"));
     expect(events.errors).toHaveLength(1);
     expect(events.errors[0].message).toMatch(/wakeWord\.nodePath/);
+    // Windows needed no Node.js before 0.13.0, so the message says what changed.
+    expect(events.errors[0].message).toContain("requires Node.js 22 or later on all platforms");
+    expect(events.errors[0].message).toContain("https://nodejs.org/");
     expect(engine.isListening).toBe(false);
   });
 
@@ -735,6 +740,210 @@ describe("pause", () => {
     proc.simulateExit(0);
     expect(events.stopped).toBe(0);
     expect(engine.isPaused).toBe(true);
+  });
+});
+
+// ── pause: the acknowledgement a handoff awaits ─────────────
+
+describe("pause acknowledgement", () => {
+  /** Whether a promise has settled, read after a flush. */
+  function track(promise: Promise<void>): () => boolean {
+    let settled = false;
+    promise.then(() => {
+      settled = true;
+    });
+    return () => settled;
+  }
+
+  it("settles only once the child says PAUSED", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.pause());
+    await flush();
+    expect(settled()).toBe(false);
+    proc.sendLine("PAUSED");
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(false);
+  });
+
+  it("settles when the pause times out and the child is killed", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.pause());
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS - 1);
+    await flush();
+    expect(settled()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles at once when stdin is already closed", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    proc.stdin.end();
+    const settled = track(engine.pause());
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles at once when nothing is listening", async () => {
+    const { engine } = makeEngine();
+    const settled = track(engine.pause());
+    await flush();
+    expect(settled()).toBe(true);
+  });
+
+  it("settles at once for a pause during crash backoff", async () => {
+    const { engine } = makeEngine();
+    await startAndReady(engine);
+    latest().simulateExit(1);
+    const settled = track(engine.pause());
+    await flush();
+    expect(settled()).toBe(true);
+    expect(engine.isPaused).toBe(true);
+  });
+
+  it("settles when the child exits before saying PAUSED", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.pause());
+    proc.simulateExit(1);
+    await flush();
+    expect(settled()).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("settles when stop() lands during the wait", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.pause());
+    engine.stop();
+    await flush();
+    expect(settled()).toBe(true);
+    expect(commands(proc)).toEqual(["pause", "stop"]);
+  });
+
+  it("settles when dispose() lands during the wait", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.pause());
+    engine.dispose();
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles when a start() replaces the child during the wait", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.pause());
+    await engine.start(ROUTES, 0.3, false);
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives a second pause() during the wait the same acknowledgement", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    const first = track(engine.pause());
+    const second = track(engine.pause());
+    await flush();
+    expect(first()).toBe(false);
+    expect(second()).toBe(false);
+    expect(commands(proc)).toEqual(["pause"]);
+    expect(events.paused).toBe(1);
+    proc.sendLine("PAUSED");
+    await flush();
+    expect(first()).toBe(true);
+    expect(second()).toBe(true);
+  });
+
+  it("fires a route's command only after the child says PAUSED", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const order: string[] = [];
+    engine.on("debug", (info) => {
+      if (info.startsWith("Mic release:")) {
+        order.push(info);
+      }
+    });
+    const executeCommand = vi.fn(async (id: string) => {
+      order.push(`command ${id}`);
+    });
+
+    const handoff = releaseThenFire(
+      () => engine.pause(),
+      () => true,
+      () => executeCommand("claude-vscode.focus")
+    );
+    await flush();
+    expect(executeCommand).not.toHaveBeenCalled();
+
+    proc.sendLine("PAUSED");
+    await expect(handoff).resolves.toEqual({ kind: "fired" });
+    expect(order).toEqual([
+      "Mic release: acknowledged by engine (paused)",
+      "command claude-vscode.focus",
+    ]);
+  });
+
+  it("fires the command after the timeout when the child never says PAUSED", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const order: string[] = [];
+    engine.on("debug", (info) => {
+      if (info.startsWith("Mic release:")) {
+        order.push(info);
+      }
+    });
+    const executeCommand = vi.fn(async (id: string) => {
+      order.push(`command ${id}`);
+    });
+
+    const handoff = releaseThenFire(
+      () => engine.pause(),
+      () => true,
+      () => executeCommand("workbench.action.terminal.focus")
+    );
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS - 1);
+    await flush();
+    expect(executeCommand).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(handoff).resolves.toEqual({ kind: "fired" });
+    expect(proc.killed).toBe(true);
+    expect(order).toEqual([
+      `Mic release: no acknowledgement after ${PAUSE_TIMEOUT_MS}ms, forcing`,
+      "command workbench.action.terminal.focus",
+    ]);
+  });
+
+  it("fires nothing when listening is disabled during the release", async () => {
+    // The extension abandons the handoff, then stops the engine: the stop
+    // settles the release early, and the command must not run after it.
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    let generation = 0;
+    const current = ++generation;
+    const executeCommand = vi.fn(async () => undefined);
+
+    const handoff = releaseThenFire(
+      () => engine.pause(),
+      () => current === generation,
+      () => executeCommand()
+    );
+    generation++;
+    engine.stop();
+
+    await expect(handoff).resolves.toEqual({ kind: "superseded" });
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(commands(proc)).toEqual(["pause", "stop"]);
   });
 });
 

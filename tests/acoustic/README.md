@@ -81,8 +81,8 @@ node tests/acoustic/run-benchmark.js [--model-dir <path>] [--threshold <n>]
 The script needs `engine/node_modules` (`cd engine && npm install`) and
 the keyword spotting model. Without `--model-dir` it looks in each
 editor's global storage for the copy the extension downloads when the
-sherpa engine runs, so the simplest way to get the model is to set
-`wakeWord.engine` to `sherpa` once and let the extension fetch it. To use
+engine first starts, so the simplest way to get the model is to enable
+listening once and let the extension fetch it. To use
 a copy elsewhere, extract the tarball named in `src/sherpaEngine.ts` and
 pass its directory.
 
