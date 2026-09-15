@@ -19,7 +19,7 @@ vi.mock("fs", () => ({
   unlinkSync: vi.fn(),
 }));
 
-import { findSystemNode } from "../../src/sherpaEngine";
+import { clearNodePathCache, findSystemNode } from "../../src/sherpaEngine";
 
 const realPlatform = process.platform;
 
@@ -32,6 +32,8 @@ function setPlatform(platform: string): void {
 
 describe("findSystemNode", () => {
   beforeEach(() => {
+    // The lookup result is cached for the life of the module.
+    clearNodePathCache();
     mocks.execSync.mockReset();
     mocks.existsSync.mockReset();
     mocks.existsSync.mockReturnValue(false);
@@ -152,5 +154,68 @@ describe("findSystemNode", () => {
     findSystemNode();
     const probed = mocks.existsSync.mock.calls.map((c) => c[0]);
     expect(probed).toEqual(["/opt/homebrew/bin/node", "/usr/local/bin/node"]);
+  });
+
+  describe("cache", () => {
+    // The lookup spawns a shell synchronously on the extension host thread.
+    // It used to run on every engine start, which meant every resume.
+
+    it("returns the cached path without running the shell lookup again", () => {
+      setPlatform("linux");
+      mocks.execSync.mockReturnValue("/usr/bin/node\n");
+      expect(findSystemNode()).toBe("/usr/bin/node");
+      expect(findSystemNode()).toBe("/usr/bin/node");
+      expect(findSystemNode("")).toBe("/usr/bin/node");
+      expect(mocks.execSync).toHaveBeenCalledTimes(1);
+    });
+
+    it("caches a well-known path found after the shell lookup failed", () => {
+      setPlatform("darwin");
+      mocks.execSync.mockImplementation(() => {
+        throw new Error("not found");
+      });
+      mocks.existsSync.mockImplementation((p: string) => p === "/usr/local/bin/node");
+      expect(findSystemNode()).toBe("/usr/local/bin/node");
+      expect(findSystemNode()).toBe("/usr/local/bin/node");
+      expect(mocks.execSync).toHaveBeenCalledTimes(1);
+      expect(mocks.existsSync).toHaveBeenCalledTimes(2);
+    });
+
+    it("lets an override bypass the cache without replacing it", () => {
+      setPlatform("linux");
+      mocks.execSync.mockReturnValue("/usr/bin/node\n");
+      findSystemNode();
+      expect(findSystemNode("/opt/node22/bin/node")).toBe("/opt/node22/bin/node");
+      expect(findSystemNode()).toBe("/usr/bin/node");
+      expect(mocks.execSync).toHaveBeenCalledTimes(1);
+    });
+
+    it("never caches an override", () => {
+      setPlatform("linux");
+      mocks.execSync.mockReturnValue("/usr/bin/node\n");
+      findSystemNode("/opt/node22/bin/node");
+      expect(findSystemNode()).toBe("/usr/bin/node");
+      expect(mocks.execSync).toHaveBeenCalledTimes(1);
+    });
+
+    it("probes afresh after clearNodePathCache()", () => {
+      setPlatform("linux");
+      mocks.execSync.mockReturnValue("/usr/bin/node\n");
+      findSystemNode();
+      mocks.execSync.mockReturnValue("/home/me/.local/bin/node\n");
+      clearNodePathCache();
+      expect(findSystemNode()).toBe("/home/me/.local/bin/node");
+      expect(mocks.execSync).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not cache the bare fallback, so a Node.js installed later is found", () => {
+      setPlatform("win32");
+      mocks.execSync.mockImplementation(() => {
+        throw new Error("not found");
+      });
+      expect(findSystemNode()).toBe("node");
+      mocks.existsSync.mockImplementation((p: string) => p === "C:\\Program Files\\nodejs\\node.exe");
+      expect(findSystemNode()).toBe("C:\\Program Files\\nodejs\\node.exe");
+    });
   });
 });

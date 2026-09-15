@@ -1,3 +1,4 @@
+import { StringDecoder } from "string_decoder";
 import { WakePhrase } from "./speechEngineInterface";
 
 /**
@@ -143,6 +144,7 @@ export function selectEngineKind(override: string, platform: string): EngineKind
 
 export type EngineEvent =
   | { type: "ready" }
+  | { type: "paused" }
   | { type: "released" }
   | { type: "detected"; phrase: string; confidence: number }
   | { type: "error"; message: string }
@@ -154,14 +156,17 @@ export type EngineEvent =
  * Both engines emit the same protocol:
  *   READY
  *   DETECTED:<phrase>|<confidence>   (the suffix is optional)
+ *   PAUSED
  *   RELEASED
  *   ERROR:<message>
  *   DEBUG:<message>
  *
- * RELEASED is sent by the sherpa engine's child once the microphone has been
- * closed. The Windows engine has no equivalent: System.Speech holds the
- * device for the lifetime of the PowerShell process, so process exit is the
- * release confirmation there.
+ * PAUSED and RELEASED are sent by the sherpa engine's child: PAUSED once a
+ * `pause` command has closed the microphone and the process is waiting,
+ * models loaded, for `resume`; RELEASED once `stop` has closed it for good.
+ * The Windows engine has neither: System.Speech holds the device for the
+ * lifetime of the PowerShell process, so process exit is the release
+ * confirmation there.
  *
  * Anything else (blank lines, stray output from a child's dependencies)
  * returns null and is ignored by the caller.
@@ -179,6 +184,9 @@ export function parseEngineLine(
 
   if (trimmed === "READY") {
     return { type: "ready" };
+  }
+  if (trimmed === "PAUSED") {
+    return { type: "paused" };
   }
   if (trimmed === "RELEASED") {
     return { type: "released" };
@@ -230,6 +238,31 @@ export function splitLines(buffer: string): { lines: string[]; rest: string } {
   const parts = buffer.split("\n");
   const rest = parts.pop() || "";
   return { lines: parts, rest };
+}
+
+/**
+ * Build a stdout 'data' handler that hands `onLine` every complete line, in
+ * order, however the output was chunked.
+ *
+ * A pipe delivers chunks, not lines: one chunk can hold several lines and one
+ * line can arrive in pieces. Looking for a verb in each chunk on its own
+ * misses one split across two chunks, which left a RELEASED unseen and the
+ * release to run out its timeout. The decoder keeps a multi-byte character
+ * that straddles two chunks intact, which per-chunk toString() does not.
+ */
+export function createLineReader(
+  onLine: (line: string) => void
+): (chunk: Buffer | string) => void {
+  const decoder = new StringDecoder("utf8");
+  let buffer = "";
+  return (chunk) => {
+    buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
+    const split = splitLines(buffer);
+    buffer = split.rest;
+    for (const line of split.lines) {
+      onLine(line);
+    }
+  };
 }
 
 // -- PowerShell stderr --------------------------------------------------

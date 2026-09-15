@@ -230,7 +230,9 @@ The status bar shows **Wake: Paused** while a manual route waits. The default Cl
 When a wake phrase is detected:
 
 1. The extension asks the speech engine to close the microphone and waits for it to
-   confirm, then kills the process (forcing it after 500 ms if no confirmation arrives)
+   confirm. The sherpa engine keeps its process running with the speech model loaded,
+   so listening comes back without reloading it, and a process that has not confirmed
+   within 500 ms is stopped. The Windows engine ends its process
 2. The target VS Code command fires (opening the assistant)
 3. The assistant's voice mode takes over the microphone with no contention
 4. After `wakeWord.cooldownSeconds` (default: 30), wake word listening resumes. A route with `handoff: "manual"` waits for you instead
@@ -301,7 +303,7 @@ Useful values for the `command` field in your routes. Command IDs listed are for
 
 ## How It Works (Technical)
 
-The extension selects a speech engine based on platform (or the `wakeWord.engine` setting) and spawns it as a background child process. Both engines communicate via stdout using the same protocol: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, `DEBUG:<info>`. The sherpa engine also sends `RELEASED` once it has closed the microphone.
+The extension selects a speech engine based on platform (or the `wakeWord.engine` setting) and spawns it as a background child process. Both engines communicate via stdout using the same protocol: `READY`, `DETECTED:<phrase>|<confidence>`, `ERROR:<message>`, `DEBUG:<info>`. The sherpa engine also takes `pause`, `resume`, and `stop` commands on stdin, and answers `PAUSED` once it has closed the microphone for a handoff, `READY` once it has reopened it, and `RELEASED` once it has closed it for good.
 
 ### Windows engine (default on Windows)
 
@@ -309,7 +311,7 @@ Spawns a PowerShell process using `System.Speech.Recognition.SpeechRecognitionEn
 
 ### Sherpa engine (default on macOS/Linux, optional on Windows)
 
-Spawns `audio-engine.js` under **system Node.js** (not Electron). The child process uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use and cached.
+Spawns `audio-engine.js` under **system Node.js** (not Electron). The child process uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use and cached. The process is started once and kept across handoffs: a handoff closes only the microphone, and the model stays loaded for the resume.
 
 Captured audio passes through voice activity detection (Silero VAD) before it reaches the keyword spotter, so the spotter only runs while someone is speaking and an idle editor does not decode silence. decibri also conditions the signal on the way through: DC offset removal, an 80 Hz high-pass to drop rumble below the voice band, and automatic gain control targeting -18 dBFS so the confidence threshold sees a consistent level.
 
@@ -319,8 +321,8 @@ Captured audio passes through voice activity detection (Silero VAD) before it re
 2. Engine writes `READY` when the mic is open
 3. Each detection above the confidence threshold is written to stdout as `DETECTED:<phrase>|<confidence>`
 4. The extension reads stdout and fires the corresponding command
-5. On handoff, the engine process is killed to release the microphone
-6. After the cooldown countdown, a new engine process starts
+5. On handoff, the microphone is released: the sherpa engine closes it and keeps its process and model loaded, and the Windows engine ends its process
+6. After the cooldown countdown, the sherpa engine reopens the microphone and the Windows engine starts a new process
 
 Zero runtime npm dependencies in the extension host. All native dependencies are isolated in the `engine/` child process.
 

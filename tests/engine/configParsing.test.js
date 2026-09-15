@@ -80,6 +80,29 @@ describe('parseControlLine', () => {
     expect(parseControlLine('  stop\r')).toEqual({ kind: 'stop' });
   });
 
+  it('recognises the pause command', () => {
+    // Close the microphone, keep the spotter and models loaded.
+    expect(parseControlLine('pause')).toEqual({ kind: 'pause' });
+    expect(parseControlLine('pause\r')).toEqual({ kind: 'pause' });
+  });
+
+  it('recognises the resume command', () => {
+    expect(parseControlLine('resume')).toEqual({ kind: 'resume' });
+    expect(parseControlLine(' resume \r')).toEqual({ kind: 'resume' });
+  });
+
+  it('matches commands exactly, not by prefix or case', () => {
+    for (const line of ['PAUSE', 'Resume', 'paused', 'resume now', 'stopped']) {
+      expect(parseControlLine(line).kind).toBe('invalid');
+    }
+  });
+
+  it('separates a pause and a resume that arrived in one chunk', () => {
+    const drained = drainLines('pause\nresume\nsto');
+    expect(drained.lines.map((l) => parseControlLine(l).kind)).toEqual(['pause', 'resume']);
+    expect(drained.rest).toBe('sto');
+  });
+
   it('ignores a blank line', () => {
     expect(parseControlLine('')).toEqual({ kind: 'empty' });
     expect(parseControlLine('   ')).toEqual({ kind: 'empty' });

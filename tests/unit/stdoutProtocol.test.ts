@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { formatConfidence, parseEngineLine, splitLines } from "../../src/wakeWordCore";
+import {
+  createLineReader,
+  formatConfidence,
+  parseEngineLine,
+  splitLines,
+} from "../../src/wakeWordCore";
 
 describe("parseEngineLine", () => {
   it("parses READY", () => {
@@ -73,6 +78,22 @@ describe("parseEngineLine", () => {
     expect(parseEngineLine("DEBUG:RELEASED")).toEqual({
       type: "debug",
       message: "RELEASED",
+    });
+  });
+
+  it("parses PAUSED", () => {
+    // The sherpa child sends this once a pause command has closed the
+    // microphone. The process and its models stay loaded for the resume.
+    expect(parseEngineLine("PAUSED")).toEqual({ type: "paused" });
+    expect(parseEngineLine("  PAUSED\r")).toEqual({ type: "paused" });
+  });
+
+  it("does not mistake other output for PAUSED", () => {
+    expect(parseEngineLine("paused")).toBeNull();
+    expect(parseEngineLine("PAUSED:now")).toBeNull();
+    expect(parseEngineLine("DEBUG:PAUSED")).toEqual({
+      type: "debug",
+      message: "PAUSED",
     });
   });
 
@@ -162,6 +183,56 @@ describe("splitLines", () => {
 
   it("handles an empty buffer", () => {
     expect(splitLines("")).toEqual({ lines: [], rest: "" });
+  });
+});
+
+describe("createLineReader", () => {
+  function reader(): { feed: (chunk: Buffer | string) => void; lines: string[] } {
+    const lines: string[] = [];
+    return { feed: createLineReader((line) => lines.push(line)), lines };
+  }
+
+  it("delivers every complete line in one chunk, in order", () => {
+    const r = reader();
+    r.feed(Buffer.from("DEBUG:something\nRELEASED\n"));
+    expect(r.lines).toEqual(["DEBUG:something", "RELEASED"]);
+  });
+
+  it("reassembles a verb split across two chunks", () => {
+    const r = reader();
+    r.feed(Buffer.from("RELEA"));
+    expect(r.lines).toEqual([]);
+    r.feed(Buffer.from("SED\n"));
+    expect(r.lines).toEqual(["RELEASED"]);
+  });
+
+  it("holds a trailing partial line until its newline arrives", () => {
+    const r = reader();
+    r.feed("PAUSED\nREA");
+    expect(r.lines).toEqual(["PAUSED"]);
+    r.feed("DY");
+    r.feed("\n");
+    expect(r.lines).toEqual(["PAUSED", "READY"]);
+  });
+
+  it("keeps a multi-byte character that straddles two chunks", () => {
+    const bytes = Buffer.from("ERROR:No microphone matching \"Réaltek\" was found.\n");
+    const split = bytes.indexOf(0xc3) + 1; // inside the two bytes of "é"
+    const r = reader();
+    r.feed(bytes.subarray(0, split));
+    r.feed(bytes.subarray(split));
+    expect(r.lines).toEqual(['ERROR:No microphone matching "Réaltek" was found.']);
+  });
+
+  it("keeps separate readers independent", () => {
+    const a = reader();
+    const b = reader();
+    a.feed("REL");
+    b.feed("PAU");
+    a.feed("EASED\n");
+    b.feed("SED\n");
+    expect(a.lines).toEqual(["RELEASED"]);
+    expect(b.lines).toEqual(["PAUSED"]);
   });
 });
 
