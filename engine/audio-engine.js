@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * audio-engine.js — child process script for cross-platform wake word detection.
+ * audio-engine.js: child process script for cross-platform wake word detection.
  *
  * Runs under system Node.js (not the Electron runtime) so that native addons
  * load against the correct Node.js ABI.
@@ -10,18 +10,24 @@
  * spotter only sees audio while speech is present, so an idle editor does not
  * run the transducer.
  *
+ * The process lives across handoffs. The models load once; a pause closes
+ * the microphone and a resume reopens it, so listening comes back without
+ * reloading anything.
+ *
  * Protocol (stdout):
- *   READY                        — KWS loaded, mic open, listening
- *   DETECTED:<phrase>             — keyword detected (phrase lowercase)
- *   RELEASED                     — microphone closed, safe to take the device
- *   ERROR:<msg>                  — fatal error
- *   DEBUG:<msg>                  — diagnostic info
+ *   READY                        KWS loaded, mic open, listening
+ *   DETECTED:<phrase>            keyword detected (phrase lowercase)
+ *   PAUSED                       microphone closed, models still loaded
+ *   RELEASED                     microphone closed for good, process exiting
+ *   ERROR:<msg>                  fatal error
+ *   DEBUG:<msg>                  diagnostic info
  *
  * The keyword spotter applies its own threshold and returns no usable score,
  * so DETECTED carries no confidence value. The parser still accepts the
  * `|<conf>` suffix the Windows engine sends.
  *
- * Config: read from stdin as a single JSON line then stdin is closed.
+ * Config: read from stdin as a single JSON line. stdin then stays open for
+ * commands.
  *   { phrases: [{phrase: string, label: string}],
  *     threshold: number,
  *     modelDir: string,
@@ -29,7 +35,14 @@
  *     audioDevice: string }     "" for the system default, otherwise a
  *                               device index or a name substring
  *
- * Stop: close stdin or send "stop\n" on stdin.
+ * Commands (stdin, one per line):
+ *   pause    close the microphone, keep the models loaded; answered by PAUSED
+ *   resume   reopen the microphone; answered by READY
+ *   stop     close everything and exit; answered by RELEASED. Closing stdin
+ *            does the same.
+ *
+ * In debug mode each startup phase and each reopen of the microphone is timed
+ * as a `DEBUG:Timing: <phase> <n>ms` line.
  *
  * Self-test: `node audio-engine.js --self-test` loads every dependency and
  * exits without opening the microphone. CI runs it on each platform.
@@ -62,7 +75,6 @@ require.main.paths.unshift(path.join(engineDir, 'node_modules'));
 // Pure logic lives in ./lib so it can be unit tested without a microphone.
 // These are relative requires and so bypass the resolver hook above.
 const { modelPath } = require('./lib/model-path');
-const { VadGate } = require('./lib/vad-gate');
 const { buildKeywordSpec } = require('./lib/keywords');
 const {
   drainLines,
@@ -71,11 +83,21 @@ const {
   withAudioDevice,
 } = require('./lib/control');
 const { micErrorMessage } = require('./lib/mic-errors');
+const { createSpotter } = require('./lib/spotter');
+const { CaptureSession } = require('./lib/capture');
 
-let mic = null;
-let kws = null;
-let kwsStream = null;
+/** The microphone lifecycle, once the models have loaded. See lib/capture.js. */
+let session = null;
+/** The keyword spotter, once loaded. See lib/spotter.js. */
+let spotter = null;
 let stopping = false;
+/**
+ * Whether the microphone should be open. A pause that arrives while the
+ * models are still loading clears it, so the microphone is not opened until a
+ * resume. The extension only pauses an engine that has said READY, so this
+ * is defensive.
+ */
+let captureWanted = true;
 
 function out(msg) {
   process.stdout.write(msg + '\n');
@@ -131,6 +153,9 @@ function runSelfTest() {
     if (typeof Microphone !== 'function') {
       throw new Error('decibri did not export a Microphone constructor');
     }
+    if (typeof Microphone.open !== 'function') {
+      throw new Error('decibri did not export Microphone.open');
+    }
     if (typeof sherpa.createKws !== 'function') {
       throw new Error('sherpa-onnx did not export createKws');
     }
@@ -153,21 +178,34 @@ function runSelfTest() {
 
 async function main(config) {
   const { phrases, threshold, modelDir, debugMode, audioDevice } = config;
+  const timed = (phase, since) => {
+    if (debugMode) debug('Timing: ' + phase + ' ' + (Date.now() - since) + 'ms');
+  };
 
   if (debugMode) debug('audio-engine starting, modelDir=' + modelDir);
 
-  // Load sentencepiece for BPE tokenisation
+  // sherpa-onnx instantiates its WASM module as it loads.
+  let since = Date.now();
   const { SentencePieceProcessor } = require('sentencepiece-js');
   const sherpa = require('sherpa-onnx');
   const { Microphone } = require('decibri');
+  timed('modules-load', since);
 
-  // Tokenise each phrase and build a lookup map: DECODED_UPPER → phrase string
+  // Load sentencepiece for BPE tokenisation
+  since = Date.now();
   const sp = new SentencePieceProcessor();
   await sp.load(modelPath(modelDir, 'bpe.model'));
+  timed('bpe-load', since);
+
+  // A stop during the load has already said RELEASED and the process is on
+  // its way out. Loading the transducer now would only hold that exit up.
+  if (stopping) return;
 
   // Build keyword string (one BPE-tokenised phrase per line) and reverse map
   // ("HEY CLAUDE" -> "hey claude").
+  since = Date.now();
   const spec = buildKeywordSpec(phrases, (text) => sp.encodePieces(text));
+  timed('tokenise', since);
   const phraseMap = spec.phraseMap;
 
   if (debugMode) {
@@ -181,10 +219,10 @@ async function main(config) {
     return;
   }
 
-  const keywords = spec.keywords;
-
   // Create KWS instance
   if (debugMode) debug('loading sherpa-onnx KWS model...');
+  let kws;
+  since = Date.now();
   try {
     kws = sherpa.createKws({
       featConfig: { samplingRate: 16000, featureDim: 80 },
@@ -205,24 +243,29 @@ async function main(config) {
       numTrailingBlanks: 1,
       keywordsScore: 1.0,
       keywordsThreshold: clampKeywordThreshold(threshold),
-      keywords,
+      keywords: spec.keywords,
     });
   } catch (err) {
     fatal('Failed to load KWS model: ' + err.message);
     return;
   }
+  timed('model-load', since);
 
-  kwsStream = kws.createStream();
+  spotter = createSpotter({ kws, phraseMap, send: out, debug: debugMode ? debug : null });
 
-  // Open microphone.
+  // Microphone options.
   //
-  //   vad: 'silero'  — gates the keyword spotter so the ONNX decode loop only
-  //                    runs while someone is speaking. The extension listens
-  //                    all day; without this the transducer decodes silence.
-  //   dcRemoval      — strips a constant offset some capture hardware adds.
-  //   highpass: 80   — removes rumble below the voice band.
-  //   agc: -18       — drives quiet input up toward a consistent level, which
-  //                    is what the KWS threshold is calibrated against.
+  //   vad: 'silero'   gates the keyword spotter so the ONNX decode loop only
+  //                   runs while someone is speaking. The extension listens
+  //                   all day; without this the transducer decodes silence.
+  //   dcRemoval       strips a constant offset some capture hardware adds.
+  //   highpass: 80    removes rumble below the voice band.
+  //   agc: -18        drives quiet input up toward a consistent level, which
+  //                   is what the KWS threshold is calibrated against.
+  //   dtype: float32  delivers the samples the spotter takes, so a chunk is
+  //                   read in place rather than converted from Int16. AGC can
+  //                   overshoot full scale and float32 does not clamp the way
+  //                   int16 did, so lib/samples.js clamps.
   //
   // Conditioning runs dcRemoval -> highpass -> agc on the delivered audio.
   // VAD reads the pre-conditioning signal, so the two are independent.
@@ -230,7 +273,7 @@ async function main(config) {
   // Microphone.open() is decibri's async factory. The constructor loads the
   // Silero model inline and blocks the event loop for the duration; the
   // factory does the same work on the native thread pool and rejects with
-  // the same error classes, so the catch below is unchanged.
+  // the same error classes. It runs again on every resume.
   //
   // `device` is added only when wakeWord.audioDevice names one: a device
   // index or a case-insensitive name substring. Absent, decibri opens the
@@ -239,6 +282,7 @@ async function main(config) {
     {
       sampleRate: 16000,
       channels: 1,
+      dtype: 'float32',
       vad: 'silero',
       dcRemoval: true,
       highpass: 80,
@@ -246,6 +290,21 @@ async function main(config) {
     },
     audioDevice
   );
+
+  session = new CaptureSession({
+    openMicrophone: (options) => Microphone.open(options),
+    micOptions,
+    spotter,
+    send: out,
+    fail: (err, prefix) => fatal(micErrorMessage(err, prefix, audioDevice)),
+    debug: debugMode ? debug : null,
+  });
+
+  if (!captureWanted) {
+    if (debugMode) debug('models loaded; paused before the microphone opened, waiting for resume');
+    return;
+  }
+
   if (debugMode) {
     debug(
       'opening microphone' +
@@ -253,145 +312,50 @@ async function main(config) {
         '...'
     );
   }
-  try {
-    mic = await Microphone.open(micOptions);
-  } catch (err) {
-    fatal(micErrorMessage(err, 'Failed to open microphone', audioDevice));
-    return;
+  await session.start();
+  if (debugMode && session.listening) {
+    debug('mic open, VAD-gated, listening for: ' + Object.values(phraseMap).join(', '));
   }
+}
 
-  // A stop that arrived while the open was in flight found no microphone to
-  // close and has already sent RELEASED. Close this one now rather than hold
-  // the device until the process exits.
-  if (stopping) {
-    try { mic.stop(); } catch { /* ignore */ }
-    mic = null;
-    return;
+/** "pause": close the microphone and keep everything else. */
+function pauseCapture() {
+  if (stopping) return;
+  captureWanted = false;
+  if (session) {
+    session.pause();
+  } else {
+    // Still loading, so nothing is open. main() leaves the microphone closed.
+    out('PAUSED');
   }
+}
 
-  mic.on('error', (err) => {
-    fatal(micErrorMessage(err, 'Microphone error', audioDevice));
-  });
-
-  // VAD gating.
-  //
-  // decibri emits 'data' for a chunk *before* it scores that chunk, so the
-  // chunk that trips the detector reaches this handler while the gate is still
-  // closed. Chunks are therefore held in a short pre-roll ring and flushed
-  // into the spotter when 'speech' fires. Without the pre-roll the onset of
-  // the phrase, the syllable that carries the start of the wake word, never
-  // reaches the spotter and detection collapses. See lib/vad-gate.js.
-  const PREROLL_CHUNKS = 5; // 5 x 100 ms at decibri's default framesPerBuffer
-  const gate = new VadGate(PREROLL_CHUNKS);
-
-  // Push one Float32 chunk into the spotter and drain whatever it enables.
-  function feed(floats) {
-    if (stopping || !kws || !kwsStream) return;
-
-    kwsStream.acceptWaveform(16000, floats);
-
-    while (kws.isReady(kwsStream)) {
-      kws.decode(kwsStream);
-      const result = kws.getResult(kwsStream);
-      if (result.keyword !== '') {
-        const decodedKey = result.keyword.trim();
-        const phrase = phraseMap[decodedKey];
-        if (phrase) {
-          if (debugMode) debug('KWS result: ' + JSON.stringify(result));
-          // No confidence suffix: the spotter has already applied the
-          // threshold and the score it returns is not a usable confidence.
-          // Reporting a fixed 1.0 made these lines look comparable to the
-          // Windows engine's real scores when they never were.
-          out('DETECTED:' + phrase);
-        } else {
-          if (debugMode) debug('Unmatched KWS result: ' + JSON.stringify(result));
-        }
-        kws.reset(kwsStream);
-      }
-    }
+/** "resume": reopen the microphone. */
+function resumeCapture() {
+  if (stopping) return;
+  captureWanted = true;
+  // Still loading: main() opens the microphone once the models are in.
+  if (session) {
+    session.resume().catch((err) => fatal('Resume error: ' + err.message));
   }
-
-  mic.on('speech', () => {
-    if (stopping) return;
-    const held = gate.prerollLength;
-    if (debugMode) debug('VAD: speech (' + held + ' pre-roll chunks)');
-    for (const floats of gate.speechStarted()) {
-      feed(floats);
-    }
-  });
-
-  mic.on('silence', () => {
-    gate.speechEnded();
-    if (debugMode) debug('VAD: silence');
-    // Decode each speech segment independently. Without the reset the spotter
-    // sees the two sides of a gap spliced together and can spot a phrase that
-    // was never said in one breath.
-    if (!stopping && kws && kwsStream) {
-      try { kws.reset(kwsStream); } catch { /* ignore */ }
-    }
-  });
-
-  // Required even while gating: decibri only pumps the capture stream — and
-  // therefore only produces VAD scores — while a 'data' listener drains it.
-  mic.on('data', (chunk) => {
-    if (stopping || !kws || !kwsStream) return;
-
-    // chunk is Int16 little-endian PCM — convert to Float32 in [-1, 1]
-    const samples = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.length / 2);
-    const floats = new Float32Array(samples.length);
-    for (let i = 0; i < samples.length; i++) {
-      floats[i] = samples[i] / 32768.0;
-    }
-
-    // While silent the gate retains the chunk as pre-roll and returns nothing,
-    // so the decode is skipped entirely.
-    for (const ready of gate.push(floats)) {
-      feed(ready);
-    }
-  });
-
-  // Debug only: decibri's overrunCount is the number of capture chunks it has
-  // dropped because the consumer fell behind the stream, so a rising figure
-  // means the decode loop cannot keep up with the microphone. Reported only
-  // when it changes, so a session with no overruns produces no output, and
-  // unref'd so the timer never holds the process open on its own.
-  if (debugMode) {
-    let reported = 0;
-    setInterval(() => {
-      if (stopping || !mic) return;
-      const count = mic.overrunCount;
-      if (count !== reported) {
-        debug('overruns: ' + count);
-        reported = count;
-      }
-    }, 30000).unref();
-  }
-
-  out('READY');
-  if (debugMode) debug('mic open, VAD-gated, listening for: ' + Object.values(phraseMap).join(', '));
 }
 
 function shutdown() {
   if (stopping) return;
   stopping = true;
-  if (mic) {
-    try { mic.stop(); } catch { /* ignore */ }
-    mic = null;
+
+  // Close the capture device and say so before anything else: the extension
+  // waits for RELEASED before it kills this process, rather than killing it
+  // and trusting the OS to have reclaimed the device by then.
+  if (session) {
+    session.stop();
+  } else {
+    out('RELEASED');
   }
 
-  // The capture device is closed. Say so before doing anything else: the
-  // extension waits for RELEASED before firing the command that takes the
-  // microphone over, rather than killing this process and trusting the OS to
-  // have reclaimed the device by then.
-  out('RELEASED');
-
-  if (kwsStream) {
-    try { kwsStream.free(); } catch { /* ignore */ }
-    kwsStream = null;
-  }
-  if (kws) {
-    try { kws.free(); } catch { /* ignore */ }
-    kws = null;
+  if (spotter) {
+    spotter.free();
+    spotter = null;
   }
   exitWhenFlushed(0);
 }
@@ -404,7 +368,7 @@ if (process.argv.includes('--self-test')) {
   return;
 }
 
-// Read config from stdin (single JSON line)
+// Read config, then commands, from stdin
 let stdinBuf = '';
 process.stdin.setEncoding('utf8');
 
@@ -419,23 +383,29 @@ process.stdin.on('data', (chunk) => {
 
   for (const line of drained.lines) {
     const control = parseControlLine(line);
-    if (control.kind === 'stop') {
-      shutdown();
-      return;
+    switch (control.kind) {
+      case 'stop':
+        shutdown();
+        return;
+      case 'pause':
+        pauseCapture();
+        break;
+      case 'resume':
+        resumeCapture();
+        break;
+      case 'empty':
+        break;
+      case 'invalid':
+        fatal(control.message);
+        return;
+      default:
+        main(control.config).catch((err) => fatal('Startup error: ' + err.message));
     }
-    if (control.kind === 'empty') {
-      continue;
-    }
-    if (control.kind === 'invalid') {
-      fatal(control.message);
-      return;
-    }
-    main(control.config).catch((err) => fatal('Startup error: ' + err.message));
   }
 });
 
 process.stdin.on('end', () => {
-  // stdin closed without a stop command — shut down cleanly
+  // stdin closed without a stop command: shut down cleanly
   shutdown();
 });
 

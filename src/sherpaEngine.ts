@@ -9,9 +9,9 @@ import * as vscode from "vscode";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 import {
   clampThreshold,
+  createLineReader,
   matchRoute,
   parseEngineLine,
-  splitLines,
 } from "./wakeWordCore";
 
 /**
@@ -20,6 +20,11 @@ import {
  * Spawns audio-engine.js as a child process under system Node.js (not Electron),
  * so that native addons (decibri) load against the correct Node.js ABI.
  * sherpa-onnx (WASM) and sentencepiece-js (WASM) are also loaded in the child.
+ *
+ * The child lives across handoffs. pause() tells it to close the microphone
+ * and resume() to reopen it, so the models load once per start instead of
+ * once per wake phrase. The process ends on stop(), dispose(), a crash, or a
+ * pause the child does not acknowledge in time.
  *
  * Supports Windows, macOS, and Linux.
  */
@@ -41,6 +46,29 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    * has been overtaken and must not spawn.
    */
   private startGeneration = 0;
+
+  // What is known about the current child. resetChildState() clears all of
+  // it whenever the child changes.
+
+  /**
+   * The child has said READY at least once, so it is past the model load and
+   * reads its commands promptly.
+   */
+  private childReady = false;
+  /**
+   * The child has been told to pause and not yet told to resume: it is alive
+   * with the microphone closed at the engine's request. A crash in this state
+   * is not retried, because a retry would reopen the microphone in the middle
+   * of a handoff.
+   */
+  private childPaused = false;
+  /** Force kills a child that has not said PAUSED in time. */
+  private pauseTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When "pause" was sent, while PAUSED is awaited. Debug timing only. */
+  private pauseSentAt = 0;
+  /** When "resume" was sent, while READY is awaited; 0 otherwise. */
+  private resumeSentAt = 0;
+
   private static readonly MAX_RETRIES = 3;
   private static readonly RETRY_DELAYS = [2000, 5000, 10000];
   /**
@@ -51,6 +79,13 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    * open, not because the acknowledgement is expected to be slow.
    */
   private static readonly RELEASE_TIMEOUT_MS = 500;
+  /**
+   * How long to wait for the child's PAUSED before force killing it. The same
+   * device close as RELEASED, capped for the same reason: a wedged child must
+   * not hold the microphone through a handoff. The next resume starts a new
+   * child in its place.
+   */
+  private static readonly PAUSE_TIMEOUT_MS = 500;
 
   /**
    * `audioDevice` is the `wakeWord.audioDevice` setting: empty for the
@@ -78,11 +113,15 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     if (this._isListening) {
       return;
     }
+    const startedAt = Date.now();
 
     // A start supersedes any retry still scheduled from a crash. Left armed,
     // it would fire into the fresh child below: a no-op if READY has arrived
     // by then, otherwise a needless kill and respawn mid model load.
     this.clearRetryTimer();
+    // A paused child is replaced as well: a start carries the phrases,
+    // threshold, and debug mode to use, and after a settings change those
+    // are not the ones that child was given.
     this.forceKill();
     const generation = ++this.startGeneration;
 
@@ -116,16 +155,18 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     const engineScript = path.join(path.dirname(__dirname), "engine", "audio-engine.js");
     this.emit("debug", `Spawning: ${nodePath} ${engineScript}`);
 
-    this.process = spawn(nodePath, [engineScript], {
+    this.resetChildState();
+    const proc = spawn(nodePath, [engineScript], {
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.process = proc;
 
     // A write to a child that has already exited surfaces EPIPE as an 'error'
     // event on the stream, not as a thrown exception, so the try/catch around
     // each write does not cover it. Without a listener that event takes the
     // extension host down, and the release path deliberately writes to a child
     // that is on its way out.
-    this.process.stdin?.on("error", () => {
+    proc.stdin?.on("error", () => {
       /* child is gone; nothing left to say to it */
     });
 
@@ -140,54 +181,31 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       debugMode,
       audioDevice: this.audioDevice,
     };
-    this.process.stdin?.write(JSON.stringify(config) + "\n");
+    proc.stdin?.write(JSON.stringify(config) + "\n");
 
-    let stdoutBuffer = "";
-
-    this.process.stdout?.on("data", (data: Buffer) => {
-      stdoutBuffer += data.toString();
-      const split = splitLines(stdoutBuffer);
-      stdoutBuffer = split.rest;
-
-      for (const line of split.lines) {
-        const event = parseEngineLine(line);
-        if (!event) {
-          continue;
+    proc.stdout?.on(
+      "data",
+      createLineReader((line) => {
+        if (this.process === proc) {
+          this.handleLine(line, phrases, startedAt);
         }
+      })
+    );
 
-        if (event.type === "ready") {
-          this._isListening = true;
-          this._isPaused = false;
-          this.retryCount = 0;
-          this.emit("started");
-        } else if (event.type === "debug") {
-          this.emit("debug", event.message);
-        } else if (event.type === "error") {
-          this.emit("error", new Error(event.message));
-        } else if (event.type === "detected") {
-          const match = matchRoute(phrases, event.phrase);
-          if (match) {
-            // No confidence: the keyword spotter applied its own threshold
-            // and returns no usable score. Reporting one anyway put a
-            // meaningless "confidence: 1.00" in every log line.
-            this.emit("detected", match, undefined);
-          }
-        }
-        // RELEASED is only of interest while a release is in flight, and
-        // releaseThenKill() installs its own listener for it.
-      }
-    });
-
-    this.process.stderr?.on("data", (data: Buffer) => {
+    proc.stderr?.on("data", (data: Buffer) => {
       this.emit("debug", "stderr: " + data.toString().trim());
     });
 
-    this.process.on("error", (err) => {
+    proc.on("error", (err) => {
       this._isListening = false;
       this._isPaused = false;
       this.process = null;
+      this.resetChildState();
 
       if (err.message.includes("ENOENT") || err.message.includes("not found")) {
+        // The executable the lookup found is gone (Node.js upgraded or
+        // removed), so the next start must look again rather than reuse it.
+        clearNodePathCache();
         this.emit(
           "error",
           new Error(
@@ -200,10 +218,12 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       }
     });
 
-    this.process.on("exit", (code) => {
+    proc.on("exit", (code) => {
       const wasListening = this._isListening;
+      const wasPaused = this.childPaused;
       this._isListening = false;
       this.process = null;
+      this.resetChildState();
 
       this.emit("debug", `Process exited: code=${code}, killed=${this._killedIntentionally}`);
 
@@ -211,6 +231,14 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         if (wasListening && !this._isPaused) {
           this.emit("stopped");
         }
+        return;
+      }
+
+      // The child died while paused for a handoff. A retry now would reopen
+      // the microphone the handoff gave away, so the engine stays paused with
+      // no process and resume() starts a new one.
+      if (wasPaused) {
+        this.emit("debug", "Engine process exited while paused: the next resume starts a new one");
         return;
       }
 
@@ -241,6 +269,66 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     });
   }
 
+  /** Act on one line of the current child's stdout. */
+  private handleLine(line: string, phrases: WakePhrase[], startedAt: number): void {
+    const event = parseEngineLine(line);
+    if (!event) {
+      return;
+    }
+
+    switch (event.type) {
+      case "ready":
+        // The same READY answers a start and a resume.
+        if (this.currentDebugMode) {
+          this.emit(
+            "debug",
+            this.resumeSentAt
+              ? `Timing: resume-to-ready ${Date.now() - this.resumeSentAt}ms`
+              : `Timing: start-to-ready ${Date.now() - startedAt}ms`
+          );
+        }
+        this.resumeSentAt = 0;
+        this.childReady = true;
+        this._isListening = true;
+        this._isPaused = false;
+        this.retryCount = 0;
+        this.emit("started");
+        break;
+      case "paused":
+        // Only a pause this engine is waiting on counts.
+        if (this.pauseTimer) {
+          this.clearPauseTimer();
+          this.emit("debug", "Mic release: acknowledged by engine (paused)");
+          if (this.currentDebugMode) {
+            this.emit("debug", `Timing: pause-to-ack ${Date.now() - this.pauseSentAt}ms`);
+          }
+          this.pauseSentAt = 0;
+        }
+        break;
+      case "debug":
+        this.emit("debug", event.message);
+        break;
+      case "error":
+        this.emit("error", new Error(event.message));
+        break;
+      case "detected":
+        // Listening ended when pause() returned. A detection the child made
+        // before the pause command reached it does not count.
+        if (this._isListening) {
+          const match = matchRoute(phrases, event.phrase);
+          if (match) {
+            // No confidence: the keyword spotter applied its own threshold
+            // and returns no usable score. Reporting one anyway put a
+            // meaningless "confidence: 1.00" in every log line.
+            this.emit("detected", match, undefined);
+          }
+        }
+        break;
+      // RELEASED is only of interest while a release is in flight, and
+      // releaseThenKill() reads it itself.
+    }
+  }
+
   stop(): void {
     // Cancel any pending retry first, before the state guard below.
     //
@@ -255,13 +343,21 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     // Likewise a start() still awaiting the model check: see startGeneration.
     this.startGeneration++;
 
-    // Kill whatever child exists before the state guard, for the same
+    // Deal with whatever child exists before the state guard, for the same
     // reason. A child that has been spawned but has not yet said READY is
     // neither listening nor paused, and returning early left it to finish
     // loading, open the microphone, and report READY to a stopped engine:
     // Disable, Reset Consent, and an engine switch during that window all
-    // ended with the microphone open.
-    this.forceKill();
+    // ended with the microphone open. That child may still be inside the
+    // model load, where it reads no commands, so it is killed outright. A
+    // child that has said READY, listening or paused, reads its commands, so
+    // it is asked to close the microphone and given RELEASE_TIMEOUT_MS to
+    // say so.
+    if (this.childReady) {
+      this.releaseThenKill();
+    } else {
+      this.forceKill();
+    }
 
     if (!this._isListening && !this._isPaused) {
       return;
@@ -286,9 +382,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
 
     this._isPaused = true;
-    this.clearRetryTimer();
-    this.releaseThenKill();
     this._isListening = false;
+    this.clearRetryTimer();
+    this.pauseChild();
     this.emit("paused");
   }
 
@@ -297,13 +393,42 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       return;
     }
 
+    const proc = this.process;
+    // A child already on its way to READY, from a start or an earlier
+    // resume, needs nothing more.
+    if (proc && !this.childPaused) {
+      return;
+    }
+
     this.retryCount = 0;
+
+    // The usual case: the paused child is alive with its models loaded and
+    // only the microphone has to reopen. Its READY sets the engine listening,
+    // as after a start. This is sent even while the PAUSED is still on its
+    // way: the child handles its commands in order.
+    if (proc && this.writeCommand(proc, "resume")) {
+      this.childPaused = false;
+      this.resumeSentAt = Date.now();
+      return;
+    }
+
+    // Nothing to resume: the child crashed or was killed during the pause,
+    // or the pause came during crash backoff. Start a new one. The engine
+    // stays paused until it says READY, so a start that fails leaves the
+    // engine paused rather than half listening.
+    if (proc) {
+      this.forceKill(proc);
+    }
+    this.emit("debug", "Resume: no engine process to resume, starting a new one");
     this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
   }
 
   dispose(): void {
     this.clearRetryTimer();
-    this.clearReleaseTimer();
+    // The engine is being discarded and nothing will be left to hear
+    // RELEASED, so the child is killed now instead of being left to a
+    // release and its timer.
+    this.forceKill();
     this.stop();
     this.removeAllListeners();
   }
@@ -322,20 +447,80 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
   }
 
+  private clearPauseTimer(): void {
+    if (this.pauseTimer) {
+      clearTimeout(this.pauseTimer);
+      this.pauseTimer = null;
+    }
+  }
+
+  /** Forget everything known about the current child, timers included. */
+  private resetChildState(): void {
+    this.clearPauseTimer();
+    this.childReady = false;
+    this.childPaused = false;
+    this.pauseSentAt = 0;
+    this.resumeSentAt = 0;
+  }
+
   /**
-   * Ask the child to close the microphone and wait until it says it has.
+   * Ask the child to close the microphone, keep everything else loaded, and
+   * say PAUSED.
    *
-   * The extension fires the target command immediately after pause() returns,
-   * and that command exists to hand the microphone to something else. The
-   * previous behaviour killed the child and assumed the OS had torn the
-   * capture device down by the time anything else asked for it, which was
-   * only ever usually true. The child now prints RELEASED once mic.stop() has
-   * returned, so wait for that line and force kill on a timeout so a wedged
-   * child cannot hold the device open indefinitely.
+   * The extension fires the target command as soon as pause() returns, and
+   * that command exists to hand the microphone to something else. pause()
+   * stays synchronous, so the close completes underneath the command, and a
+   * child that has not said PAUSED within PAUSE_TIMEOUT_MS is killed so it
+   * cannot hold the device through the handoff.
+   */
+  private pauseChild(): void {
+    const proc = this.process;
+    if (!proc) {
+      return;
+    }
+
+    this.childPaused = true;
+    this.resumeSentAt = 0;
+    if (!this.writeCommand(proc, "pause")) {
+      this.emit("debug", "Mic release: stdin already closed");
+      this.forceKill(proc);
+      return;
+    }
+
+    this.clearPauseTimer();
+    this.pauseSentAt = Date.now();
+    this.pauseTimer = setTimeout(() => {
+      this.pauseTimer = null;
+      const resumeRequested = this.resumeSentAt !== 0;
+      this.emit(
+        "debug",
+        `Mic release: no acknowledgement after ${SherpaEngine.PAUSE_TIMEOUT_MS}ms, forcing`
+      );
+      this.forceKill(proc);
+      // A resume sent behind the unanswered pause went to the child just
+      // killed. Start a new one so that resume still happens.
+      if (resumeRequested && this._isPaused) {
+        this.emit("debug", "Resume: the engine did not pause in time, starting a new one");
+        this.retryCount = 0;
+        this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
+      }
+    }, SherpaEngine.PAUSE_TIMEOUT_MS);
+  }
+
+  /**
+   * Ask the child to close the microphone for good, wait until it says it
+   * has, and kill it. Used by stop().
    *
-   * pause() stays synchronous: the command fires as soon as it returns and
-   * the release completes within the timeout underneath. Ordering the command
-   * strictly after RELEASED is a handoff policy change, not this one.
+   * The child prints RELEASED once mic.stop() has returned. The line goes
+   * through the same reassembly as everything else the child prints, so a
+   * RELEASED split across two chunks, or behind other output in one, still
+   * counts. A child that says nothing within RELEASE_TIMEOUT_MS is killed
+   * anyway, so a wedged child cannot hold the device open indefinitely.
+   *
+   * From here the child is leaving: nothing else it prints, and neither its
+   * exit nor its errors, reaches the engine. It stays in `this.process` until
+   * it is killed, so a start() in the meantime kills it at once instead of
+   * running a second child next to it.
    */
   private releaseThenKill(): void {
     const proc = this.process;
@@ -345,11 +530,15 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
     this._killedIntentionally = true;
     this.clearReleaseTimer();
+    this.resetChildState();
 
-    // Take stdout over for the duration: the normal handler must not emit a
-    // detection from a process that is already shutting down.
     proc.stdout?.removeAllListeners("data");
     proc.stderr?.removeAllListeners("data");
+    proc.removeAllListeners("exit");
+    proc.removeAllListeners("error");
+    proc.on("error", () => {
+      /* the child is going away */
+    });
 
     let settled = false;
     const finish = (reason: string): void => {
@@ -362,35 +551,35 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       this.forceKill(proc);
     };
 
-    proc.stdout?.on("data", (data: Buffer) => {
-      for (const line of data.toString().split("\n")) {
+    proc.stdout?.on(
+      "data",
+      createLineReader((line) => {
         if (parseEngineLine(line)?.type === "released") {
           finish("acknowledged by engine");
-          return;
         }
-      }
-    });
+      })
+    );
 
     this.releaseTimer = setTimeout(
       () => finish(`no acknowledgement after ${SherpaEngine.RELEASE_TIMEOUT_MS}ms, forcing`),
       SherpaEngine.RELEASE_TIMEOUT_MS
     );
 
-    if (!this.writeStop(proc)) {
+    if (!this.writeCommand(proc, "stop")) {
       finish("stdin already closed");
     }
   }
 
   /**
-   * Send the stop command. Returns false when the child is already gone.
+   * Send one command line. Returns false when the child is already gone.
    */
-  private writeStop(proc: ChildProcess): boolean {
+  private writeCommand(proc: ChildProcess, command: "pause" | "resume" | "stop"): boolean {
     const stdin = proc.stdin;
     if (!stdin || !stdin.writable || proc.exitCode !== null) {
       return false;
     }
     try {
-      stdin.write("stop\n");
+      stdin.write(command + "\n");
       return true;
     } catch {
       return false;
@@ -400,9 +589,10 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   /**
    * Tear the child down now, without waiting for an acknowledgement.
    *
-   * `target` defaults to the current child. releaseThenKill() passes the
-   * process it captured, because the exit handler may already have cleared
-   * `this.process` by the time the acknowledgement or the timeout lands.
+   * `target` defaults to the current child. The release and pause timeouts
+   * pass the child they were waiting on; while either is pending that child
+   * is still the current one, because every path that replaces the child
+   * comes through here first and cancels them.
    */
   private forceKill(target: ChildProcess | null = this.process): void {
     const proc = target;
@@ -411,12 +601,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
 
     this._killedIntentionally = true;
-    this.clearReleaseTimer();
+    if (this.process === proc) {
+      this.clearReleaseTimer();
+      this.resetChildState();
+      this.process = null;
+    }
     proc.stdout?.removeAllListeners();
     proc.stderr?.removeAllListeners();
     // Ask for a clean release first even here: a child that acts on it closes
     // the device itself rather than leaving the OS to reclaim it.
-    this.writeStop(proc);
+    this.writeCommand(proc, "stop");
     try {
       proc.stdin?.end();
     } catch {
@@ -428,30 +622,43 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     } catch {
       // Process may have already exited
     }
-    if (this.process === proc) {
-      this.process = null;
-    }
   }
 }
 
 // ── Helpers ─────────────────────────────────────────────────
 
 /**
+ * The executable the last lookup found. The location of Node.js does not
+ * change while the editor runs, and the lookup spawns a shell synchronously
+ * on the extension host thread, so it runs once rather than on every start.
+ */
+let cachedNodePath: string | null = null;
+
+/**
  * Locate the system Node.js executable.
  *
  * Resolution order:
- *   1. wakeWord.nodePath user setting (highest priority)
- *   2. `where node` / `which node` shell command
- *   3. Well-known install paths per platform
- *   4. Bare 'node' as last resort
+ *   1. wakeWord.nodePath user setting (highest priority, never cached)
+ *   2. The path an earlier lookup found
+ *   3. `where node` / `which node` shell command
+ *   4. Well-known install paths per platform
+ *   5. Bare 'node' as last resort
+ *
+ * A path found by 3 or 4 is cached. The bare fallback is not: a Node.js
+ * installed after a failed lookup is picked up by the next start instead of
+ * needing a reload.
  */
 export function findSystemNode(override?: string): string {
   if (override) return override;
+  if (cachedNodePath) return cachedNodePath;
 
   try {
     const cmd = process.platform === "win32" ? "where node" : "which node";
     const result = execSync(cmd, { encoding: "utf8" }).trim().split("\n")[0].trim();
-    if (result) return result;
+    if (result) {
+      cachedNodePath = result;
+      return result;
+    }
   } catch {
     // fall through
   }
@@ -464,10 +671,21 @@ export function findSystemNode(override?: string): string {
       : ["/usr/bin/node", "/usr/local/bin/node"];
 
   for (const p of wellKnown) {
-    if (existsSync(p)) return p;
+    if (existsSync(p)) {
+      cachedNodePath = p;
+      return p;
+    }
   }
 
   return "node";
+}
+
+/**
+ * Forget the cached lookup. Called when spawning the cached path fails, and
+ * by tests.
+ */
+export function clearNodePathCache(): void {
+  cachedNodePath = null;
 }
 
 // ── Model management ─────────────────────────────────────────

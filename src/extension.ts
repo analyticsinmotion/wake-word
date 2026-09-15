@@ -305,8 +305,11 @@ export function activate(context: vscode.ExtensionContext) {
         log("info", "Paused: window lost focus");
       } else if (state.focused && isPausedByFocus) {
         isPausedByFocus = false;
-        speechEngine.resume();
         log("info", "Resumed: window regained focus");
+        // resumeListening(), not resume(): a routes change made while the
+        // window was unfocused has to be applied, and resume() would bring
+        // the engine back with the old phrases.
+        resumeListening();
       }
     })
   );
@@ -558,7 +561,9 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     );
   }
 
-  // Pause: kill the speech engine process to release the mic
+  // Pause: release the microphone. The sherpa engine closes it and keeps its
+  // process and models loaded for the resume; the Windows engine ends its
+  // process.
   speechEngine.pause();
 
   // Fire the target command
@@ -575,6 +580,9 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     );
     resumeListening();
     return;
+  }
+  if (isDevMode) {
+    log("info", `Timing: detect-to-command ${Date.now() - now}ms`);
   }
 
   // Hand off: resume on the route's timer, or wait for the user.

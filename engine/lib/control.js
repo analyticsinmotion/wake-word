@@ -25,10 +25,14 @@ function drainLines(buffer) {
 /**
  * Parse one line read from stdin.
  *
- * The extension sends a single JSON config line on start and the literal
- * "stop" when it wants the microphone released.
+ * The extension sends a single JSON config line on start, then commands:
+ *   pause   close the microphone and keep the spotter loaded (PAUSED)
+ *   resume  reopen the microphone (READY)
+ *   stop    close everything and exit (RELEASED)
  *
  * @returns {{kind: 'stop'}
+ *   | {kind: 'pause'}
+ *   | {kind: 'resume'}
  *   | {kind: 'empty'}
  *   | {kind: 'config', config: object}
  *   | {kind: 'invalid', message: string}}
@@ -36,8 +40,8 @@ function drainLines(buffer) {
 function parseControlLine(line) {
   const trimmed = String(line == null ? '' : line).trim();
 
-  if (trimmed === 'stop') {
-    return { kind: 'stop' };
+  if (trimmed === 'stop' || trimmed === 'pause' || trimmed === 'resume') {
+    return { kind: trimmed };
   }
   if (trimmed.length === 0) {
     return { kind: 'empty' };

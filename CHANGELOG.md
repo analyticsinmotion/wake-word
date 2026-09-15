@@ -8,6 +8,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.0] - 2026-09-15
+
+### Added
+
+- `pause` and `resume` commands on the audio engine's stdin, and a
+  `PAUSED` message on its stdout, alongside the existing `stop` and
+  `RELEASED`.
+- Timing lines in debug mode (the Extension Development Host). The
+  engine process reports `modules-load`, `bpe-load`, `tokenise`,
+  `model-load`, and `mic-open` when it starts and `resume-mic-open` on
+  each resume; the extension reports `start-to-ready`, `pause-to-ack`,
+  `resume-to-ready`, and `detect-to-command`. Nothing changes outside
+  debug mode.
+
+### Changed
+
+- The sherpa engine's process now stays alive across handoffs. When a
+  wake phrase is detected the extension sends it `pause`: the process
+  closes the microphone, keeps the keyword spotter and its models loaded,
+  and confirms with `PAUSED`. Resuming, after the cooldown or a manual
+  handoff, sends `resume`, which reopens the microphone and answers
+  `READY`. Previously every handoff killed the process and every resume
+  started a new one, which reloaded the models before listening could
+  resume. The process now ends only when listening is disabled, the
+  engine is switched or reconfigured, the extension deactivates, or the
+  process crashes. A process that has not confirmed a pause within
+  500 ms is killed so it cannot hold the microphone, and the next resume
+  starts a new one. A process that crashes while paused is not restarted
+  until you resume, so a crash cannot reopen the microphone during a
+  handoff. The Windows engine is unchanged and still ends its process on
+  every handoff.
+- After a pause the keyword spotter continues from a fresh stream rather
+  than a reset one, so audio heard before the pause cannot complete a
+  phrase after it.
+- Disabling listening asks the sherpa engine's process to close the
+  microphone and waits for `RELEASED`, up to 500 ms, before killing it:
+  the acknowledged release a handoff used before this version. A process
+  still loading its models is killed at once, as before.
+- The microphone is captured as 32-bit float samples (decibri's
+  `dtype: 'float32'`) instead of 16-bit integers converted to float in
+  JavaScript, so each chunk is read in place with no conversion or
+  allocation. Samples beyond full scale, which automatic gain control can
+  produce, are clamped to the range the 16-bit format enforced.
+- The sherpa engine looks up the Node.js executable once and caches the
+  result, instead of spawning `where node` or `which node` synchronously
+  on the extension host thread on every engine start. A lookup that finds
+  nothing is not cached, and a spawn that fails because the cached
+  executable has gone clears the cache so the next start looks again.
+
+### Fixed
+
+- The sherpa engine searched each stdout chunk on its own for the
+  `RELEASED` acknowledgement, so one split across two chunks was missed
+  and the release waited out its full 500 ms timeout. `RELEASED` and the
+  new `PAUSED` now go through the same line reassembly as the rest of the
+  protocol. A multi-byte character split across two chunks is also no
+  longer garbled in log and error lines.
+- With `wakeWord.pauseOnFocusLoss` enabled, regaining focus resumed with
+  the wake phrases the engine was paused with, ignoring a change to
+  `wakeWord.routes` made while the window was unfocused, even though the
+  log said the change would apply when listening resumed. Regaining focus
+  now resumes the way the end of a cooldown does, with a full start when
+  the routes changed.
+- `package-lock.json` still carried version 0.10.0. It now matches
+  `package.json`.
+
 ## [0.11.0] - 2026-09-05
 
 ### Added

@@ -7,8 +7,9 @@ import { MockChildProcess } from "../mocks/childProcess";
  *
  * These are the paths that were only ever checked by hand: start, stop,
  * pause, resume, the crash and retry backoff, the retry-timer cancellation
- * that stop() and pause() must perform (the D2 fix), and the RELEASED
- * handshake with its timeout. `spawn` is replaced with a factory for
+ * that stop() and pause() must perform (the D2 fix), the pause and resume
+ * commands that keep one child alive across handoffs, and the PAUSED and
+ * RELEASED handshakes with their timeouts. `spawn` is replaced with a factory for
  * MockChildProcess, `fs` says the model is already downloaded, and the timers
  * are faked so a ten second backoff costs nothing.
  *
@@ -38,7 +39,7 @@ vi.mock("fs", () => ({
   unlinkSync: vi.fn(),
 }));
 
-import { SherpaEngine } from "../../src/sherpaEngine";
+import { SherpaEngine, clearNodePathCache } from "../../src/sherpaEngine";
 import { WakePhrase } from "../../src/speechEngineInterface";
 
 const ROUTES: WakePhrase[] = [
@@ -53,6 +54,7 @@ const ROUTES: WakePhrase[] = [
 
 const NODE = "/fake/bin/node";
 const RELEASE_TIMEOUT_MS = 500;
+const PAUSE_TIMEOUT_MS = 500;
 const RETRY_DELAYS_MS = [2000, 5000, 10000];
 
 let spawned: MockChildProcess[] = [];
@@ -127,7 +129,21 @@ function configLine(proc: MockChildProcess): Record<string, unknown> {
   return JSON.parse(proc.stdinLines[0]);
 }
 
+/** Every command written to the child after its config line. */
+function commands(proc: MockChildProcess): string[] {
+  return proc.stdinLines.slice(1);
+}
+
+/** Start, report READY, pause, and acknowledge the pause. */
+async function pausedEngine(engine: SherpaEngine): Promise<MockChildProcess> {
+  const proc = await startAndReady(engine);
+  engine.pause();
+  proc.sendLine("PAUSED");
+  return proc;
+}
+
 beforeEach(() => {
+  clearNodePathCache();
   spawned = [];
   mocks.spawn.mockReset();
   mocks.spawn.mockImplementation(() => {
@@ -250,6 +266,24 @@ describe("start", () => {
     expect(engine.isListening).toBe(false);
   });
 
+  it("looks Node.js up again after the cached executable fails to spawn", async () => {
+    const context = {
+      globalStorageUri: { fsPath: "/fake/storage" },
+    } as unknown as vscode.ExtensionContext;
+    const engine = new SherpaEngine(context);
+    const events = capture(engine);
+    mocks.execSync.mockReturnValue("/usr/bin/node\n");
+
+    await engine.start(ROUTES, 0.3, false);
+    await engine.start(ROUTES, 0.3, false);
+    expect(mocks.execSync).toHaveBeenCalledTimes(1);
+
+    latest().simulateError(new Error("spawn /usr/bin/node ENOENT"));
+    expect(events.errors[0].message).toMatch(/wakeWord\.nodePath/);
+    await engine.start(ROUTES, 0.3, false);
+    expect(mocks.execSync).toHaveBeenCalledTimes(2);
+  });
+
   it("reports any other spawn failure with its message", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, false);
@@ -343,16 +377,21 @@ describe("stdout protocol", () => {
 // ── stop ────────────────────────────────────────────────────
 
 describe("stop", () => {
-  it("asks the child to release, closes stdin, kills it, and reports stopped", async () => {
+  it("asks a listening child to release, reports stopped, and kills it on RELEASED", async () => {
     const { engine, events } = makeEngine();
     const proc = await startAndReady(engine);
     engine.stop();
     expect(engine.isListening).toBe(false);
     expect(engine.isPaused).toBe(false);
     expect(events.stopped).toBe(1);
-    expect(proc.stdinLines).toContain("stop");
-    expect(proc.stdin.writable).toBe(false);
+    expect(commands(proc)).toEqual(["stop"]);
+    // Not killed yet: the child gets the chance to close the device itself.
+    expect(proc.killed).toBe(false);
+
+    proc.sendLine("RELEASED");
     expect(proc.killed).toBe(true);
+    expect(proc.stdin.writable).toBe(false);
+    expect(events.debug).toContain("Mic release: acknowledged by engine");
   });
 
   it("is a no-op when nothing is running", () => {
@@ -424,34 +463,13 @@ describe("stop", () => {
   });
 });
 
-// ── pause and the RELEASED protocol ─────────────────────────
+// ── stop and the RELEASED handshake ─────────────────────────
 
-describe("pause and the RELEASED handshake", () => {
-  it("sends stop on stdin and reports paused while the release is in flight", async () => {
-    const { engine, events } = makeEngine();
-    const proc = await startAndReady(engine);
-    engine.pause();
-    expect(engine.isPaused).toBe(true);
-    expect(engine.isListening).toBe(false);
-    expect(events.paused).toBe(1);
-    expect(proc.stdinLines).toContain("stop");
-    // Not killed yet: the child gets a chance to close the device itself.
-    expect(proc.killed).toBe(false);
-  });
-
-  it("kills the child once RELEASED arrives", async () => {
-    const { engine, events } = makeEngine();
-    const proc = await startAndReady(engine);
-    engine.pause();
-    proc.sendLine("RELEASED");
-    expect(proc.killed).toBe(true);
-    expect(events.debug).toContain("Mic release: acknowledged by engine");
-  });
-
+describe("stop and the RELEASED handshake", () => {
   it("force-kills the child when no RELEASED arrives within the timeout", async () => {
     const { engine, events } = makeEngine();
     const proc = await startAndReady(engine);
-    engine.pause();
+    engine.stop();
     await vi.advanceTimersByTimeAsync(RELEASE_TIMEOUT_MS - 1);
     expect(proc.killed).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
@@ -461,34 +479,201 @@ describe("pause and the RELEASED handshake", () => {
     );
   });
 
+  it("sees a RELEASED split across two chunks", async () => {
+    // Searching each chunk on its own missed this and left the release to
+    // run out its timeout.
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.stop();
+    proc.sendRaw("RELEA");
+    expect(proc.killed).toBe(false);
+    proc.sendRaw("SED\n");
+    expect(proc.killed).toBe(true);
+    expect(events.debug).toContain("Mic release: acknowledged by engine");
+  });
+
+  it("sees a RELEASED that arrives behind a DEBUG line in one chunk", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.stop();
+    proc.sendRaw("DEBUG:closing microphone\nRELEASED\n");
+    expect(proc.killed).toBe(true);
+    expect(events.debug).toContain("Mic release: acknowledged by engine");
+  });
+
   it("does not force-kill a second time after an acknowledged release", async () => {
     const { engine, events } = makeEngine();
     const proc = await startAndReady(engine);
-    engine.pause();
+    engine.stop();
     proc.sendLine("RELEASED");
     await vi.advanceTimersByTimeAsync(RELEASE_TIMEOUT_MS * 2);
     expect(events.debug.filter((d) => d.startsWith("Mic release:"))).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("does not emit a detection from a child that is being released", async () => {
+  it("lets nothing else a releasing child prints reach the engine", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.stop();
+    proc.sendLine("DETECTED:hey claude");
+    proc.sendLine("READY");
+    proc.sendLine("ERROR:late failure");
+    proc.sendLine("DEBUG:late output");
+    expect(events.detected).toHaveLength(0);
+    expect(events.started).toBe(1);
+    expect(events.errors).toHaveLength(0);
+    expect(events.debug).not.toContain("late output");
+    expect(engine.isListening).toBe(false);
+  });
+
+  it("releases a paused child the same way", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.stop();
+    expect(engine.isPaused).toBe(false);
+    expect(events.stopped).toBe(1);
+    expect(commands(proc)).toEqual(["pause", "stop"]);
+    expect(proc.killed).toBe(false);
+    proc.sendLine("RELEASED");
+    expect(proc.killed).toBe(true);
+  });
+
+  it("releases a child still reopening the microphone after a resume", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.resume();
+    engine.stop();
+    expect(events.stopped).toBe(1);
+    expect(commands(proc)).toEqual(["pause", "resume", "stop"]);
+    proc.sendLine("READY");
+    expect(engine.isListening).toBe(false);
+    proc.sendLine("RELEASED");
+    expect(proc.killed).toBe(true);
+  });
+
+  it("force-kills at once when stdin is already closed", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    proc.stdin.end();
+    engine.stop();
+    expect(proc.killed).toBe(true);
+    expect(events.debug).toContain("Mic release: stdin already closed");
+  });
+
+  it("does not report stopped a second time when the released child exits", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.stop();
+    proc.sendLine("RELEASED");
+    proc.simulateExit(0);
+    expect(events.stopped).toBe(1);
+  });
+
+  it("kills a releasing child at once when stop() is called again", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.stop();
+    engine.stop();
+    expect(proc.killed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("lets a start() kill a releasing child rather than run two", async () => {
+    const { engine } = makeEngine();
+    const first = await startAndReady(engine);
+    engine.stop();
+    await engine.start(ROUTES, 0.3, false);
+    expect(first.killed).toBe(true);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    // The first child's release timer went with it.
+    await vi.advanceTimersByTimeAsync(RELEASE_TIMEOUT_MS);
+    expect(latest().killed).toBe(false);
+  });
+});
+
+// ── pause: the child stays alive ────────────────────────────
+
+describe("pause", () => {
+  it("sends pause on stdin, reports paused, and leaves the child running", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.pause();
+    expect(engine.isPaused).toBe(true);
+    expect(engine.isListening).toBe(false);
+    expect(events.paused).toBe(1);
+    expect(commands(proc)).toEqual(["pause"]);
+    expect(proc.killed).toBe(false);
+    expect(proc.stdin.writable).toBe(true);
+  });
+
+  it("clears the pause timeout when PAUSED arrives", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.pause();
+    proc.sendLine("PAUSED");
+    expect(events.debug).toContain("Mic release: acknowledged by engine (paused)");
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS * 4);
+    expect(proc.killed).toBe(false);
+  });
+
+  it("sees a PAUSED split across two chunks", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.pause();
+    proc.sendRaw("PAU");
+    proc.sendRaw("SED\n");
+    expect(events.debug).toContain("Mic release: acknowledged by engine (paused)");
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS * 2);
+    expect(proc.killed).toBe(false);
+  });
+
+  it("sees a PAUSED that arrives behind other output in one chunk", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.pause();
+    proc.sendRaw("DEBUG:VAD: silence\nPAUSED\n");
+    expect(events.debug).toContain("VAD: silence");
+    expect(events.debug).toContain("Mic release: acknowledged by engine (paused)");
+  });
+
+  it("force-kills a child that does not say PAUSED within the timeout", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.pause();
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS - 1);
+    expect(proc.killed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(proc.killed).toBe(true);
+    expect(events.debug).toContain(
+      `Mic release: no acknowledgement after ${PAUSE_TIMEOUT_MS}ms, forcing`
+    );
+    // Still paused, and nothing restarts behind the handoff.
+    expect(engine.isPaused).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a PAUSED it is not waiting for", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    proc.sendLine("PAUSED");
+    expect(engine.isListening).toBe(true);
+    expect(events.debug.filter((d) => d.startsWith("Mic release:"))).toHaveLength(0);
+  });
+
+  it("does not emit a detection from a child that has been asked to pause", async () => {
     // The extension's own guard against repeats is shouldDebounce(), tested
     // in debounce.test.ts. This is the engine's half: once pause() has
-    // asked for the microphone back, nothing the child still prints counts.
+    // returned, nothing the child still prints counts as a detection.
     const { engine, events } = makeEngine();
     const proc = await startAndReady(engine);
     engine.pause();
     proc.sendLine("DETECTED:hey claude");
+    proc.sendLine("PAUSED");
+    proc.sendLine("DETECTED:hey claude");
     expect(events.detected).toHaveLength(0);
-  });
-
-  it("does not report stopped when the released child exits", async () => {
-    const { engine, events } = makeEngine();
-    const proc = await startAndReady(engine);
-    engine.pause();
-    proc.sendLine("RELEASED");
-    proc.simulateExit(0);
-    expect(events.stopped).toBe(0);
-    expect(engine.isPaused).toBe(true);
   });
 
   it("force-kills at once when stdin is already closed", async () => {
@@ -497,6 +682,7 @@ describe("pause and the RELEASED handshake", () => {
     proc.stdin.end();
     engine.pause();
     expect(proc.killed).toBe(true);
+    expect(engine.isPaused).toBe(true);
     expect(events.debug).toContain("Mic release: stdin already closed");
   });
 
@@ -507,59 +693,186 @@ describe("pause and the RELEASED handshake", () => {
     expect(events.paused).toBe(0);
   });
 
-  it("lets stop() cut a release short", async () => {
+  it("is a no-op while already paused", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.pause();
+    expect(commands(proc)).toEqual(["pause"]);
+    expect(events.paused).toBe(1);
+  });
+
+  it("does not retry a child that crashes while paused", async () => {
+    // A retry would reopen the microphone the handoff gave away.
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    proc.simulateExit(1);
+    expect(events.warnings).toHaveLength(0);
+    expect(events.errors).toHaveLength(0);
+    expect(engine.isPaused).toBe(true);
+    expect(events.debug).toContain(
+      "Engine process exited while paused: the next resume starts a new one"
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a child that crashes before it says PAUSED", async () => {
     const { engine, events } = makeEngine();
     const proc = await startAndReady(engine);
     engine.pause();
-    engine.stop();
-    expect(proc.killed).toBe(true);
-    expect(engine.isPaused).toBe(false);
-    expect(events.stopped).toBe(1);
-    // The release timer was cleared with the kill, so nothing fires later.
-    await vi.advanceTimersByTimeAsync(RELEASE_TIMEOUT_MS);
-    expect(events.debug.filter((d) => d.startsWith("Mic release:"))).toHaveLength(0);
+    proc.simulateExit(1);
+    expect(events.warnings).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report stopped when a paused child exits cleanly", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    proc.simulateExit(0);
+    expect(events.stopped).toBe(0);
+    expect(engine.isPaused).toBe(true);
   });
 });
 
 // ── resume ──────────────────────────────────────────────────
 
 describe("resume", () => {
-  it("starts a fresh child after a pause", async () => {
-    const { engine, events } = makeEngine();
-    const first = await startAndReady(engine);
-    engine.pause();
-    first.sendLine("RELEASED");
+  it("sends resume to the paused child instead of spawning a new one", async () => {
+    const { engine } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.resume();
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(commands(proc)).toEqual(["pause", "resume"]);
+    expect(proc.killed).toBe(false);
+  });
 
+  it("remains paused until the child reports READY, then listens on the same child", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.resume();
+    expect(engine.isPaused).toBe(true);
+    expect(engine.isListening).toBe(false);
+
+    proc.sendLine("READY");
+    expect(engine.isListening).toBe(true);
+    expect(engine.isPaused).toBe(false);
+    expect(events.started).toBe(2);
+    expect(latest()).toBe(proc);
+
+    proc.sendLine("DETECTED:hey computer");
+    expect(events.detected.map((d) => d.phrase.label)).toEqual(["Terminal"]);
+  });
+
+  it("works when the resume goes out before PAUSED has come back", async () => {
+    // A command that fails fast has the extension resume straight after pause().
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.pause();
+    engine.resume();
+    expect(commands(proc)).toEqual(["pause", "resume"]);
+    proc.sendLine("PAUSED");
+    proc.sendLine("READY");
+    expect(engine.isListening).toBe(true);
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS * 2);
+    expect(proc.killed).toBe(false);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps one child through rapid pause and resume cycles", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    const expected: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      engine.pause();
+      proc.sendLine("PAUSED");
+      engine.resume();
+      proc.sendLine("READY");
+      expected.push("pause", "resume");
+    }
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(proc.killed).toBe(false);
+    expect(commands(proc)).toEqual(expected);
+    expect(events.paused).toBe(5);
+    expect(events.started).toBe(6);
+    expect(engine.isListening).toBe(true);
+  });
+
+  it("sends resume once while READY is still on its way", async () => {
+    const { engine } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.resume();
+    engine.resume();
+    await flush();
+    expect(commands(proc)).toEqual(["pause", "resume"]);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a new child with the same config when the paused one has died", async () => {
+    const { engine, events } = makeEngine();
+    const first = await pausedEngine(engine);
+    first.simulateExit(1);
     engine.resume();
     await flush();
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
-    expect(latest()).not.toBe(first);
+    expect(configLine(latest())).toEqual(configLine(first));
+    expect(events.debug).toContain("Resume: no engine process to resume, starting a new one");
 
     latest().sendLine("READY");
     expect(engine.isListening).toBe(true);
     expect(engine.isPaused).toBe(false);
-    expect(events.started).toBe(2);
   });
 
-  it("remains paused until the new child reports READY", async () => {
+  it("starts a new child after the pause timeout killed the old one", async () => {
     const { engine } = makeEngine();
     const first = await startAndReady(engine);
     engine.pause();
-    first.sendLine("RELEASED");
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS);
+    expect(first.killed).toBe(true);
     engine.resume();
     await flush();
-    expect(engine.isPaused).toBe(true);
-    expect(engine.isListening).toBe(false);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(latest()).not.toBe(first);
   });
 
-  it("gives the new child the same phrases and threshold", async () => {
-    const { engine } = makeEngine();
+  it("starts a new child at once when a resume was waiting behind a pause that timed out", async () => {
+    const { engine, events } = makeEngine();
     const first = await startAndReady(engine);
     engine.pause();
-    first.sendLine("RELEASED");
+    engine.resume();
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS);
+    await flush();
+    expect(first.killed).toBe(true);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(events.debug).toContain("Resume: the engine did not pause in time, starting a new one");
+    latest().sendLine("READY");
+    expect(engine.isListening).toBe(true);
+  });
+
+  it("starts a new child when the paused child's stdin has closed", async () => {
+    const { engine } = makeEngine();
+    const first = await pausedEngine(engine);
+    first.stdin.end();
     engine.resume();
     await flush();
-    expect(configLine(latest())).toEqual(configLine(first));
+    expect(first.killed).toBe(true);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a child that crashes while reopening the microphone", async () => {
+    // Unlike a crash while paused: the extension has asked to listen again.
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.resume();
+    proc.simulateExit(1);
+    expect(events.warnings[0]).toMatch(/Retrying in 2s \(attempt 1\/3\)/);
+    await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0]);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
   });
 
   it("is a no-op unless paused", async () => {
@@ -568,10 +881,94 @@ describe("resume", () => {
     await flush();
     expect(mocks.spawn).not.toHaveBeenCalled();
 
-    await startAndReady(engine);
+    const proc = await startAndReady(engine);
     engine.resume();
     await flush();
     expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(commands(proc)).toEqual([]);
+  });
+});
+
+// ── start while paused: a settings change during a handoff ──
+
+describe("start while paused", () => {
+  it("replaces the paused child with one carrying the new routes and threshold", async () => {
+    // After a routes change resumeListening() goes through start(), because
+    // resume() would bring the paused child back with the old phrases.
+    const { engine, events } = makeEngine();
+    const old = await pausedEngine(engine);
+    const routes: WakePhrase[] = [
+      ...ROUTES,
+      { label: "Search", phrase: "search files", command: "workbench.action.quickOpen" },
+    ];
+    await engine.start(routes, 0.5, false);
+    expect(old.killed).toBe(true);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    const config = configLine(latest());
+    expect(config.phrases).toContainEqual({ phrase: "search files", label: "Search" });
+    expect(config.threshold).toBe(0.5);
+    expect(engine.isPaused).toBe(true);
+
+    latest().sendLine("READY");
+    expect(engine.isPaused).toBe(false);
+    latest().sendLine("DETECTED:search files");
+    expect(events.detected.map((d) => d.phrase.label)).toEqual(["Search"]);
+  });
+
+  it("does not send a resume to the replacement while it is starting", async () => {
+    const { engine } = makeEngine();
+    await pausedEngine(engine);
+    await engine.start(ROUTES, 0.3, false);
+    engine.resume();
+    await flush();
+    expect(commands(latest())).toEqual([]);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a replacement that crashes before READY", async () => {
+    const { engine, events } = makeEngine();
+    await pausedEngine(engine);
+    await engine.start(ROUTES, 0.3, false);
+    latest().simulateExit(1);
+    expect(events.warnings).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0]);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ── debug timing ────────────────────────────────────────────
+
+describe("debug timing", () => {
+  it("logs start-to-ready, pause-to-ack, and resume-to-ready in debug mode", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, true);
+    const proc = latest();
+    proc.sendLine("READY");
+    engine.pause();
+    proc.sendLine("PAUSED");
+    engine.resume();
+    proc.sendLine("READY");
+    const timing = events.debug.filter((d) => d.startsWith("Timing:"));
+    expect(timing).toHaveLength(3);
+    expect(timing[0]).toMatch(/^Timing: start-to-ready \d+ms$/);
+    expect(timing[1]).toMatch(/^Timing: pause-to-ack \d+ms$/);
+    expect(timing[2]).toMatch(/^Timing: resume-to-ready \d+ms$/);
+  });
+
+  it("logs no timing outside debug mode", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.resume();
+    proc.sendLine("READY");
+    expect(events.debug.filter((d) => d.startsWith("Timing:"))).toEqual([]);
+  });
+
+  it("forwards the child's own timing lines", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    proc.sendLine("DEBUG:Timing: model-load 487ms");
+    expect(events.debug).toContain("Timing: model-load 487ms");
   });
 });
 
@@ -791,15 +1188,33 @@ describe("dispose", () => {
     expect(mocks.spawn).toHaveBeenCalledTimes(1);
   });
 
-  it("cancels an in-flight release and kills the child now", async () => {
+  it("cancels an unacknowledged pause and kills the child now", async () => {
     const { engine } = makeEngine();
     const proc = await startAndReady(engine);
     engine.pause();
     engine.dispose();
     expect(proc.killed).toBe(true);
-    // The release timer is gone with the listeners: nothing left to fire.
+    // The pause timer is gone with the child: nothing left to fire.
     expect(vi.getTimerCount()).toBe(0);
-    await vi.advanceTimersByTimeAsync(RELEASE_TIMEOUT_MS);
+    await vi.advanceTimersByTimeAsync(PAUSE_TIMEOUT_MS);
+  });
+
+  it("kills a paused child at once", async () => {
+    // An engine switch or a wakeWord.audioDevice change during a handoff
+    // disposes the paused engine; its child must not outlive it.
+    const { engine } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.dispose();
+    expect(proc.killed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("kills a listening child at once rather than waiting for RELEASED", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.dispose();
+    expect(proc.killed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("kills a child that has not yet reported READY", async () => {
