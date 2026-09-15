@@ -74,7 +74,7 @@ function resolveModelDir(explicit) {
         '\nEither enable listening in the extension once so it downloads the model, ' +
         'or pass --model-dir <path> pointing at an extracted copy of ' +
         core.MODEL_NAME +
-        '.tar.bz2 (the URL is in src/sherpaEngine.ts).'
+        '.tar.gz (the URL is in src/sherpaEngine.ts).'
     );
   }
   return found;

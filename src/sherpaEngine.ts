@@ -1,5 +1,5 @@
 import { EventEmitter } from "events";
-import { spawn, ChildProcess, execFile, execFileSync, execSync } from "child_process";
+import { spawn, ChildProcess, execFile, execSync } from "child_process";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, createWriteStream, writeFileSync, readFileSync, unlinkSync } from "fs";
 import * as path from "path";
@@ -7,6 +7,7 @@ import * as https from "https";
 import { pipeline } from "stream/promises";
 import * as vscode from "vscode";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
+import { extractTarGz } from "./tarExtract";
 import {
   clampThreshold,
   createLineReader,
@@ -761,12 +762,20 @@ export function probeNodeVersion(nodePath: string, timeoutMs = 5000): Promise<st
 const MODEL_VERSION = "1";
 /** Exported for tests/acoustic, which carries its own copy and checks it against this. */
 export const MODEL_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
-const MODEL_URL =
-  "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/" +
-  MODEL_NAME + ".tar.bz2";
+/**
+ * The model archive, from the `model-v1` release of the Wake Word repository.
+ *
+ * sherpa-onnx publishes this model as `.tar.bz2`; the release carries it
+ * repacked as `.tar.gz`, which extractTarGz() reads with Node.js's own zlib
+ * instead of a system `tar`. Every file inside is byte-identical to the
+ * sherpa-onnx archive, so MODEL_VERSION did not change with it.
+ */
+export const MODEL_URL =
+  "https://github.com/analyticsinmotion/wake-word/releases/download/model-v1/" +
+  MODEL_NAME + ".tar.gz";
 
 /**
- * SHA-256 of the model tarball at MODEL_URL (17,626,723 bytes).
+ * SHA-256 of the model archive at MODEL_URL (17,272,719 bytes).
  *
  * The download follows HTTP redirects to a CDN host and the result is fed
  * straight into the keyword spotter, so nothing but this digest stands
@@ -774,11 +783,11 @@ const MODEL_URL =
  * on the user's machine. Recompute and update this whenever MODEL_URL or
  * MODEL_VERSION changes:
  *
- *   curl -L -o model.tar.bz2 "<MODEL_URL>"
- *   shasum -a 256 model.tar.bz2      # certutil -hashfile model.tar.bz2 SHA256
+ *   curl -L -o model.tar.gz "<MODEL_URL>"
+ *   shasum -a 256 model.tar.gz      # certutil -hashfile model.tar.gz SHA256
  */
 export const MODEL_SHA256 =
-  "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a";
+  "2f3eccc60f6db87053f9fa32cd5749ff674e692520065e54ac0d86aeace731e0";
 
 /**
  * Redirect hops the model download will follow before giving up.
@@ -822,12 +831,12 @@ export function redirectLimitExceeded(hops: number, max: number = MAX_REDIRECTS)
 }
 
 /**
- * Throw unless the downloaded tarball matches the expected digest.
+ * Throw unless the downloaded archive matches the expected digest.
  *
  * Runs before extraction, so a tampered or truncated download never reaches
- * `tar` and never reaches the keyword spotter. The message carries a prefix
- * of each digest: enough to tell a corrupted download from a substituted one
- * in a bug report, without a wall of hex in a notification.
+ * the extractor and never reaches the keyword spotter. The message carries a
+ * prefix of each digest: enough to tell a corrupted download from a
+ * substituted one in a bug report, without a wall of hex in a notification.
  */
 export function verifyModelHash(actual: string, expected: string = MODEL_SHA256): void {
   if (actual.toLowerCase() !== expected.toLowerCase()) {
@@ -837,37 +846,6 @@ export function verifyModelHash(actual: string, expected: string = MODEL_SHA256)
         "the download may be corrupted or tampered with."
     );
   }
-}
-
-/**
- * The tar executable and arguments that unpack the model tarball into
- * `storageDir`.
- *
- * On Windows this is the tar.exe in System32 (bsdtar, shipped with Windows
- * since 10 version 1803), named by full path whenever it exists. A bare
- * `tar` resolves through PATH, where a GNU tar from Git for Windows or MSYS2
- * can come first. GNU tar does not read bzip2 itself: it runs an external
- * `bzip2`, and fails ("bzip2: Cannot exec") when none is on PATH. bsdtar
- * reads bzip2 in-process, provided its build includes bz2lib. Everywhere
- * else, and on a Windows without that file, it is `tar` from PATH.
- *
- * The arguments go to execFileSync, not a shell, so no path needs quoting.
- */
-export function modelExtractCommand(
-  tarballPath: string,
-  storageDir: string,
-  platform: string = process.platform,
-  systemRoot: string | undefined = process.env.SystemRoot,
-  exists: (p: string) => boolean = existsSync
-): { file: string; args: string[] } {
-  let file = "tar";
-  if (platform === "win32") {
-    const systemTar = path.win32.join(systemRoot || "C:\\Windows", "System32", "tar.exe");
-    if (exists(systemTar)) {
-      file = systemTar;
-    }
-  }
-  return { file, args: ["-xjf", tarballPath, "-C", storageDir] };
 }
 
 /** Where the model lives in global storage, and whether a usable copy is there. */
@@ -937,7 +915,7 @@ async function downloadModel(
       debugLog?.("Downloading model from " + MODEL_URL);
       progress.report({ message: "Connecting..." });
 
-      const tarballPath = path.join(storageDir, MODEL_NAME + ".tar.bz2");
+      const tarballPath = path.join(storageDir, MODEL_NAME + ".tar.gz");
 
       // Download tarball (following redirects — GitHub releases return 302 → CDN)
       await new Promise<void>((resolve, reject) => {
@@ -980,7 +958,7 @@ async function downloadModel(
 
       // Verify before extraction. The download followed redirects to a CDN
       // host and the files inside are loaded straight into the keyword
-      // spotter, so a bad tarball must never reach `tar`.
+      // spotter, so a bad archive must never reach the extractor.
       progress.report({ message: "Verifying..." });
       const actualHash = createHash("sha256").update(readFileSync(tarballPath)).digest("hex");
       debugLog?.("Model SHA-256: " + actualHash);
@@ -1000,17 +978,22 @@ async function downloadModel(
       progress.report({ message: "Extracting..." });
       debugLog?.("Extracting " + tarballPath);
 
-      // The tarball's entries are all under a single MODEL_NAME directory, so
-      // this lands on modelDir directly. The tarball is bzip2-compressed, so
-      // the tar found must be able to read bzip2 itself.
-      const extract = modelExtractCommand(tarballPath, storageDir);
+      // version.txt marks a complete extraction, and this one writes over the
+      // files of any earlier one in place. Remove it first, so an extraction
+      // that fails part way cannot leave half-written files that
+      // modelStatus() takes for a complete model.
+      if (existsSync(versionFile)) {
+        unlinkSync(versionFile);
+      }
+
+      // The archive's entries are all under a single MODEL_NAME directory, so
+      // this lands on modelDir directly. No system tar is involved: see
+      // tarExtract.ts.
       try {
-        execFileSync(extract.file, extract.args, { stdio: "pipe", windowsHide: true });
+        await extractTarGz(tarballPath, storageDir);
       } catch (err: unknown) {
-        const stderr = (err as { stderr?: Buffer | string } | null)?.stderr;
-        const detail =
-          (stderr ? stderr.toString().trim() : "") || (err instanceof Error ? err.message : String(err));
-        throw new Error(`Could not extract the speech model with ${extract.file}: ${detail}`, { cause: err });
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(`Could not extract the speech model: ${detail}`, { cause: err });
       }
 
       // Write version file
