@@ -9,6 +9,7 @@ import * as vscode from "vscode";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 import { extractTarGz } from "./tarExtract";
 import {
+  DEFAULT_THRESHOLD,
   clampThreshold,
   createLineReader,
   matchRoute,
@@ -36,7 +37,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   private _isListening = false;
   private _isPaused = false;
   private _killedIntentionally = false;
-  private currentThreshold = 0.3;
+  private currentThreshold = DEFAULT_THRESHOLD;
   private currentDebugMode = false;
   private retryCount = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -120,7 +121,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     return this._isPaused;
   }
 
-  async start(phrases: WakePhrase[], confidenceThreshold = 0.3, debugMode = false): Promise<void> {
+  async start(phrases: WakePhrase[], confidenceThreshold = DEFAULT_THRESHOLD, debugMode = false): Promise<void> {
     if (this._isListening) {
       return;
     }

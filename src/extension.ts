@@ -12,6 +12,7 @@ import {
 import {
   CALIBRATION_DURATION_MS,
   CONFIRMATION_WINDOW_MS,
+  DEFAULT_THRESHOLD,
   DETECTION_DEBOUNCE_MS,
   CalibrationDetection,
   PendingConfirmation,
@@ -101,15 +102,17 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
     handoff: "manual",
   },
   {
-    label: "Copilot",
-    phrase: "hey copilot",
+    // The command opens the editor's generic chat panel, whichever chat
+    // extension is active, so neither the label nor the phrase names one.
+    label: "Chat",
+    phrase: ["hey chat", "open chat"],
     command: "workbench.action.chat.open",
   },
   {
     label: "Terminal",
     // "Hey Computer", not "Computer": a single common English word triggers
     // on ordinary speech far too readily for an always-listening extension.
-    phrase: "hey computer",
+    phrase: ["hey computer", "open terminal"],
     command: "workbench.action.terminal.focus",
   },
 ];
@@ -449,7 +452,7 @@ function startListening() {
   }
   stopLockWatcher();
 
-  const threshold = clampThreshold(config.get<number>("confidenceThreshold", 0.3));
+  const threshold = clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD));
   const audioDevice = readAudioDevice(config);
   const deviceNote = audioDevice ? `, device="${audioDevice}"` : "";
   log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}${deviceNote}`);
@@ -874,7 +877,7 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
     );
     return;
   }
-  const threshold = clampThreshold(config.get<number>("confidenceThreshold", 0.3));
+  const threshold = clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD));
   const seconds = CALIBRATION_DURATION_MS / 1000;
 
   const prior = capturePriorState();
@@ -1095,7 +1098,7 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     modelPresent: model.present,
     modelSha256: MODEL_SHA256,
     audioDevice: readAudioDevice(config),
-    threshold: clampThreshold(config.get<number>("confidenceThreshold", 0.3)),
+    threshold: clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD)),
     cooldownSeconds: config.get<number>("cooldownSeconds", 30),
     confirmationMode: config.get<boolean>("confirmationMode", false),
     pauseOnFocusLoss: config.get<boolean>("pauseOnFocusLoss", false),

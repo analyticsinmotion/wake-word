@@ -3,7 +3,7 @@
 > Voice control for your editor with customizable wake word. Fully local, zero config.
 
 ## What it does
-Wake Word is a VS Code extension that listens for spoken wake phrases and triggers editor commands. Say "Hey Claude" and Claude Code opens. Say "Hey Copilot" and GitHub Copilot Chat opens. Say "Computer" and the terminal focuses.
+Wake Word is a VS Code extension that listens for spoken wake phrases and triggers editor commands. Say "Hey Claude" and Claude Code opens. Say "Hey Chat" and the editor's chat panel opens. Say "Hey Computer" and the terminal focuses.
 
 ## Key facts
 - Version: 0.5.1

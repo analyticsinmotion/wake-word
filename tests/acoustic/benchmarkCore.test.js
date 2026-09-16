@@ -202,8 +202,10 @@ describe('resolveKeywords', () => {
   it('unions the defaults with the fixture phrases, in that order, without duplicates', () => {
     expect(resolveKeywords(DEFAULT_PHRASES, ['hey claude', 'computer', 'computer'], null)).toEqual([
       'hey claude',
-      'hey copilot',
+      'hey chat',
+      'open chat',
       'hey computer',
+      'open terminal',
       'computer',
     ]);
   });
@@ -439,7 +441,7 @@ describe('formatReport', () => {
   const meta = {
     modelName: 'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01',
     threshold: 0.3,
-    keywords: ['hey claude', 'hey copilot', 'hey computer'],
+    keywords: ['hey claude', 'open chat', 'hey computer'],
     fixturesDir: 'tests/acoustic/fixtures',
   };
 
@@ -449,7 +451,7 @@ describe('formatReport', () => {
         positive('hey claude', 'hey claude', 1.5, 1.2),
         positive('hey claude', null),
         positive('hey computer', 'hey computer', 1.7, 1.3),
-        positive('hey copilot', 'hey computer'),
+        positive('open chat', 'hey computer'),
       ],
       [negative('silence-10s.wav', 10), negative('talk.wav', 30, 1)]
     );
@@ -457,13 +459,13 @@ describe('formatReport', () => {
       '=== Acoustic Benchmark ===',
       'Model:      sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01',
       'Threshold:  0.3',
-      'Keywords:   hey claude, hey copilot, hey computer',
+      'Keywords:   hey claude, open chat, hey computer',
       'Fixtures:   tests/acoustic/fixtures',
       '',
       'Positive (FRR):',
       '  hey claude:    1/2 detected (FRR: 50%)',
       '  hey computer:  1/1 detected (FRR: 0%)',
-      '  hey copilot:   0/1 detected (FRR: 100%, wrong phrase: 1)',
+      '  open chat:     0/1 detected (FRR: 100%, wrong phrase: 1)',
       '  all:           2/4 detected (FRR: 50%)',
       '',
       'Negative (FAR):',

@@ -203,8 +203,11 @@ async function main(config) {
 
   // Build keyword string (one BPE-tokenised phrase per line) and reverse map
   // ("HEY CLAUDE" -> "hey claude").
+  // The threshold goes on every keyword line, where it takes effect; the
+  // same value is passed as the global keywordsThreshold below.
+  const keywordThreshold = clampKeywordThreshold(threshold);
   since = Date.now();
-  const spec = buildKeywordSpec(phrases, (text) => sp.encodePieces(text));
+  const spec = buildKeywordSpec(phrases, (text) => sp.encodePieces(text), keywordThreshold);
   timed('tokenise', since);
   const phraseMap = spec.phraseMap;
 
@@ -242,7 +245,7 @@ async function main(config) {
       maxActivePaths: 4,
       numTrailingBlanks: 1,
       keywordsScore: 1.0,
-      keywordsThreshold: clampKeywordThreshold(threshold),
+      keywordsThreshold: keywordThreshold,
       keywords: spec.keywords,
     });
   } catch (err) {

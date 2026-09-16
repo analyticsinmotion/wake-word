@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#0d1117">
   <title>Wake Word | Voice Activation for Code Editors</title>
-  <meta name="description" content="Voice control for your editor with customizable wake word. Say 'Hey Claude' or 'Hey Copilot' and the right AI assistant opens. Fully local, zero config.">
+  <meta name="description" content="Voice control for your editor with customizable wake word. Say 'Hey Claude' and Claude opens, or 'Hey Chat' and the chat panel opens. Fully local, zero config.">
   <meta name="keywords" content="wake word, voice control, VS Code, voice activation, hands-free coding, speech recognition, accessibility">
   <link rel="canonical" href="https://wakeword.io/">
   <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -15,7 +15,7 @@
 
   <!-- Open Graph -->
   <meta property="og:title" content="Wake Word | Voice Activation for Code Editors">
-  <meta property="og:description" content="Voice control for your editor. Say 'Hey Claude' and Claude opens. Say 'Hey Copilot' and Copilot opens. Fully local, zero config.">
+  <meta property="og:description" content="Voice control for your editor. Say 'Hey Claude' and Claude opens. Say 'Hey Chat' and the chat panel opens. Fully local, zero config.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://wakeword.io/">
   <meta property="og:site_name" content="Wake Word">
@@ -41,7 +41,7 @@
   </script>
   <!-- Schema.org: HowTo -->
   <script type="application/ld+json">
-  {"@context":"https://schema.org","@type":"HowTo","name":"Set up Wake Word for VS Code","step":[{"@type":"HowToStep","name":"Install","text":"Install Wake Word from the VS Code Marketplace, Open VSX, or GitHub Releases."},{"@type":"HowToStep","name":"Consent","text":"Approve the microphone consent dialog on first run."},{"@type":"HowToStep","name":"Speak","text":"Say a wake phrase like 'Hey Claude' or 'Hey Copilot'."},{"@type":"HowToStep","name":"Handoff","text":"Wake Word releases the mic and opens the target assistant."},{"@type":"HowToStep","name":"Resume","text":"After a cooldown, listening resumes automatically."}]}
+  {"@context":"https://schema.org","@type":"HowTo","name":"Set up Wake Word for VS Code","step":[{"@type":"HowToStep","name":"Install","text":"Install Wake Word from the VS Code Marketplace, Open VSX, or GitHub Releases."},{"@type":"HowToStep","name":"Consent","text":"Approve the microphone consent dialog on first run."},{"@type":"HowToStep","name":"Speak","text":"Say a wake phrase like 'Hey Claude' or 'Hey Chat'."},{"@type":"HowToStep","name":"Handoff","text":"Wake Word releases the mic and opens the target assistant."},{"@type":"HowToStep","name":"Resume","text":"After a cooldown, listening resumes automatically."}]}
   </script>
 
   <!-- Prevent FOIT: set theme before paint -->
@@ -604,8 +604,8 @@
         <div class="routes-grid">
           <div class="route-card">
             <div class="route-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg></div>
-            <div class="route-phrase">"Hey Copilot"</div>
-            <div class="route-action">Opens GitHub Copilot Chat</div>
+            <div class="route-phrase">"Hey Chat"</div>
+            <div class="route-action">Opens the chat panel</div>
           </div>
           <div class="route-card">
             <div class="route-icon"><img src="assets/claude-color-logo.svg" alt="" width="24" height="24"></div>
@@ -614,7 +614,7 @@
           </div>
           <div class="route-card">
             <div class="route-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
-            <div class="route-phrase">"Computer"</div>
+            <div class="route-phrase">"Hey Computer"</div>
             <div class="route-action">Focuses the terminal</div>
           </div>
         </div>

@@ -261,29 +261,29 @@ describe('clampKeywordThreshold', () => {
     expect(clampKeywordThreshold(0.5)).toBe(0.5);
   });
 
-  it('clamps to the range sherpa-onnx accepts', () => {
-    expect(clampKeywordThreshold(0.01)).toBe(0.1);
-    expect(clampKeywordThreshold(-1)).toBe(0.1);
+  it('clamps to the range the setting allows', () => {
+    expect(clampKeywordThreshold(0.001)).toBe(0.01);
+    expect(clampKeywordThreshold(-1)).toBe(0.01);
     expect(clampKeywordThreshold(0.95)).toBe(0.9);
     expect(clampKeywordThreshold(100)).toBe(0.9);
   });
 
   it('keeps the bounds themselves', () => {
-    expect(clampKeywordThreshold(0.1)).toBe(0.1);
+    expect(clampKeywordThreshold(0.01)).toBe(0.01);
     expect(clampKeywordThreshold(0.9)).toBe(0.9);
   });
 
   it('defaults when the value is missing or unusable', () => {
-    expect(clampKeywordThreshold(undefined)).toBe(0.25);
-    expect(clampKeywordThreshold(null)).toBe(0.25);
-    expect(clampKeywordThreshold(NaN)).toBe(0.25);
-    expect(clampKeywordThreshold(0)).toBe(0.25);
+    expect(clampKeywordThreshold(undefined)).toBe(0.05);
+    expect(clampKeywordThreshold(null)).toBe(0.05);
+    expect(clampKeywordThreshold(NaN)).toBe(0.05);
+    expect(clampKeywordThreshold(0)).toBe(0.05);
   });
 
   it('never returns a value outside the accepted range', () => {
-    for (const input of [-1, 0, 0.1, 0.25, 0.9, 1, 99, NaN, undefined, null]) {
+    for (const input of [-1, 0, 0.001, 0.05, 0.25, 0.9, 1, 99, NaN, undefined, null]) {
       const result = clampKeywordThreshold(input);
-      expect(result).toBeGreaterThanOrEqual(0.1);
+      expect(result).toBeGreaterThanOrEqual(0.01);
       expect(result).toBeLessThanOrEqual(0.9);
     }
   });

@@ -82,7 +82,7 @@
 
 Say a wake phrase and the right AI assistant opens -- no clicking required.
 
-Say **"Hey Claude"** and Claude opens. Say **"Hey Copilot"** and Copilot opens. Say **"Hey Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
+Say **"Hey Claude"** and Claude opens. Say **"Hey Chat"** and the chat panel opens. Say **"Hey Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
 
 **Zero config. No API keys. No accounts.** The only prerequisite is Node.js 22 or later. Install and go.
 
@@ -141,9 +141,9 @@ These work out of the box with no configuration:
 
 | You say | What opens | Command |
 | --- | --- | --- |
-| "Hey Copilot" | GitHub Copilot Chat | `workbench.action.chat.open` |
 | "Hey Claude" | Claude Code | `claude-vscode.focus` |
-| "Hey Computer" | Terminal | `workbench.action.terminal.focus` |
+| "Hey Chat" or "Open Chat" | The editor's chat panel | `workbench.action.chat.open` |
+| "Hey Computer" or "Open Terminal" | Terminal | `workbench.action.terminal.focus` |
 
 The Claude route uses manual handoff (see [Handoff mode](#handoff-mode)): after it fires, listening stays paused until you click **Wake: Paused** in the status bar. The other two resume after the cooldown.
 
@@ -155,14 +155,14 @@ Add your own phrases in `settings.json`. Any spoken English phrase works:
 {
   "wakeWord.routes": [
     {
-      "label": "Copilot",
-      "phrase": "hey copilot",
-      "command": "workbench.action.chat.open"
-    },
-    {
       "label": "Claude",
       "phrase": "hey claude",
       "command": "claude-vscode.focus"
+    },
+    {
+      "label": "Codex",
+      "phrase": "hey codex",
+      "command": "chatgpt.newCodexPanel"
     },
     {
       "label": "Search",
@@ -179,6 +179,8 @@ Add your own phrases in `settings.json`. Any spoken English phrase works:
 ```
 
 The speech engine listens only for the phrases in your routes, so speech that matches none of them never fires anything.
+
+Detection of uncommon words varies. The speech model works best with common English words, so a phrase built on a product name or other unusual word, such as "hey codex", may be missed more often than the default phrases. If one is, run **Wake Word: Calibrate** to see what is heard, lower `wakeWord.confidenceThreshold`, or add an alias made of common words.
 
 ### Phrase aliases
 
@@ -265,7 +267,7 @@ The lock lives in the extension's global storage, which windows of the same edit
 | `wakeWord.enableOnStartup` | `true` | Start listening when the editor opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
 | `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, resume on regain |
-| `wakeWord.confidenceThreshold` | `0.3` | Minimum confidence score (0.1–0.9) for wake phrase detection |
+| `wakeWord.confidenceThreshold` | `0.05` | Trigger threshold (0.01 to 0.9) for wake phrase detection. Lower detects more easily, higher gives fewer false positives |
 | `wakeWord.confirmationMode` | `false` | Require the wake phrase twice within 5 seconds before triggering. Reduces false positives in noisy environments. |
 | `wakeWord.nodePath` | `""` | Path to Node.js executable. Leave empty to auto-detect. Set this if the engine cannot find Node.js (common with nvm or fnm). |
 | `wakeWord.audioDevice` | `""` | Microphone to use: a case-insensitive substring of the device name (e.g. `"USB"`) or a device index. Empty for the system default. |
@@ -336,8 +338,9 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 | Problem | Solution |
 | --- | --- |
 | Reporting a problem | Run **Wake Word: Show Diagnostics**, choose **Copy to Clipboard**, and paste the report into your issue. It has no audio, and your home directory is replaced with `~`. |
-| Engine starts but never detects phrases | Run **Wake Word: Calibrate** to see what the engine hears. Try lowering `wakeWord.confidenceThreshold` (e.g. `0.2`). Speak clearly and close to your microphone. |
-| Too many false positives | Enable `wakeWord.confirmationMode`, which requires the phrase twice within 5 seconds: say it, pause about three seconds, say it again. The status bar shows `Wake: Confirm` between the two. Also try raising `wakeWord.confidenceThreshold` (e.g. `0.5` or higher) and using longer, more distinctive wake phrases. |
+| Engine starts but never detects phrases | Run **Wake Word: Calibrate** to see what the engine hears. Try lowering `wakeWord.confidenceThreshold` (e.g. `0.02`). Speak clearly and close to your microphone. |
+| Some phrases detect better than others | The keyword spotter uses an open-vocabulary model that works best with common English words. Proper nouns and unusual words may need a lower confidence threshold: try lowering `wakeWord.confidenceThreshold` (e.g. `0.02`). The default phrases are tuned for reliable detection at the default of `0.05`. For a custom phrase that is still missed, run **Wake Word: Calibrate** and try an alias made of common words. |
+| Too many false positives | Enable `wakeWord.confirmationMode`, which requires the phrase twice within 5 seconds: say it, pause about three seconds, say it again. The status bar shows `Wake: Confirm` between the two. Also try raising `wakeWord.confidenceThreshold` (e.g. `0.1` to `0.3`) and using longer, more distinctive wake phrases. |
 | "Phrase warning" notification | One of your phrases is a single word, very short, a common word, or clashes with another route's phrase. The output channel says which and why. See [Phrase warnings](#phrase-warnings). |
 | Listening does not resume after a wake phrase | The route uses `handoff: "manual"`, which the default Claude route does. Click **Wake: Paused** in the status bar or run **Wake Word: Enable Listening**. Set `handoff` to `"timer"` on that route to resume after the cooldown instead. |
 | "Failed to start audio engine" | Ensure your microphone is connected and not in use by another application. Check your system sound settings. |
