@@ -24,7 +24,7 @@ const CHUNK_SAMPLES = 1600;
  * cannot be required from a plain Node script; tests/unit/benchmarkConstants
  * keeps this list in step with DEFAULT_ROUTES.
  */
-const DEFAULT_PHRASES = ['hey claude', 'hey copilot', 'hey computer'];
+const DEFAULT_PHRASES = ['hey claude', 'hey chat', 'open chat', 'hey computer', 'open terminal'];
 
 /**
  * The model directory the extension downloads, and the files it needs.
@@ -264,7 +264,7 @@ const USAGE = [
   'Usage: node tests/acoustic/run-benchmark.js [options]',
   '',
   '  --model-dir <path>   Model directory. Default: search each editor\'s global storage.',
-  '  --threshold <n>      Keyword threshold, 0.1 to 0.9. Default: 0.3.',
+  '  --threshold <n>      Keyword threshold, 0.01 to 0.9. Default: 0.05.',
   '  --phrases <list>     Comma-separated keyword list. Default: the default routes',
   '                       plus every phrase a positive fixture names.',
   '  --fixtures <dir>     Fixture root with positive/ and negative/. Default: tests/acoustic/fixtures.',

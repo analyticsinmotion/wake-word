@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.2] - 2026-09-16
+
+### Changed
+
+- Default chat route renamed from "Copilot" to "Chat" with phrases
+  "hey chat" and "open chat", since the command opens the editor's
+  generic chat panel regardless of which chat extension is active.
+- Terminal route gains "open terminal" as an alias alongside
+  "hey computer".
+- Default confidence threshold lowered from 0.3 to 0.05 to match the
+  boost scores. The setting now feeds directly into the per-phrase
+  trigger threshold on every keyword line. Its range is now 0.01 to
+  0.9. A `wakeWord.confidenceThreshold` set explicitly in settings.json
+  keeps its value, so remove it to use the new default.
+
+### Fixed
+
+- Keyword boost scores (3.0) and per-phrase trigger thresholds added
+  to every keyword line. Without boosting, uncommon words in
+  wake phrases were not reliably detected by the speech model.
+
 ## [0.13.1] - 2026-09-15
 
 ### Changed

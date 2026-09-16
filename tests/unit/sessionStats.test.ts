@@ -100,11 +100,11 @@ describe("formatSessionStats", () => {
     const stats = createSessionStats(T0);
     for (let i = 0; i < 2; i++) recordDetection(stats, "Terminal");
     for (let i = 0; i < 8; i++) recordDetection(stats, "Claude");
-    for (let i = 0; i < 4; i++) recordDetection(stats, "Copilot");
+    for (let i = 0; i < 4; i++) recordDetection(stats, "Chat");
     stats.engineStarts = 17;
     stats.cooldowns = 14;
     expect(formatSessionStats(stats, T0 + 342 * MINUTE)).toBe(
-      "Session: 342min, 14 detections (Claude: 8, Copilot: 4, Terminal: 2), " +
+      "Session: 342min, 14 detections (Claude: 8, Chat: 4, Terminal: 2), " +
         "0 errors, 17 engine starts, 14 cooldowns"
     );
   });

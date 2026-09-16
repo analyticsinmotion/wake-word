@@ -11,10 +11,14 @@ import { WakePhrase } from "./speechEngineInterface";
 /** Minimum gap between two accepted detections of any phrase. */
 export const DETECTION_DEBOUNCE_MS = 3000;
 
-/** Bounds enforced on `wakeWord.confidenceThreshold`. */
-export const MIN_THRESHOLD = 0.1;
+/**
+ * Bounds enforced on `wakeWord.confidenceThreshold`, and its default. The
+ * value becomes every keyword line's trigger threshold in the engine, and
+ * clampKeywordThreshold() in engine/lib/control.js repeats these numbers.
+ */
+export const MIN_THRESHOLD = 0.01;
 export const MAX_THRESHOLD = 0.9;
-export const DEFAULT_THRESHOLD = 0.3;
+export const DEFAULT_THRESHOLD = 0.05;
 
 // -- Phrases ------------------------------------------------------------
 
@@ -308,7 +312,7 @@ function plural(count: number, noun: string): string {
 /**
  * Render the session summary line:
  *
- *   Session: 342min, 14 detections (Claude: 8, Copilot: 4, Terminal: 2),
+ *   Session: 342min, 14 detections (Claude: 8, Chat: 4, Terminal: 2),
  *   0 errors, 17 engine starts, 14 cooldowns
  *
  * Phrases are listed most-detected first, ties in the order first heard.

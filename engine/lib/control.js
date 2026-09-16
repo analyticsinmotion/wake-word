@@ -55,11 +55,13 @@ function parseControlLine(line) {
 }
 
 /**
- * Clamp the keyword-spotting threshold into the range sherpa-onnx accepts.
- * Zero, NaN, and missing values fall back to 0.25.
+ * Clamp the keyword-spotting threshold into the range the
+ * `wakeWord.confidenceThreshold` setting allows, 0.01 to 0.9, matching
+ * clampThreshold() in src/wakeWordCore.ts. Zero, NaN, and missing values
+ * fall back to the setting's default, 0.05.
  */
 function clampKeywordThreshold(threshold) {
-  return Math.max(0.1, Math.min(0.9, threshold || 0.25));
+  return Math.max(0.01, Math.min(0.9, threshold || 0.05));
 }
 
 /**

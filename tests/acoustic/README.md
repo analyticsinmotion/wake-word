@@ -86,9 +86,10 @@ listening once and let the extension fetch it. To use
 a copy elsewhere, extract the tarball named in `src/sherpaEngine.ts` and
 pass its directory.
 
-- `--threshold` is the keyword threshold, 0.1 to 0.9, default 0.3, the
-  same default as `wakeWord.confidenceThreshold`. Run the benchmark at
-  several values to see how FRR and FAR trade off.
+- `--threshold` is the keyword threshold, 0.01 to 0.9, default 0.05, the
+  same range and default as `wakeWord.confidenceThreshold`. Like the
+  setting, it is written as every keyword line's trigger threshold. Run
+  the benchmark at several values to see how FRR and FAR trade off.
 - `--phrases` replaces the keyword list. By default it is the default
   routes' phrases plus every phrase a positive fixture names, and the
   report prints it, because FAR depends on what was loaded.
@@ -102,14 +103,14 @@ run before any are added.
 ```text
 === Acoustic Benchmark ===
 Model:      sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01
-Threshold:  0.3
-Keywords:   hey claude, hey copilot, hey computer
+Threshold:  0.05
+Keywords:   hey claude, hey chat, open chat, hey computer, open terminal
 Fixtures:   tests/acoustic/fixtures
 
 Positive (FRR):
+  hey chat:      9/10 detected (FRR: 10%)
   hey claude:    8/10 detected (FRR: 20%)
   hey computer:  10/10 detected (FRR: 0%)
-  hey copilot:   9/10 detected (FRR: 10%)
   all:           27/30 detected (FRR: 10%)
 
 Negative (FAR):

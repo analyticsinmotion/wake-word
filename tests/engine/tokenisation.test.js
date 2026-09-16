@@ -7,6 +7,17 @@ import {
 
 const B = WORD_BOUNDARY;
 
+/** The boost score and default trigger threshold a keyword line ends with. */
+const SUFFIX = ' :3.0 #0.05';
+
+/**
+ * Drop the ':' boost and '#' threshold fields from a keyword line, as
+ * sherpa-onnx does when it parses the list, leaving the pieces.
+ */
+function linePieces(line) {
+  return line.split(' ').filter((t) => !t.startsWith(':') && !t.startsWith('#'));
+}
+
 /**
  * A stand-in for SentencePieceProcessor.encodePieces that splits on spaces,
  * marks each word boundary the way the real BPE model does, and breaks longer
@@ -51,7 +62,7 @@ describe('decodePieces', () => {
   it('round-trips a multi-word phrase through the fake tokeniser', () => {
     expect(decodePieces(fakeEncodePieces('HEY CLAUDE'))).toBe('HEY CLAUDE');
     expect(decodePieces(fakeEncodePieces('COMPUTER'))).toBe('COMPUTER');
-    expect(decodePieces(fakeEncodePieces('  HEY   COPILOT  '))).toBe('HEY COPILOT');
+    expect(decodePieces(fakeEncodePieces('  OPEN   TERMINAL  '))).toBe('OPEN TERMINAL');
   });
 });
 
@@ -97,10 +108,55 @@ describe('buildKeywordSpec', () => {
     expect(spec.phraseMap['HEY CLAUDE']).toBe('hey claude');
   });
 
-  it('writes keyword lines as space-separated pieces', () => {
-    const spec = buildKeywordSpec([{ phrase: 'hey', label: 'X' }], fakeEncodePieces);
-    expect(spec.keywordLines).toEqual([B + 'HE Y']);
-    expect(spec.keywords).toBe(B + 'HE Y');
+  it('writes keyword lines as space-separated pieces with the boost and threshold', () => {
+    const spec = buildKeywordSpec([{ phrase: 'hey', label: 'X' }], fakeEncodePieces, 0.05);
+    expect(spec.keywordLines).toEqual([B + 'HE Y :3.0 #0.05']);
+    expect(spec.keywords).toBe(B + 'HE Y :3.0 #0.05');
+  });
+
+  it('writes the threshold it is given as the trigger threshold', () => {
+    for (const threshold of [0.01, 0.2, 0.35, 0.9]) {
+      const spec = buildKeywordSpec([{ phrase: 'hey', label: 'X' }], fakeEncodePieces, threshold);
+      expect(spec.keywordLines).toEqual([B + 'HE Y :3.0 #' + threshold]);
+    }
+  });
+
+  it('clamps the threshold into the setting range before writing it', () => {
+    const line = (threshold) =>
+      buildKeywordSpec([{ phrase: 'hey', label: 'X' }], fakeEncodePieces, threshold).keywordLines[0];
+    expect(line(0.001)).toBe(B + 'HE Y :3.0 #0.01');
+    expect(line(-1)).toBe(B + 'HE Y :3.0 #0.01');
+    expect(line(5)).toBe(B + 'HE Y :3.0 #0.9');
+  });
+
+  it('writes the default threshold when none or an unusable one is given', () => {
+    for (const threshold of [undefined, null, NaN, 0]) {
+      const spec = buildKeywordSpec([{ phrase: 'hey', label: 'X' }], fakeEncodePieces, threshold);
+      expect(spec.keywordLines).toEqual([B + 'HE Y :3.0 #0.05']);
+    }
+  });
+
+  it('ends every keyword line with the boost score and trigger threshold', () => {
+    const spec = buildKeywordSpec(
+      [
+        { phrase: 'hey claude', label: 'Claude' },
+        { phrase: ['hey chat', 'open chat'], label: 'Chat' },
+        { phrase: ['hey computer', 'open terminal'], label: 'Terminal' },
+      ],
+      fakeEncodePieces,
+      0.05
+    );
+    expect(spec.keywordLines).toHaveLength(5);
+    for (const line of spec.keywordLines) {
+      expect(line.endsWith(SUFFIX)).toBe(true);
+      expect(line.slice(0, -SUFFIX.length)).not.toMatch(/[:#]/);
+    }
+  });
+
+  it('keeps the boost and threshold out of the debug tokens and the lookup key', () => {
+    const spec = buildKeywordSpec([{ phrase: 'hey chat', label: 'Chat' }], fakeEncodePieces);
+    expect(spec.details[0].tokens).toBe(B + 'HE Y ' + B + 'CH AT');
+    expect(Object.keys(spec.phraseMap)).toEqual(['HEY CHAT']);
   });
 
   it('separates keyword lines with a newline, as sherpa-onnx expects', () => {
@@ -111,7 +167,7 @@ describe('buildKeywordSpec', () => {
       ],
       fakeEncodePieces
     );
-    expect(spec.keywords).toBe(B + 'HE Y' + '\n' + B + 'YO');
+    expect(spec.keywords).toBe(B + 'HE Y' + SUFFIX + '\n' + B + 'YO' + SUFFIX);
   });
 
   it('skips blank phrases', () => {
@@ -148,7 +204,7 @@ describe('buildKeywordSpec', () => {
     expect(spec.details).toEqual([
       {
         phrase: 'hey claude',
-        tokens: spec.keywordLines[0],
+        tokens: linePieces(spec.keywordLines[0]).join(' '),
         decoded: 'HEY CLAUDE',
       },
     ]);
@@ -179,13 +235,13 @@ describe('buildKeywordSpec', () => {
     const spec = buildKeywordSpec(
       [
         { phrase: 'hey claude', label: 'Claude' },
-        { phrase: 'hey copilot', label: 'Copilot' },
-        { phrase: 'computer', label: 'Terminal' },
+        { phrase: ['hey chat', 'open chat'], label: 'Chat' },
+        { phrase: ['hey computer', 'open terminal'], label: 'Terminal' },
       ],
       fakeEncodePieces
     );
     for (const line of spec.keywordLines) {
-      const decoded = decodePieces(line.split(' '));
+      const decoded = decodePieces(linePieces(line));
       expect(spec.phraseMap[decoded]).toBeDefined();
     }
   });

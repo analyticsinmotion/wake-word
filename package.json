@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -71,7 +71,7 @@
         "wakeWord.routes": {
           "type": "array",
           "default": [],
-          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Copilot, Hey Claude, Hey Computer).",
+          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Claude, Hey Chat, Hey Computer).",
           "items": {
             "type": "object",
             "required": [
@@ -142,10 +142,10 @@
         },
         "wakeWord.confidenceThreshold": {
           "type": "number",
-          "default": 0.3,
-          "minimum": 0.1,
+          "default": 0.05,
+          "minimum": 0.01,
           "maximum": 0.9,
-          "description": "Minimum confidence score (0.1 to 0.9) required to trigger a wake phrase. Lower values detect more but increase false positives."
+          "description": "Trigger threshold (0.01 to 0.9) for wake phrase detection. Lower values detect more easily but increase false positives. Higher values reduce false positives but may miss phrases. The default of 0.05 is tuned for the built-in speech model."
         },
         "wakeWord.confirmationMode": {
           "type": "boolean",

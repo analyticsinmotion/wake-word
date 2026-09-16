@@ -106,7 +106,8 @@ async function createSpotter(modelDir, keywords, threshold) {
 
   const spec = buildKeywordSpec(
     keywords.map((phrase) => ({ phrase, label: phrase })),
-    (text) => sp.encodePieces(text)
+    (text) => sp.encodePieces(text),
+    threshold
   );
   if (spec.keywordLines.length === 0) {
     throw new Error('No usable keywords');
@@ -239,7 +240,7 @@ async function main() {
     positives.map((p) => p.expected),
     opts.phrases
   );
-  const threshold = clampKeywordThreshold(opts.threshold === null ? 0.3 : opts.threshold);
+  const threshold = clampKeywordThreshold(opts.threshold === null ? 0.05 : opts.threshold);
 
   console.log(`Loading ${path.basename(modelDir)}...`);
   const spotter = await createSpotter(modelDir, keywords, threshold);
