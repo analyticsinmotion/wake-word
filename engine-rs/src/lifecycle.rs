@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::assets;
-use crate::config::{AudioDevice, Config};
+use crate::config::{AudioDevice, Config, PhraseMap};
 use crate::mic_errors::{mic_error_message, CaptureError};
 use crate::protocol::{parse_control_line, ControlLine, Reporter, Sink};
 
@@ -95,9 +95,11 @@ pub struct OpenRequest {
 /// Everything needed to build the keyword spotter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrepareRequest {
-    /// The configured phrases, as sent.
-    pub phrases: Vec<String>,
-    /// The clamped trigger threshold every keyword line carries.
+    /// The keyword lines from the config, as sent.
+    pub keyword_lines: Vec<String>,
+    /// Decoded keyword to configured phrase, from the config.
+    pub phrase_map: PhraseMap,
+    /// The clamped trigger threshold, passed as the spotter-wide threshold.
     pub threshold: f64,
     /// Where the extension unpacked the keyword spotting model.
     pub model_dir: String,
@@ -123,24 +125,19 @@ pub struct Prepared {
     pub listening_for: Vec<String>,
 }
 
-/// Why preparation failed. Each is fatal, with the Node engine's wording.
+/// Why preparation failed. Fatal, with the Node engine's wording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareError {
-    /// No configured phrase survived tokenising.
-    NoValidPhrases,
-    /// The transducer could not be loaded.
+    /// The transducer could not be loaded, or a keyword line is one it cannot
+    /// take.
     ModelLoad(String),
-    /// Anything else, the tokeniser model included.
-    Startup(String),
 }
 
 impl PrepareError {
     /// The text of the `ERROR:` line.
     pub fn message(&self) -> String {
         match self {
-            PrepareError::NoValidPhrases => "No valid phrases to detect".to_string(),
             PrepareError::ModelLoad(detail) => format!("Failed to load KWS model: {detail}"),
-            PrepareError::Startup(detail) => format!("Startup error: {detail}"),
         }
     }
 }
@@ -149,7 +146,7 @@ impl PrepareError {
 /// spotter that work produces. `spawn_prepare` and `spawn_open` return at once
 /// and the result arrives later as an [`Event`].
 pub trait Spawner: Send {
-    /// Load the tokeniser and the keyword spotter.
+    /// Load the keyword spotter.
     fn spawn_prepare(&mut self, request: PrepareRequest);
     /// Open a microphone and, once it is open, run it.
     fn spawn_open(&mut self, request: OpenRequest);
@@ -539,8 +536,26 @@ impl Lifecycle {
             "wake-word-engine starting, modelDir={}",
             config.model_dir
         ));
+
+        // The extension tokenises the phrases and sends the keyword lines and
+        // the phrase map; the engine cannot listen without either.
+        let Some(keyword_lines) = config.keyword_lines.clone() else {
+            self.fatal("Startup error: the config has no keywordLines, and the engine does not tokenise phrases itself");
+            return;
+        };
+        if keyword_lines.is_empty() {
+            self.fatal("No valid phrases to detect");
+            return;
+        }
+        if config.phrase_map.is_empty() {
+            self.fatal(
+                "Startup error: the config has no phraseMap, so no detection could be reported",
+            );
+            return;
+        }
         let request = PrepareRequest {
-            phrases: config.phrases.clone(),
+            keyword_lines,
+            phrase_map: config.phrase_map.clone(),
             threshold: config.threshold,
             model_dir: config.model_dir.clone(),
         };
@@ -797,9 +812,16 @@ mod tests {
         }
     }
 
-    const CONFIG: &str = r#"{"phrases":[{"phrase":"hey claude","label":"Claude"}],"threshold":0.05,"modelDir":"/models","debugMode":false,"audioDevice":""}"#;
-    const DEBUG_CONFIG: &str =
-        r#"{"phrases":[{"phrase":"hey claude"}],"modelDir":"/models","debugMode":true}"#;
+    const CONFIG: &str = r#"{"phrases":[{"phrase":"hey claude","label":"Claude"}],"threshold":0.05,"modelDir":"/models","debugMode":false,"audioDevice":"","keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
+    const DEBUG_CONFIG: &str = r#"{"modelDir":"/models","debugMode":true,"keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
+
+    /// A config line with one keyword line and its phrase map entry, plus
+    /// `fields`, which are JSON members without the braces.
+    fn config_with(fields: &str) -> String {
+        format!(
+            r#"{{"keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{{"HEY CLAUDE":"hey claude"}},{fields}}}"#
+        )
+    }
 
     struct Harness {
         lifecycle: Lifecycle,
@@ -1237,7 +1259,7 @@ mod tests {
     #[test]
     fn names_the_configured_device_when_the_open_cannot_find_it() {
         let mut harness = Harness::new();
-        harness.line(r#"{"phrases":[{"phrase":"hey claude"}],"audioDevice":"Desk Mic 2"}"#);
+        harness.line(&config_with(r#""audioDevice":"Desk Mic 2""#));
         harness.complete_prepare();
         harness.fail_open_with(
             "MICROPHONE_NOT_FOUND",
@@ -1406,10 +1428,10 @@ mod tests {
     #[test]
     fn opens_with_the_configured_device_and_paths() {
         let mut harness = Harness::new();
-        harness.line(
-            r#"{"phrases":[{"phrase":"hey claude"}],"audioDevice":"2","debugMode":true,
-                "vadModelPath":"/models/silero_vad.onnx","ortLibraryPath":"/ort/libonnxruntime.so"}"#,
-        );
+        harness.line(&config_with(
+            r#""audioDevice":"2","debugMode":true,
+                "vadModelPath":"/models/silero_vad.onnx","ortLibraryPath":"/ort/libonnxruntime.so""#,
+        ));
         harness.complete_prepare();
         let request = harness.requests().pop().expect("an open was requested");
         assert_eq!(request.device, AudioDevice::Index(2));
@@ -1432,15 +1454,39 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_preparation_failure_as_a_startup_error() {
-        let mut harness = Harness::new();
-        harness.line(CONFIG);
-        harness.fail_prepare(PrepareError::Startup("bpe.model is missing".to_string()));
-        assert_eq!(
-            harness.sent(),
-            ["ERROR:Startup error: bpe.model is missing"]
-        );
-        assert_eq!(harness.lifecycle.exit_code(), Some(1));
+    fn refuses_a_config_without_keyword_lines_before_preparing() {
+        for json in [
+            r#"{"phrases":[{"phrase":"hey claude"}],"modelDir":"/models","phraseMap":{"HEY CLAUDE":"hey claude"}}"#,
+            r#"{"keywordLines":"▁HE Y :3.0 #0.05","phraseMap":{"HEY":"hey"}}"#,
+        ] {
+            let mut harness = Harness::new();
+            harness.line(json);
+            assert_eq!(
+                harness.sent(),
+                ["ERROR:Startup error: the config has no keywordLines, and the engine does not tokenise phrases itself"],
+                "{json}"
+            );
+            assert_eq!(harness.lifecycle.exit_code(), Some(1));
+            assert_eq!(harness.prepares(), 0);
+        }
+    }
+
+    #[test]
+    fn refuses_a_config_without_a_phrase_map_before_preparing() {
+        for json in [
+            r#"{"keywordLines":["▁HE Y :3.0 #0.05"]}"#,
+            r#"{"keywordLines":["▁HE Y :3.0 #0.05"],"phraseMap":{}}"#,
+            r#"{"keywordLines":["▁HE Y :3.0 #0.05"],"phraseMap":{"HEY":7}}"#,
+        ] {
+            let mut harness = Harness::new();
+            harness.line(json);
+            assert_eq!(
+                harness.sent(),
+                ["ERROR:Startup error: the config has no phraseMap, so no detection could be reported"],
+                "{json}"
+            );
+            assert_eq!(harness.prepares(), 0);
+        }
     }
 
     #[test]
@@ -1463,42 +1509,54 @@ mod tests {
         let mut harness = Harness::new();
         harness.line(CONFIG);
         harness.line("stop");
-        harness.fail_prepare(PrepareError::Startup("bpe.model is missing".to_string()));
+        harness.fail_prepare(PrepareError::ModelLoad(
+            "/models/tokens.txt does not exist".to_string(),
+        ));
         assert_eq!(harness.sent(), ["RELEASED"]);
         assert_eq!(harness.lifecycle.exit_code(), Some(0));
     }
 
     #[test]
-    fn refuses_a_config_with_no_usable_phrase() {
-        // Whether a phrase is usable is only known once it has been
-        // tokenised, so the refusal comes from preparation, not from the
-        // config line.
-        let mut harness = Harness::new();
-        harness.line(r#"{"phrases":[{"phrase":42},{"phrase":"  "}],"modelDir":"/models"}"#);
-        assert_eq!(harness.prepares(), 1, "preparation still runs");
-        assert!(harness.sent().is_empty());
-
-        harness.fail_prepare(PrepareError::NoValidPhrases);
-        assert_eq!(harness.sent(), ["ERROR:No valid phrases to detect"]);
-        assert_eq!(harness.lifecycle.exit_code(), Some(1));
-        assert_eq!(harness.opens(), 0);
+    fn refuses_a_config_with_no_keyword_line_before_preparing() {
+        // The extension found no phrase it could tokenise. Lines that are not
+        // strings are no lines either.
+        for json in [
+            r#"{"keywordLines":[],"phraseMap":{"HEY CLAUDE":"hey claude"},"modelDir":"/models"}"#,
+            r#"{"keywordLines":[42,null],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#,
+        ] {
+            let mut harness = Harness::new();
+            harness.line(json);
+            assert_eq!(
+                harness.sent(),
+                ["ERROR:No valid phrases to detect"],
+                "{json}"
+            );
+            assert_eq!(harness.lifecycle.exit_code(), Some(1));
+            assert_eq!(harness.prepares(), 0);
+            assert_eq!(harness.opens(), 0);
+        }
     }
 
     #[test]
-    fn hands_preparation_the_phrases_the_threshold_and_the_model_directory() {
+    fn hands_preparation_the_keyword_lines_the_phrase_map_the_threshold_and_the_model_directory() {
         let mut harness = Harness::new();
         harness.line(
-            r#"{"phrases":[{"phrase":["Hey Claude","open claude"]},{"phrase":"hey chat"}],
+            r#"{"phrases":[{"phrase":["Hey Claude","open claude"]}],
+                "keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3","▁O P EN ▁C LA U DE :3.0 #0.3"],
+                "phraseMap":{"HEY CLAUDE":"hey claude","OPEN CLAUDE":"open claude"},
                 "threshold":0.3,"modelDir":"/models/kws"}"#,
         );
+        let mut phrase_map = PhraseMap::default();
+        phrase_map.insert("HEY CLAUDE".to_string(), "hey claude".to_string());
+        phrase_map.insert("OPEN CLAUDE".to_string(), "open claude".to_string());
         assert_eq!(
             harness.prepare_requests(),
             [PrepareRequest {
-                phrases: vec![
-                    "Hey Claude".to_string(),
-                    "open claude".to_string(),
-                    "hey chat".to_string()
+                keyword_lines: vec![
+                    "\u{2581}HE Y \u{2581}C LA U DE :3.0 #0.3".to_string(),
+                    "\u{2581}O P EN \u{2581}C LA U DE :3.0 #0.3".to_string(),
                 ],
+                phrase_map,
                 threshold: 0.3,
                 model_dir: "/models/kws".to_string(),
             }]
@@ -1642,17 +1700,6 @@ mod tests {
     fn writes_preparation_progress_in_debug_mode_as_it_arrives() {
         let mut harness = Harness::new();
         harness.line(DEBUG_CONFIG);
-        harness.preparing(PrepareProgress::Timing {
-            phase: "bpe-load",
-            elapsed_ms: 4,
-        });
-        harness.preparing(PrepareProgress::Timing {
-            phase: "tokenise",
-            elapsed_ms: 1,
-        });
-        harness.preparing(PrepareProgress::Debug(
-            "phrase: hey claude -> tokens: \u{2581}HE Y -> decoded: HEY".to_string(),
-        ));
         harness.preparing(PrepareProgress::Debug(
             "loading sherpa-onnx KWS model...".to_string(),
         ));
@@ -1663,9 +1710,6 @@ mod tests {
         assert_eq!(
             harness.sent()[1..],
             [
-                "DEBUG:Timing: bpe-load 4ms",
-                "DEBUG:Timing: tokenise 1ms",
-                "DEBUG:phrase: hey claude -> tokens: \u{2581}HE Y -> decoded: HEY",
                 "DEBUG:loading sherpa-onnx KWS model...",
                 "DEBUG:Timing: model-load 212ms",
             ]
@@ -1800,9 +1844,9 @@ mod tests {
     #[test]
     fn names_the_configured_device_in_the_opening_debug_line() {
         let mut harness = Harness::new();
-        harness.line(
-            r#"{"phrases":[{"phrase":"hey claude"}],"debugMode":true,"audioDevice":"Desk Mic 2"}"#,
-        );
+        harness.line(&config_with(
+            r#""debugMode":true,"audioDevice":"Desk Mic 2""#,
+        ));
         harness.complete_prepare();
         assert!(
             harness
@@ -1816,10 +1860,10 @@ mod tests {
     #[test]
     fn names_the_voice_activity_model_in_a_debug_line() {
         let mut harness = Harness::new();
-        harness.line(
-            r#"{"phrases":[{"phrase":"hey claude"}],"debugMode":true,
-                "vadModelPath":"/m/silero_vad.onnx","ortLibraryPath":"/o/ort.so"}"#,
-        );
+        harness.line(&config_with(
+            r#""debugMode":true,
+                "vadModelPath":"/m/silero_vad.onnx","ortLibraryPath":"/o/ort.so""#,
+        ));
         harness.complete_prepare();
         let expected = format!(
             "DEBUG:voice activity model={}, ONNX Runtime={}",

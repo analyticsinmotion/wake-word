@@ -1,6 +1,8 @@
 version: 2
 updates:
-  # Build and publish toolchain. Nothing here ships in the .vsix.
+  # Build and publish toolchain, and sentencepiece-js, the one package here that
+  # ships in the .vsix. Its pin must match the engine tree's;
+  # tests/unit/tokeniser.test.ts fails when they differ.
   - package-ecosystem: npm
     directory: "/"
     schedule:
@@ -12,7 +14,7 @@ updates:
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
 
-  # The engine tree — the only dependency tree that reaches end users.
+  # The engine tree, which ships in the .vsix.
   - package-ecosystem: npm
     directory: "/engine"
     schedule:

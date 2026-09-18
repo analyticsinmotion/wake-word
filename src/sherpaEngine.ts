@@ -6,8 +6,10 @@ import * as path from "path";
 import * as https from "https";
 import { pipeline } from "stream/promises";
 import * as vscode from "vscode";
+import { buildKeywordSpec, configPhrases, keywordTexts, skippedPhraseWarning } from "./keywords";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 import { extractTarGz } from "./tarExtract";
+import { Tokenised, readVocabulary, tokenise } from "./tokeniser";
 import {
   DEFAULT_THRESHOLD,
   clampThreshold,
@@ -22,7 +24,14 @@ import {
  *
  * Spawns audio-engine.js as a child process under system Node.js (not Electron),
  * so that native addons (decibri) load against the correct Node.js ABI.
- * sherpa-onnx (WASM) and sentencepiece-js (WASM) are also loaded in the child.
+ * sherpa-onnx (WASM) is also loaded in the child.
+ *
+ * Before spawning, the phrases are tokenised here, in a worker thread (see
+ * tokeniser.ts), and the config line carries the finished keyword lines and
+ * the decoded-to-spoken phrase map. A phrase with a piece the model's token
+ * table lacks is left out with a warning. audio-engine.js reads `phrases` and
+ * tokenises them itself; `keywordLines` and `phraseMap` serve an engine that
+ * takes its phrases already tokenised.
  *
  * The child lives across handoffs. pause() tells it to close the microphone
  * and resume() to reopen it, so the models load once per start instead of
@@ -163,6 +172,46 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       return;
     }
 
+    const texts = keywordTexts(phrases);
+    const tokenisingSince = Date.now();
+    let tokenised: Tokenised;
+    let vocabulary: Set<string>;
+    try {
+      [tokenised, vocabulary] = await Promise.all([tokenise(modelDir, texts), readVocabulary(modelDir)]);
+    } catch (err: unknown) {
+      if (generation === this.startGeneration) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.emit("error", new Error("Could not tokenise the wake phrases: " + message));
+      } else {
+        this.emit("debug", "Start abandoned: stopped while the phrases were tokenised");
+      }
+      return;
+    }
+    // The same race as the model check, over the tokenising.
+    if (generation !== this.startGeneration) {
+      this.emit("debug", "Start abandoned: stopped while the phrases were tokenised");
+      return;
+    }
+
+    // keywordTexts() walks the phrases the way buildKeywordSpec() does, so
+    // every text it asks for was tokenised above.
+    const pieces = new Map(texts.map((text, i) => [text, tokenised.pieces[i]]));
+    const spec = buildKeywordSpec(phrases, (text) => pieces.get(text) ?? [], safeThreshold, vocabulary);
+    if (debugMode) {
+      this.emit("debug", `Timing: bpe-load ${Math.max(0, tokenised.loadedAt - tokenisingSince)}ms`);
+      this.emit("debug", `Timing: tokenise ${Math.max(0, Date.now() - tokenised.loadedAt)}ms`);
+      for (const d of spec.details) {
+        this.emit("debug", `phrase: ${d.phrase} -> tokens: ${d.tokens} -> decoded: ${d.decoded}`);
+      }
+    }
+    for (const skipped of spec.skipped) {
+      this.emit("warning", skippedPhraseWarning(skipped));
+    }
+    if (spec.keywordLines.length === 0) {
+      this.emit("error", new Error("No valid phrases to detect"));
+      return;
+    }
+
     const nodePath = findSystemNode(this.nodePathOverride);
     const engineScript = path.join(path.dirname(__dirname), "engine", "audio-engine.js");
     this.emit("debug", `Spawning: ${nodePath} ${engineScript}`);
@@ -185,16 +234,17 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       /* child is gone; nothing left to say to it */
     });
 
-    // Send config as JSON line then leave stdin open (child reads more commands)
+    // Send config as JSON line then leave stdin open (child reads more commands).
+    // `phrases` leaves out what the keyword lines leave out, so a child that
+    // tokenises for itself listens for the same phrases.
     const config = {
-      phrases: phrases.map((p) => ({
-        phrase: p.phrase,
-        label: p.label,
-      })),
+      phrases: configPhrases(phrases, new Set(spec.skipped.map((s) => s.phrase))),
       threshold: safeThreshold,
       modelDir,
       debugMode,
       audioDevice: this.audioDevice,
+      keywordLines: spec.keywordLines,
+      phraseMap: spec.phraseMap,
     };
     proc.stdin?.write(JSON.stringify(config) + "\n");
 

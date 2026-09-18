@@ -1205,12 +1205,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sentencepiece-rust"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60f271394c88f9c091ea275db6ed526566bb40a232e64dfe702c66cf47c3dee6"
-
-[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1548,7 +1542,6 @@ name = "wake-word-engine"
 version = "0.1.0"
 dependencies = [
  "decibri",
- "sentencepiece-rust",
  "serde_json",
  "sherpa-onnx",
 ]

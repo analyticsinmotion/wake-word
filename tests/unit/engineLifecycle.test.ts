@@ -10,12 +10,13 @@ import { MockChildProcess } from "../mocks/childProcess";
  * that stop() and pause() must perform (the D2 fix), the pause and resume
  * commands that keep one child alive across handoffs, and the PAUSED and
  * RELEASED handshakes with their timeouts. `spawn` is replaced with a factory for
- * MockChildProcess, `fs` says the model is already downloaded, and the timers
- * are faked so a ten second backoff costs nothing.
+ * MockChildProcess, `fs` says the model is already downloaded, the tokeniser
+ * splits phrases into one piece per word against a token table without
+ * digits, and the timers are faked so a ten second backoff costs nothing.
  *
  * setImmediate is left real on purpose: `start()` is async because of the
- * model check, and one real macrotask turn is the simplest way to let its
- * promise chain settle after a faked timer has fired.
+ * model check and the tokenising, and one real macrotask turn is the simplest
+ * way to let its promise chain settle after a faked timer has fired.
  */
 
 const mocks = vi.hoisted(() => ({
@@ -23,6 +24,8 @@ const mocks = vi.hoisted(() => ({
   execSync: vi.fn(),
   existsSync: vi.fn(),
   readFileSync: vi.fn(),
+  tokenise: vi.fn(),
+  readVocabulary: vi.fn(),
 }));
 
 vi.mock("child_process", () => ({
@@ -37,6 +40,11 @@ vi.mock("fs", () => ({
   createWriteStream: vi.fn(),
   writeFileSync: vi.fn(),
   unlinkSync: vi.fn(),
+}));
+
+vi.mock("../../src/tokeniser", () => ({
+  tokenise: mocks.tokenise,
+  readVocabulary: mocks.readVocabulary,
 }));
 
 import { SherpaEngine, clearNodePathCache } from "../../src/sherpaEngine";
@@ -59,6 +67,32 @@ const PAUSE_TIMEOUT_MS = 500;
 const RETRY_DELAYS_MS = [2000, 5000, 10000];
 
 let spawned: MockChildProcess[] = [];
+
+/** The stand-in tokeniser: one piece per word, each marked as a word start. */
+function wordPieces(text: string): string[] {
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => "▁" + word);
+}
+
+/** A token table that has every piece without a digit in it. */
+class LettersOnly extends Set<string> {
+  has(piece: string): boolean {
+    return !/\d/.test(piece);
+  }
+}
+
+/** A promise the test settles by hand. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (err: Error) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (err: Error) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 function latest(): MockChildProcess {
   const proc = spawned[spawned.length - 1];
@@ -158,6 +192,13 @@ beforeEach(() => {
   mocks.existsSync.mockReturnValue(true);
   mocks.readFileSync.mockReset();
   mocks.readFileSync.mockReturnValue("1");
+  mocks.tokenise.mockReset();
+  mocks.tokenise.mockImplementation(async (_modelDir: string, texts: string[]) => ({
+    pieces: texts.map(wordPieces),
+    loadedAt: Date.now(),
+  }));
+  mocks.readVocabulary.mockReset();
+  mocks.readVocabulary.mockImplementation(async () => new LettersOnly());
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
 });
 
@@ -197,6 +238,22 @@ describe("start", () => {
     expect(config.modelDir).toMatch(/sherpa-onnx/);
     expect(config.debugMode).toBe(true);
     expect(proc.stdin.writable).toBe(true);
+  });
+
+  it("sends the keyword lines and the phrase map it built", async () => {
+    const { engine } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    const config = configLine(latest());
+    expect(config.keywordLines).toEqual([
+      "▁HEY ▁CLAUDE :3.0 #0.3",
+      "▁HEY ▁COMPUTER :3.0 #0.3",
+      "▁OPEN ▁TERMINAL :3.0 #0.3",
+    ]);
+    expect(config.phraseMap).toEqual({
+      "HEY CLAUDE": "hey claude",
+      "HEY COMPUTER": "hey computer",
+      "OPEN TERMINAL": "open terminal",
+    });
   });
 
   it("sends an empty audioDevice by default", async () => {
@@ -305,6 +362,171 @@ describe("start", () => {
     expect(mocks.spawn).not.toHaveBeenCalled();
     expect(events.errors).toHaveLength(1);
     expect(events.errors[0].message).toMatch(/^Model unavailable: /);
+  });
+});
+
+// ── tokenising the phrases ──────────────────────────────────
+
+describe("tokenising the phrases", () => {
+  const withRoute66: WakePhrase[] = [
+    { label: "Claude", phrase: "hey claude", command: "claude-vscode.focus" },
+    { label: "Roads", phrase: ["route 66", "open maps"], command: "maps.open" },
+  ];
+
+  it("tokenises each phrase once, with the model directory, before spawning", async () => {
+    const { engine } = makeEngine();
+    await engine.start([...ROUTES, { label: "Again", phrase: "Hey Claude", command: "x.y" }], 0.3, false);
+    expect(mocks.tokenise).toHaveBeenCalledTimes(1);
+    const [modelDir, texts] = mocks.tokenise.mock.calls[0];
+    expect(modelDir).toMatch(/sherpa-onnx/);
+    expect(texts).toEqual(["HEY CLAUDE", "HEY COMPUTER", "OPEN TERMINAL"]);
+    expect(mocks.readVocabulary).toHaveBeenCalledWith(modelDir);
+    expect(configLine(latest()).modelDir).toBe(modelDir);
+  });
+
+  it("skips a phrase the model cannot spell with a warning and listens for the rest", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(withRoute66, 0.05, false);
+    expect(events.warnings).toEqual([
+      'Phrase "route 66" skipped: "▁66" is not in the speech model\'s vocabulary. ' +
+        "Phrases can use the letters A to Z, apostrophes, and hyphens; write numbers as words.",
+    ]);
+    expect(events.errors).toEqual([]);
+    const config = configLine(latest());
+    expect(config.keywordLines).toEqual([
+      "▁HEY ▁CLAUDE :3.0 #0.05",
+      "▁OPEN ▁MAPS :3.0 #0.05",
+    ]);
+    expect(config.phraseMap).toEqual({ "HEY CLAUDE": "hey claude", "OPEN MAPS": "open maps" });
+    // Left out of the phrases as well, so a child that tokenises for itself
+    // listens for the same set.
+    expect(config.phrases).toEqual([
+      { phrase: "hey claude", label: "Claude" },
+      { phrase: ["open maps"], label: "Roads" },
+    ]);
+  });
+
+  it("reports no valid phrases without spawning when every phrase is skipped", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start([{ label: "Roads", phrase: ["route 66", "exit 12"], command: "maps.open" }], 0.3, false);
+    expect(events.warnings).toHaveLength(2);
+    expect(events.warnings[0]).toMatch(/^Phrase "route 66" skipped/);
+    expect(events.warnings[1]).toMatch(/^Phrase "exit 12" skipped/);
+    expect(events.errors.map((e) => e.message)).toEqual(["No valid phrases to detect"]);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(engine.isListening).toBe(false);
+  });
+
+  it("reports no valid phrases without spawning when no phrase is usable", async () => {
+    const { engine, events } = makeEngine();
+    const blank = [{ label: "Blank", phrase: ["", "   ", 42], command: "x.y" } as unknown as WakePhrase];
+    await engine.start(blank, 0.3, false);
+    expect(events.warnings).toEqual([]);
+    expect(events.errors.map((e) => e.message)).toEqual(["No valid phrases to detect"]);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it("reports a tokeniser that fails without spawning", async () => {
+    mocks.tokenise.mockRejectedValue(new Error("ENOENT: no such file, open '/m/bpe.model'"));
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    expect(events.errors.map((e) => e.message)).toEqual([
+      "Could not tokenise the wake phrases: ENOENT: no such file, open '/m/bpe.model'",
+    ]);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it("reports a token table that cannot be read without spawning", async () => {
+    mocks.readVocabulary.mockRejectedValue(new Error("ENOENT: no such file, open '/m/tokens.txt'"));
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    expect(events.errors.map((e) => e.message)).toEqual([
+      "Could not tokenise the wake phrases: ENOENT: no such file, open '/m/tokens.txt'",
+    ]);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it("abandons a start that is stopped while the phrases are tokenised", async () => {
+    const pending = deferred<{ pieces: string[][]; loadedAt: number }>();
+    mocks.tokenise.mockReturnValue(pending.promise);
+    const { engine, events } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    await flush();
+    expect(mocks.tokenise).toHaveBeenCalledTimes(1);
+    engine.stop();
+    pending.resolve({ pieces: [["▁HEY"], ["▁HEY"], ["▁OPEN"]], loadedAt: Date.now() });
+    await starting;
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(events.errors).toEqual([]);
+    expect(events.debug).toContain("Start abandoned: stopped while the phrases were tokenised");
+  });
+
+  it("says nothing of a tokeniser failure once the start has been stopped", async () => {
+    const pending = deferred<{ pieces: string[][]; loadedAt: number }>();
+    mocks.tokenise.mockReturnValue(pending.promise);
+    const { engine, events } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    await flush();
+    engine.stop();
+    pending.reject(new Error("worker failed"));
+    await starting;
+    expect(events.errors).toEqual([]);
+    expect(events.debug).toContain("Start abandoned: stopped while the phrases were tokenised");
+  });
+
+  it("lets a second start supersede one still tokenising", async () => {
+    const pending = deferred<{ pieces: string[][]; loadedAt: number }>();
+    mocks.tokenise.mockReturnValueOnce(pending.promise);
+    const { engine } = makeEngine();
+    const first = engine.start(ROUTES, 0.3, false);
+    await flush();
+    await engine.start(ROUTES, 0.5, false);
+    pending.resolve({ pieces: [["▁HEY"], ["▁HEY"], ["▁OPEN"]], loadedAt: Date.now() });
+    await first;
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(configLine(latest()).threshold).toBe(0.5);
+  });
+
+  it("logs the tokenising phases and each phrase's pieces in debug mode", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, true);
+    const lines = events.debug.filter((d) => !d.startsWith("Model already present"));
+    expect(lines.slice(0, 5)).toEqual([
+      expect.stringMatching(/^Timing: bpe-load \d+ms$/),
+      expect.stringMatching(/^Timing: tokenise \d+ms$/),
+      "phrase: hey claude -> tokens: ▁HEY ▁CLAUDE -> decoded: HEY CLAUDE",
+      "phrase: hey computer -> tokens: ▁HEY ▁COMPUTER -> decoded: HEY COMPUTER",
+      "phrase: open terminal -> tokens: ▁OPEN ▁TERMINAL -> decoded: OPEN TERMINAL",
+    ]);
+    expect(lines[5]).toMatch(/^Spawning: /);
+  });
+
+  it("times the model load from the start of tokenising", async () => {
+    const since = Date.now();
+    mocks.tokenise.mockImplementation(async (_modelDir: string, texts: string[]) => ({
+      pieces: texts.map(wordPieces),
+      loadedAt: since + 60_000,
+    }));
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, true);
+    const bpeLoad = events.debug.find((d) => d.startsWith("Timing: bpe-load"));
+    const elapsed = Number(/(\d+)ms$/.exec(bpeLoad ?? "")?.[1]);
+    expect(elapsed).toBeGreaterThanOrEqual(59_000);
+    expect(elapsed).toBeLessThanOrEqual(60_000);
+    // A load time in the future leaves nothing for the tokenise phase.
+    expect(events.debug).toContain("Timing: tokenise 0ms");
+  });
+
+  it("logs no tokenising lines outside debug mode", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    expect(events.debug.filter((d) => d.startsWith("Timing:") || d.startsWith("phrase:"))).toEqual([]);
+  });
+
+  it("warns about a skipped phrase outside debug mode too", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(withRoute66, 0.3, false);
+    expect(events.warnings).toHaveLength(1);
   });
 });
 
@@ -1149,7 +1371,7 @@ describe("start while paused", () => {
 // ── debug timing ────────────────────────────────────────────
 
 describe("debug timing", () => {
-  it("logs start-to-ready, pause-to-ack, and resume-to-ready in debug mode", async () => {
+  it("logs bpe-load, tokenise, start-to-ready, pause-to-ack, and resume-to-ready in debug mode", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, true);
     const proc = latest();
@@ -1159,10 +1381,12 @@ describe("debug timing", () => {
     engine.resume();
     proc.sendLine("READY");
     const timing = events.debug.filter((d) => d.startsWith("Timing:"));
-    expect(timing).toHaveLength(3);
-    expect(timing[0]).toMatch(/^Timing: start-to-ready \d+ms$/);
-    expect(timing[1]).toMatch(/^Timing: pause-to-ack \d+ms$/);
-    expect(timing[2]).toMatch(/^Timing: resume-to-ready \d+ms$/);
+    expect(timing).toHaveLength(5);
+    expect(timing[0]).toMatch(/^Timing: bpe-load \d+ms$/);
+    expect(timing[1]).toMatch(/^Timing: tokenise \d+ms$/);
+    expect(timing[2]).toMatch(/^Timing: start-to-ready \d+ms$/);
+    expect(timing[3]).toMatch(/^Timing: pause-to-ack \d+ms$/);
+    expect(timing[4]).toMatch(/^Timing: resume-to-ready \d+ms$/);
   });
 
   it("logs no timing outside debug mode", async () => {

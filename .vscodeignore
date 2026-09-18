@@ -5,6 +5,9 @@
 docs/**
 src/**
 node_modules/**
+# The extension host's one runtime dependency. The app-root-path package it
+# declares is never loaded by it, so it is not shipped.
+!node_modules/sentencepiece-js/**
 prototype/**
 .gitignore
 tsconfig.json

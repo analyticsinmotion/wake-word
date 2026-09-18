@@ -352,15 +352,21 @@ mod tests {
     #[test]
     fn decodes_a_multi_byte_character_split_across_chunks() {
         // The word boundary marker SentencePiece uses is three bytes, and a
-        // phrase can carry any character the user typed.
+        // keyword line carries one at the start of every word. Split inside it.
         let mut splitter = LineSplitter::new();
-        let bytes = "{\"phrases\":[{\"phrase\":\"héllo\"}]}\n".as_bytes();
+        let bytes = "{\"keywordLines\":[\"\u{2581}HE Y\"]}\n".as_bytes();
+        let marker = bytes
+            .iter()
+            .position(|byte| *byte == 0xe2)
+            .expect("the marker's first byte");
         let mut lines = Vec::new();
-        lines.extend(splitter.push(&bytes[..24]));
-        lines.extend(splitter.push(&bytes[24..]));
+        lines.extend(splitter.push(&bytes[..=marker]));
+        lines.extend(splitter.push(&bytes[marker + 1..]));
         assert_eq!(lines.len(), 1);
         match parse_control_line(&lines[0]) {
-            ControlLine::Config(config) => assert_eq!(config.phrases, vec!["héllo"]),
+            ControlLine::Config(config) => {
+                assert_eq!(config.keyword_lines, Some(vec!["\u{2581}HE Y".to_string()]))
+            }
             _ => panic!("expected a config line"),
         }
     }

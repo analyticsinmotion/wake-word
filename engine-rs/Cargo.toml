@@ -36,16 +36,12 @@ path = "src/main.rs"
 # an already extracted lib directory. See .cargo/config.toml for the C runtime
 # those libraries need on Windows.
 #
-# sentencepiece-rust: tokenises the wake phrases with the model's SentencePiece
-# file. Pure Rust with no dependencies of its own. The SentencePiece C++ library
-# is not used because it carries a copy of protobuf, and so does the ONNX
-# Runtime inside the sherpa-onnx static libraries: one executable cannot link
-# both.
+# The engine has no tokeniser: the extension tokenises the wake phrases and
+# sends the keyword lines in the config line.
 [dependencies]
 serde_json = "1"
 decibri = { version = "=6.3.0", default-features = false, features = ["capture", "vad", "gain", "ort-load-dynamic"] }
 sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["static"] }
-sentencepiece-rust = "=0.1.1"
 
 [profile.release]
 # This binary ships inside the .vsix, so size and start-up cost matter.

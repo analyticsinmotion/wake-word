@@ -191,5 +191,7 @@
     "typescript": "^5.3.3",
     "vitest": "^5.0.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "sentencepiece-js": "1.1.0"
+  }
 }

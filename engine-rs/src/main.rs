@@ -19,24 +19,22 @@
 //! - a signal thread turns SIGTERM and SIGINT, or their Windows console
 //!   equivalents, into the same shutdown the `stop` command causes.
 //!
-//! The tokeniser and the keyword spotting model load on a thread of their own,
-//! and each microphone gets one too, which opens it, reports back through the
-//! same channel, and then runs its capture loop, keyword spotting included,
-//! until it is closed. That is what lets a `pause` or a `stop` be answered
-//! while a load or an open is still in flight.
+//! The keyword spotting model loads on a thread of its own, and each
+//! microphone gets one too, which opens it, reports back through the same
+//! channel, and then runs its capture loop, keyword spotting included, until
+//! it is closed. That is what lets a `pause` or a `stop` be answered while a
+//! load or an open is still in flight.
 
 mod assets;
 mod capture;
 mod config;
 mod gate;
 mod hysteresis;
-mod keywords;
 mod lifecycle;
 mod mic_errors;
 mod protocol;
 mod samples;
 mod spotter;
-mod tokeniser;
 
 use std::io::{self, Read};
 use std::sync::mpsc::{self, Receiver, Sender};
