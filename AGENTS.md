@@ -13,6 +13,11 @@ npm run package            # Build .vsix package
 npm run benchmark          # Acoustic benchmark over tests/acoustic/fixtures (manual; needs the sherpa model)
 
 node engine/audio-engine.js --self-test   # Load the engine dependency tree and exit
+
+# Native engine packaging (after `cargo build --release` in engine-rs/)
+node engine-rs/scripts/stage.mjs --target win32-x64             # Engine, ONNX Runtime, Silero model into bin/
+npx vsce package --target win32-x64 -o ww.vsix                  # Package with bin/ included
+node scripts/verify-vsix.mjs --target win32-x64 --vsix ww.vsix --extract-to <dir>   # Check the package, run its self-test
 ```
 
 `--self-test` requires `engine/node_modules` (`cd engine && npm install`). It
@@ -62,7 +67,12 @@ wake-word/
     src/spotter.rs     # sherpa-onnx spotter configuration, decode loop, stream resets, the keyword line check, preparation
     src/mic_errors.rs  # decibri error codes to user-facing messages
     src/assets.rs      # Where ONNX Runtime and the Silero model are looked for
-    scripts/drive-protocol.mjs  # Pipes commands into the built binary and asserts the answers
+    scripts/drive-protocol.mjs  # Pipes commands into the built binary and asserts the answers; --no-microphone for CI
+    scripts/pinned-inputs.mjs   # Size and SHA-256 of the sherpa-onnx archives and the runtime files the release build downloads
+    scripts/prebuilt.mjs        # Fetches and checks the sherpa-onnx archive before the build, and the unpacked copy after it
+    scripts/stage.mjs           # Puts the binary, ONNX Runtime, the Silero model and their notices into bin/; signs on macOS
+    scripts/download.mjs        # Downloading and digest checks shared by those scripts
+  bin/                 # Staged by engine-rs/scripts/stage.mjs for packaging; gitignored, shipped in the .vsix
   tests/
     unit/              # TypeScript tests for the extension host code
     engine/            # JavaScript tests for engine/lib
@@ -74,13 +84,16 @@ wake-word/
       fixtures/              # positive/<phrase>-<nn>.wav and negative/*.wav; only silence-10s.wav is committed
   scripts/
     check-readme.js    # Lint-time check: blocks vsce-restricted SVGs in README.md
+    verify-vsix.mjs    # CI: checks a platform .vsix's contents and runs the packaged engine's self-test
+    fetch-model.mjs    # CI: downloads, verifies and extracts the keyword spotting model for tests
   eslint.config.mjs    # ESLint 10 flat config. Pins the ESLint 8 rule set; see the comments in the file
   dist/                # Compiled JS output (do not edit)
   .github/
-    dependabot.yml     # Dependency updates for both / and /engine
+    dependabot.yml     # Dependency updates for / and /engine (sentencepiece-js grouped across both) and /engine-rs
+    actions/engine-rs/action.yml  # Builds and stages the native engine for one target; used by both workflows
     workflows/
-      ci.yml           # CI: lint, compile, test, engine deps, binary prune, engine self-test, .vsix package
-      release.yml      # CI: build .vsix, publish to Marketplace and Open VSX
+      ci.yml           # CI: lint, compile, test with the model, engine deps, binary prune, engine self-test, native engine, .vsix package and check, drive script
+      release.yml      # CI: native engine, build and check .vsix, drive script, publish to Marketplace and Open VSX
 ```
 
 `extension.ts` owns all VS Code API interactions. `sherpaEngine.ts` implements `ISpeechEngine` on every platform. `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
@@ -135,7 +148,7 @@ The engine cancels a pending crash-backoff retry in `stop()`, `pause()`, and `st
 
 **Diagnostics.** `wakeWord.diagnostics` runs `runDiagnostics()`, which gathers the report and hands it to `formatDiagnostics()` in `wakeWordCore.ts`. It resolves the engine's Node.js with `findSystemNode()` and runs `probeNodeVersion()` (`node --version`, 5 s timeout, never rejects), checks the model with `modelStatus()` without downloading, reads the lock with `readLock()`/`describeLock()`, and describes the extension's state with `describeState()`. `formatDiagnostics()` notes an engine Node.js older than `MIN_ENGINE_NODE_MAJOR` (22) and passes every line through `redactHome()`, which replaces the home directory with `~` (whole path segments only; case-insensitive on Windows), because the report is meant to be pasted into a public issue. The lines are logged, and the notification offers Show Log or Copy to Clipboard. No audio and no network.
 
-**Rust engine (`engine-rs/`).** `engine-rs/` is a Rust implementation of the engine child process, a native binary that needs no system Node.js and no native addon ABI matching. It speaks the same stdin and stdout protocol, parses the same config line, runs the same lifecycle state machine, including a `pause` or `stop` that lands while the model is loading or the microphone is opening, and writes `DETECTED:<phrase>` for the configured phrases. It captures audio through the `decibri` crate (pinned `=6.3.0`, features `capture`, `vad`, `gain`, `ort-load-dynamic`) with the Node engine's options and error messages, and gates it with decibri's Silero VAD at a 0.5 threshold; the capture loop scores each chunk before gating it, so the chunk that trips the detector is not stranded behind the gate. ONNX Runtime (1.28 or later) and `silero_vad.onnx` are loaded at run time for the VAD, from `ortLibraryPath` and `vadModelPath` in the config, the `ORT_DYLIB_PATH` and `WAKE_WORD_VAD_MODEL` environment variables, or files beside the executable; `--self-test` reports which it found, and the version the linked sherpa-onnx library reports, without opening a microphone or loading a model. **`engine/audio-engine.js` under system Node.js is the engine the extension runs.** Nothing in `src/` spawns the binary, `engine-rs/**` is excluded from the `.vsix` by `.vscodeignore`, and `engine-rs/target/` is gitignored. Do not change `engine/` to suit the Rust engine: the two are kept side by side. `engine-rs/README.md` has the protocol, the build commands, and how to point a local build at ONNX Runtime and the models.
+**Rust engine (`engine-rs/`).** `engine-rs/` is a Rust implementation of the engine child process, a native binary that needs no system Node.js and no native addon ABI matching. It speaks the same stdin and stdout protocol, parses the same config line, runs the same lifecycle state machine, including a `pause` or `stop` that lands while the model is loading or the microphone is opening, and writes `DETECTED:<phrase>` for the configured phrases. It captures audio through the `decibri` crate (pinned `=6.3.0`, features `capture`, `vad`, `gain`, `ort-load-dynamic`) with the Node engine's options and error messages, and gates it with decibri's Silero VAD at a 0.5 threshold; the capture loop scores each chunk before gating it, so the chunk that trips the detector is not stranded behind the gate. ONNX Runtime (1.28 or later) and `silero_vad.onnx` are loaded at run time for the VAD, from `ortLibraryPath` and `vadModelPath` in the config, the `ORT_DYLIB_PATH` and `WAKE_WORD_VAD_MODEL` environment variables, or files beside the executable; `--self-test` reports which it found, and the version the linked sherpa-onnx library reports, without opening a microphone or loading a model. **`engine/audio-engine.js` under system Node.js is the engine the extension runs.** Nothing in `src/` spawns the binary. CI builds it and every platform `.vsix` carries it in `bin/`, beside ONNX Runtime and `silero_vad.onnx`, where it finds both with no configuration (see Boundaries for how it is built and checked); `engine-rs/**`, the source, is excluded from the `.vsix` by `.vscodeignore`, and `engine-rs/target/` and `bin/` are gitignored. Do not change `engine/` to suit the Rust engine: the two are kept side by side. `engine-rs/README.md` has the protocol, the build commands, and how to point a local build at ONNX Runtime and the models.
 
 Keyword spotting in the Rust engine is the `sherpa-onnx` crate, pinned `=1.13.8` to match the Node engine's `sherpa-onnx` package and bumped with it, with the `static` feature: the crate's build script downloads prebuilt static libraries for the target into `engine-rs/target/sherpa-onnx-prebuilt/`, and they carry their own ONNX Runtime, which is linked into the executable and is separate from the one decibri loads for the VAD. On Windows those libraries use the static C runtime, so `engine-rs/.cargo/config.toml` sets `+crt-static`; build from inside `engine-rs/` or that file is not read. `spotter_config()` in `spotter.rs` mirrors the `createKws()` call field for field and a unit test pins every value, `modeling_unit` and `bpe_vocab` included, although the keyword spotter uses neither: it creates a spotter with `bpe_vocab` naming an empty file or no file, so the engine does not require `bpe.model`. The engine has no tokeniser. It takes `keywordLines` and `phraseMap` from the config line, refuses a config without either (`Startup error:`) or with no lines (`No valid phrases to detect`) before anything loads, and passes the lines in memory. Before the model loads, `check_keyword_lines()` checks every line the way the library parses it: each word, split where C's `isspace()` splits, must be a token in `tokens.txt` or a `:` or `#` field whose number `std::stof` can read. The library does not report a bad line as an error: it ends the process on an unknown token (exit -1, with the reason only on stderr), and a field it cannot read throws a C++ exception across the FFI boundary that aborts the process. A NUL cannot pass the bindings' C string, a line break would make one entry two lines, and a line with no pieces names no keyword. The engine refuses each of these as `Failed to load KWS model:`, naming the phrase or the line. The extension already leaves unspottable phrases out; the check is there for any line that arrives anyway. The stream is reset after a detection and at the end of each speech segment, and replaced on `pause`.
 
@@ -270,6 +283,7 @@ Manual testing checklist:
 32. With the default routes, say each default phrase a few times: "Hey Claude", "Hey Chat", "Open Chat", "Hey Computer", and "Open Terminal". Each fires its route (the chat panel opens for both chat phrases, the terminal focuses for both terminal phrases). Then talk normally for a few minutes, including sentences with "chat", "computer", and "terminal" in them, and note any false triggers. Repeat on macOS or Linux.
 33. Add a route with the phrase `"route 66"` beside the defaults and enable listening. The output channel shows one `Phrase "route 66" skipped: "66" is not in the speech model's vocabulary` warning, no error notification appears, and the default phrases are detected. Then make it the only route: the error notification says "No valid phrases to detect".
 34. In the debug console of the window that launched the Extension Development Host, evaluate `process.listenerCount('uncaughtException')` and `process.listenerCount('unhandledRejection')`. Disable and enable listening three times and evaluate them again: both numbers are unchanged, because the tokeniser's listeners stay in its worker thread.
+35. Download a platform `.vsix` from a CI run and install it with **Extensions: Install from VSIX...**. In the installed extension's folder, `bin/` holds `wake-word-engine` (executable on macOS and Linux), the ONNX Runtime library, `silero_vad.onnx`, and the two notices, and `bin/wake-word-engine --self-test` prints `SELF-TEST:OK` with `ort=` and `vad-model=` naming files in that `bin/`. Do this on Windows, on macOS, and on a Linux older than the runner (for example Ubuntu 22.04 or a RHEL 8 derivative).
 
 ## Boundaries
 
@@ -282,6 +296,16 @@ Manual testing checklist:
 CI and release build four targets: `win32-x64`, `darwin-arm64`, `linux-x64`, and `linux-arm64`. Linux ARM64 runs on the `ubuntu-24.04-arm` runner label, not a variant of `ubuntu-latest`, which is x64; `decibri` ships a `linux-arm64-gnu` pre-built binary.
 
 Both workflows run on Node 22. After the engine install, each job deletes any `@decibri` platform package that does not match its build target and fails unless exactly one remains, so a `.vsix` never ships another platform's native binary. npm already installs only the package whose `os`/`cpu` fields match the runner; the step turns that into an assertion.
+
+Both workflows build the native engine on each target's own runner through `.github/actions/engine-rs`, then package, then run `scripts/verify-vsix.mjs` and the drive script against the unpacked `.vsix`; the release does this before anything is uploaded or published. The rules that keep that artifact runnable:
+
+- **NEVER** set `RUSTFLAGS` for the engine build or build it from outside `engine-rs/`: either loses `+crt-static` on Windows. The Windows build passes `-D linker-messages`, so LNK4098 (two C runtimes) fails it.
+- **NEVER** build the Linux engine directly on the runner. It is built inside `quay.io/pypa/manylinux_2_28_*` so it needs nothing newer than glibc 2.28 and GLIBCXX 3.4.25, the editor's own Linux floor; `verify-vsix.mjs` fails a binary or ONNX Runtime that needs more. Today's Node engine needs glibc 2.34 through decibri's addon.
+- **NEVER** let the sherpa-onnx build script download its own archive. `SHERPA_ONNX_ARCHIVE_DIR` points it at the archive `prebuilt.mjs` verified, and `prebuilt.mjs check` verifies the copy it unpacked. Bumping sherpa-onnx or the runtime files means new entries in `engine-rs/scripts/pinned-inputs.mjs`; `prebuilt.mjs` refuses a `Cargo.lock` version with no pinned archives.
+- **NEVER** add a `.vscodeignore` line that matches `bin/`. `verify-vsix.mjs` fails a package without the engine, its runtime files, or `node_modules/sentencepiece-js`.
+- The self-test exits 0 when ONNX Runtime or the Silero model is missing. Check what it reports, as `verify-vsix.mjs` does, never only its exit code.
+- The runtime files set floors of their own: the macOS ONNX Runtime needs macOS 14.0, and the Windows one imports the Visual C++ runtime (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`), which CI runners have and a fresh Windows install may not. The Node engine loads the same files.
+- CI has no microphone: the drive script runs with `--no-microphone`, which skips the scenarios that open one.
 
 **NEVER** ship a model download without a verified digest. The tarball is fetched over redirects to a CDN and loaded straight into the keyword spotter.
 

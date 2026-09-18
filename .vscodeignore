@@ -20,4 +20,6 @@ eslint.config.mjs
 test-*.js
 **/*.ts
 **/*.map
+# The native engine's source. The built engine and the runtime files it loads
+# are staged into bin/, which ships, so no line here may exclude bin/.
 engine-rs/**

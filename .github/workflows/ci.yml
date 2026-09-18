@@ -42,8 +42,33 @@ jobs:
       - name: Compile
         run: npm run compile
 
+      # The keyword spotting model the extension downloads, 17 MB, cached by
+      # its pinned digest. With it, the tests that check the tokeniser against
+      # the real model run instead of being skipped, and so do the engine
+      # scenarios below that load the spotter.
+      - name: Model cache key
+        id: model-key
+        shell: bash
+        run: node scripts/fetch-model.mjs --print-sha >> "$GITHUB_OUTPUT"
+
+      - name: Cache the keyword spotting model
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/kws-model
+          key: kws-model-${{ steps.model-key.outputs.sha256 }}
+
+      - name: Fetch the keyword spotting model
+        id: model
+        shell: bash
+        run: |
+          out=$(node scripts/fetch-model.mjs --dir "$RUNNER_TEMP/kws-model")
+          echo "$out"
+          echo "$out" | grep '^model-dir=' >> "$GITHUB_OUTPUT"
+
       - name: Test
         run: npm test
+        env:
+          WAKE_WORD_MODEL_DIR: ${{ steps.model.outputs.model-dir }}
 
       # The engine tree ships to users, and a broken engine dependency has
       # shipped a dead release before (v0.5.0).
@@ -82,7 +107,33 @@ jobs:
       - name: Smoke test engine
         run: node engine/audio-engine.js --self-test
 
+      # The native engine, built on this runner for this target, staged into
+      # bin/ with ONNX Runtime and the Silero model. See the action for the
+      # per-platform details.
+      - name: Build the native engine
+        uses: ./.github/actions/engine-rs
+        with:
+          target: ${{ matrix.target }}
+
       # Packaging is what actually broke twice. Building the artifact on the
       # pull request catches a vsce failure before it reaches a release.
       - name: Package VSIX
         run: npx vsce package --target ${{ matrix.target }} -o wake-word-${{ matrix.target }}-ci.vsix
+
+      # A package that builds is not a package that runs. This checks the
+      # artifact itself, then unpacks it and runs the engine's self-test from
+      # the unpacked copy.
+      - name: Verify VSIX
+        shell: bash
+        run: node scripts/verify-vsix.mjs --target ${{ matrix.target }} --vsix wake-word-${{ matrix.target }}-ci.vsix --extract-to "$RUNNER_TEMP/vsix"
+
+      # The protocol scenarios that need no microphone, against the packaged
+      # binary and the runtime files beside it. They include the spotter and
+      # the voice activity detector loading their two ONNX Runtimes in one
+      # process.
+      - name: Drive the packaged engine
+        shell: bash
+        env:
+          WAKE_WORD_MODEL_DIR: ${{ steps.model.outputs.model-dir }}
+          EXE: ${{ startsWith(matrix.target, 'win32') && 'wake-word-engine.exe' || 'wake-word-engine' }}
+        run: node engine-rs/scripts/drive-protocol.mjs --bin "$RUNNER_TEMP/vsix/extension/bin/$EXE" --no-microphone

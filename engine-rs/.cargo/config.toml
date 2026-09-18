@@ -2,8 +2,9 @@
 # the static C runtime (/MT). Rust's MSVC targets link the dynamic runtime by
 # default, and mixing the two puts both runtimes in one image: the linker
 # warns with LNK4098 and the process ends up with two heaps. Linking the static
-# runtime here keeps the executable on one, and also means it needs no Visual
-# C++ redistributable on the machine it runs on.
+# runtime here keeps the executable on one, and the executable itself imports
+# no C runtime DLL. The ONNX Runtime library it loads for voice activity
+# detection is a separate DLL, which does import one.
 #
 # Cargo reads this file only when it is run from this directory or below it,
 # and a RUSTFLAGS environment variable replaces these flags rather than adding
