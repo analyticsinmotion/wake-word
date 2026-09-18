@@ -13,7 +13,10 @@
 //! ```
 //!
 //! `phrase` is a string or an array of strings, `label` is never read by the
-//! engine, and every field is optional. The values are read one at a time out
+//! engine, and every field is optional. Two more optional fields,
+//! `vadModelPath` and `ortLibraryPath`, locate the Silero model and the ONNX
+//! Runtime library; the extension does not send them, and without them the
+//! engine searches the places `crate::assets` describes. The values are read one at a time out
 //! of a `serde_json::Value` rather than deserialised into a struct, because the
 //! Node engine coerces rather than rejects: a phrase that is not a string is
 //! skipped, a threshold of zero becomes the default, and a missing field is
@@ -64,17 +67,21 @@ pub struct Config {
     /// route grouping or the label: `buildKeywordSpec()` builds one keyword
     /// line per phrase and one flat lookup map.
     pub phrases: Vec<String>,
-    /// The clamped trigger threshold. Relay 3 writes it onto every keyword
-    /// line, which is where it takes effect; nothing reads it before then.
+    /// The clamped trigger threshold, the value every keyword line carries.
+    /// No keyword spotter reads it in this build.
     #[allow(dead_code)]
     pub threshold: f64,
-    /// Where the extension unpacked the KWS model. Relay 3 reads the model
-    /// files out of it; this relay only reports it in a debug line.
+    /// Where the extension unpacked the keyword spotting model. Reported in a
+    /// debug line; no keyword spotter reads it in this build.
     pub model_dir: String,
     /// Whether to emit `DEBUG:` lines.
     pub debug_mode: bool,
     /// The resolved `wakeWord.audioDevice` setting.
     pub audio_device: AudioDevice,
+    /// `vadModelPath`: the Silero voice activity model file, when given.
+    pub vad_model_path: Option<String>,
+    /// `ortLibraryPath`: the ONNX Runtime shared library, when given.
+    pub ort_library_path: Option<String>,
 }
 
 impl Config {
@@ -94,6 +101,8 @@ impl Config {
                 .to_string(),
             debug_mode: is_truthy(value.get("debugMode")),
             audio_device: resolve_audio_device(value.get("audioDevice")),
+            vad_model_path: optional_path(value.get("vadModelPath")),
+            ort_library_path: optional_path(value.get("ortLibraryPath")),
         }
     }
 }
@@ -175,6 +184,13 @@ pub fn resolve_audio_device(value: Option<&Value>) -> AudioDevice {
     }
 }
 
+/// An optional path field: a string that is not blank once trimmed. Anything
+/// else means the field was not given.
+fn optional_path(value: Option<&Value>) -> Option<String> {
+    let text = value.and_then(Value::as_str)?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// JavaScript truthiness, which is what `if (debugMode)` applies.
 fn is_truthy(value: Option<&Value>) -> bool {
     match value {
@@ -234,6 +250,8 @@ mod tests {
         assert_eq!(parsed.model_dir, "");
         assert!(!parsed.debug_mode);
         assert_eq!(parsed.audio_device, AudioDevice::Default);
+        assert_eq!(parsed.vad_model_path, None);
+        assert_eq!(parsed.ort_library_path, None);
     }
 
     #[test]
@@ -262,8 +280,8 @@ mod tests {
 
     #[test]
     fn keeps_a_phrase_exactly_as_sent() {
-        // Case folding and trimming belong to the keyword builder in Relay 3,
-        // which needs both the upper case form and the lower case one.
+        // Case folding and trimming belong to the keyword builder, which
+        // needs both the upper case form and the lower case one.
         let parsed = config(r#"{"phrases":[{"phrase":"  Hey Claude  "}]}"#);
         assert_eq!(parsed.phrases, vec!["  Hey Claude  "]);
     }
@@ -371,8 +389,36 @@ mod tests {
         assert_eq!(AudioDevice::Default.describe(), None);
         assert_eq!(AudioDevice::Index(1).describe().as_deref(), Some("1"));
         assert_eq!(
-            AudioDevice::Name("Blue Yeti".into()).describe().as_deref(),
-            Some("\"Blue Yeti\"")
+            AudioDevice::Name("Desk Mic 2".into()).describe().as_deref(),
+            Some("\"Desk Mic 2\"")
         );
+    }
+
+    #[test]
+    fn reads_the_vad_model_and_onnx_runtime_paths_when_given() {
+        let parsed = config(
+            r#"{"vadModelPath":" /opt/models/silero_vad.onnx ","ortLibraryPath":"/opt/ort/libonnxruntime.so"}"#,
+        );
+        assert_eq!(
+            parsed.vad_model_path.as_deref(),
+            Some("/opt/models/silero_vad.onnx")
+        );
+        assert_eq!(
+            parsed.ort_library_path.as_deref(),
+            Some("/opt/ort/libonnxruntime.so")
+        );
+    }
+
+    #[test]
+    fn treats_a_blank_or_non_string_path_as_not_given() {
+        for json in [
+            r#"{"vadModelPath":"","ortLibraryPath":"   "}"#,
+            r#"{"vadModelPath":5,"ortLibraryPath":null}"#,
+            r#"{"vadModelPath":["a"],"ortLibraryPath":{}}"#,
+        ] {
+            let parsed = config(json);
+            assert_eq!(parsed.vad_model_path, None, "{json}");
+            assert_eq!(parsed.ort_library_path, None, "{json}");
+        }
     }
 }

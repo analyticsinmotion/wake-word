@@ -11,7 +11,14 @@
  *
  *   node engine-rs/scripts/drive-protocol.mjs [--bin <path>]
  *
- * Exits 0 when every scenario passes, 1 otherwise.
+ * A scenario marked `needs: 'microphone'` opens the default microphone, so it
+ * needs one, plus ONNX Runtime and the Silero model where the engine looks for
+ * them: ORT_DYLIB_PATH and WAKE_WORD_VAD_MODEL, or both files beside the
+ * binary. One marked `needs: 'ort'` builds the voice activity detector but
+ * fails before a microphone opens. The script reads the engine's self-test
+ * first and skips, saying why, any scenario whose prerequisite is missing.
+ *
+ * Exits 0 when every scenario that ran passed, 1 otherwise.
  */
 
 import { spawn } from 'node:child_process';
@@ -26,6 +33,9 @@ const EXE = process.platform === 'win32' ? 'wake-word-engine.exe' : 'wake-word-e
 
 /** How long a single line or a process exit may take before the run fails. */
 const TIMEOUT_MS = 10000;
+
+/** An ONNX Runtime path that cannot exist, for the failure scenarios. */
+const MISSING_ORT = path.join(ENGINE_DIR, 'no-such-dir', 'onnxruntime-missing');
 
 function resolveBinary() {
   const flag = process.argv.indexOf('--bin');
@@ -57,7 +67,7 @@ function config(overrides = {}) {
 
 /** A running engine, with its stdout split into lines as they arrive. */
 class Engine {
-  constructor(binary, args = []) {
+  constructor(binary, args = [], env = {}) {
     this.lines = [];
     this.stderr = '';
     this.exitCode = null;
@@ -68,7 +78,10 @@ class Engine {
     // seen or it matches an old line and the next command is written early.
     this.consumed = 0;
 
-    this.child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.child = spawn(binary, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...env },
+    });
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', (chunk) => this.#absorb(chunk));
     this.child.stderr.setEncoding('utf8');
@@ -132,27 +145,60 @@ class Engine {
   }
 }
 
-/** Timing numbers vary run to run; the shape of the line does not. */
+/**
+ * Timing numbers vary run to run; the shape of the line does not. Lines about
+ * voice activity depend on what the microphone hears, so they are dropped.
+ */
 function normalise(lines) {
-  return lines.map((line) => line.replace(/ \d+ms$/, ' <n>ms'));
+  return lines
+    .filter((line) => !/^DEBUG:(VAD: |segment: |overruns: )/.test(line))
+    .map((line) => line.replace(/ \d+ms$/, ' <n>ms'));
+}
+
+/** Check each line against the pattern at the same position. */
+function matchShapes(lines, shapes) {
+  if (lines.length !== shapes.length) {
+    return `expected ${shapes.length} lines, got ${JSON.stringify(lines)}`;
+  }
+  const wrong = shapes.findIndex((shape, index) => !shape.test(lines[index]));
+  return wrong === -1 ? null : `line ${wrong + 1} was ${lines[wrong]}`;
+}
+
+/** Expect exactly one line, starting with `prefix`. */
+function oneLineStartingWith(prefix) {
+  return (lines) => {
+    if (lines.length !== 1) return `expected one line, got ${JSON.stringify(lines)}`;
+    return lines[0].startsWith(prefix) ? null : `line was ${lines[0]}`;
+  };
 }
 
 const scenarios = [
   {
-    name: 'self-test prints three lines and exits 0',
+    name: 'self-test prints six lines and exits 0',
     args: ['--self-test'],
     async drive() {},
-    expect: (lines) => {
-      if (lines.length !== 3) return `expected 3 lines, got ${lines.length}`;
-      if (lines[0] !== 'SELF-TEST:OK') return `first line was ${lines[0]}`;
-      if (!/^SELF-TEST:platform=\w+-\w+$/.test(lines[1])) return `second line was ${lines[1]}`;
-      if (!/^SELF-TEST:version=\d+\.\d+\.\d+$/.test(lines[2])) return `third line was ${lines[2]}`;
-      return null;
-    },
+    expect: (lines) =>
+      matchShapes(lines, [
+        /^SELF-TEST:OK$/,
+        /^SELF-TEST:platform=\w+-\w+$/,
+        /^SELF-TEST:version=\d+\.\d+\.\d+$/,
+        /^SELF-TEST:decibri=\d+\.\d+\.\d+$/,
+        /^SELF-TEST:ort=.+$/,
+        /^SELF-TEST:vad-model=.+$/,
+      ]),
     exit: 0,
   },
   {
+    name: 'self-test fails on an ONNX Runtime path that does not exist',
+    args: ['--self-test'],
+    env: { ORT_DYLIB_PATH: MISSING_ORT },
+    async drive() {},
+    expect: oneLineStartingWith('SELF-TEST:FAIL:Failed to start voice activity detection: '),
+    exit: 1,
+  },
+  {
     name: 'config, pause, resume, stop',
+    needs: 'microphone',
     async drive(engine) {
       engine.write(config() + '\n');
       await engine.waitFor('READY');
@@ -177,12 +223,13 @@ const scenarios = [
     exit: 0,
   },
   {
-    name: 'a stop during an in-flight open closes the device it produces',
+    name: 'a stop during an in-flight open closes the microphone it produces',
+    needs: 'microphone',
     async drive(engine) {
       engine.write(config({ debugMode: true }) + '\n');
       await engine.waitFor('READY');
-      // One chunk: the pause closes the device, the resume starts a new open,
-      // and the stop arrives while that open is still in flight.
+      // One chunk: the pause closes the microphone, the resume starts a new
+      // open, and the stop arrives while that open is still in flight.
       engine.write('pause\nresume\nstop\n');
     },
     expect: (lines) => {
@@ -191,9 +238,9 @@ const scenarios = [
       if (protocolLines.join('|') !== expected.join('|')) {
         return `expected ${expected.join(', ')}, got ${protocolLines.join(', ')}`;
       }
-      const closed = 'DEBUG:closed a capture device that arrived after a pause or a stop';
+      const closed = 'DEBUG:closed a microphone that arrived after a pause or a stop';
       if (!lines.includes(closed)) {
-        return `the device that arrived after the stop was not closed: ${JSON.stringify(lines)}`;
+        return `the microphone that arrived after the stop was not closed: ${JSON.stringify(lines)}`;
       }
       return null;
     },
@@ -201,6 +248,7 @@ const scenarios = [
   },
   {
     name: 'a config line split across three chunks is reassembled',
+    needs: 'microphone',
     async drive(engine) {
       const line = config();
       const first = line.slice(0, 20);
@@ -222,6 +270,7 @@ const scenarios = [
   },
   {
     name: 'blank lines and CRLF are tolerated',
+    needs: 'microphone',
     async drive(engine) {
       engine.write('\n\r\n   \n');
       engine.write(config() + '\r\n');
@@ -236,6 +285,7 @@ const scenarios = [
   },
   {
     name: 'closing stdin releases and exits 0',
+    needs: 'microphone',
     async drive(engine) {
       engine.write(config() + '\n');
       await engine.waitFor('READY');
@@ -249,15 +299,12 @@ const scenarios = [
     async drive(engine) {
       engine.write('{ not json\n');
     },
-    expect: (lines) => {
-      if (lines.length !== 1) return `expected one line, got ${JSON.stringify(lines)}`;
-      if (!lines[0].startsWith('ERROR:Invalid config JSON: ')) return `line was ${lines[0]}`;
-      return null;
-    },
+    expect: oneLineStartingWith('ERROR:Invalid config JSON: '),
     exit: 1,
   },
   {
     name: 'an unknown command is fatal',
+    needs: 'microphone',
     async drive(engine) {
       engine.write(config() + '\n');
       await engine.waitFor('READY');
@@ -281,7 +328,55 @@ const scenarios = [
     exit: 1,
   },
   {
+    name: 'an ONNX Runtime that cannot be loaded is reported before any microphone opens',
+    env: { ORT_DYLIB_PATH: MISSING_ORT },
+    async drive(engine) {
+      engine.write(config() + '\n');
+    },
+    expect: oneLineStartingWith(
+      'ERROR:Failed to start voice activity detection: decibri: failed to load ONNX Runtime'
+    ),
+    exit: 1,
+  },
+  {
+    name: 'a Silero model that does not exist is reported',
+    needs: 'ort',
+    async drive(engine) {
+      const vadModelPath = path.join(ENGINE_DIR, 'no-such-dir', 'silero_vad.onnx');
+      engine.write(config({ vadModelPath }) + '\n');
+    },
+    expect: oneLineStartingWith(
+      'ERROR:Failed to start voice activity detection: Failed to load Silero VAD model from '
+    ),
+    exit: 1,
+  },
+  {
+    name: 'a device name that matches no microphone names the setting',
+    needs: 'microphone',
+    async drive(engine) {
+      engine.write(config({ audioDevice: 'No Microphone Has This Name 7f3a' }) + '\n');
+    },
+    lines: [
+      'ERROR:No microphone matching "No Microphone Has This Name 7f3a" was found. ' +
+        'Check wakeWord.audioDevice against the input devices on this machine.',
+    ],
+    exit: 1,
+  },
+  {
+    name: 'a device index past the end of the list names the setting',
+    needs: 'microphone',
+    async drive(engine) {
+      engine.write(config({ audioDevice: '999' }) + '\n');
+    },
+    lines: [
+      'ERROR:Microphone index 999 is out of range. ' +
+        'Check wakeWord.audioDevice against the input devices on this machine.',
+    ],
+    exit: 1,
+  },
+  {
     name: 'SIGTERM releases and exits 0',
+    needs: 'microphone',
     skip: process.platform === 'win32' ? 'Windows has no POSIX signals' : null,
     async drive(engine) {
       engine.write(config() + '\n');
@@ -293,6 +388,7 @@ const scenarios = [
   },
   {
     name: 'SIGINT releases and exits 0',
+    needs: 'microphone',
     skip: process.platform === 'win32' ? 'Windows has no POSIX signals' : null,
     async drive(engine) {
       engine.write(config() + '\n');
@@ -304,25 +400,51 @@ const scenarios = [
   },
   {
     name: 'debug mode reports every phase',
+    needs: 'microphone',
     async drive(engine) {
-      engine.write(config({ debugMode: true, audioDevice: 'Blue Yeti' }) + '\n');
+      engine.write(config({ debugMode: true }) + '\n');
+      await engine.waitFor('READY');
+      engine.write('pause\n');
+      await engine.waitFor('PAUSED');
+      engine.write('resume\n');
       await engine.waitFor('READY');
       engine.write('stop\n');
     },
-    lines: [
-      'DEBUG:wake-word-engine starting, modelDir=/models',
-      'DEBUG:Timing: prepare <n>ms',
-      'DEBUG:opening capture device (device: "Blue Yeti")...',
-      'DEBUG:Timing: mic-open <n>ms',
-      'READY',
-      'RELEASED',
-    ],
+    expect: (lines) =>
+      matchShapes(lines, [
+        /^DEBUG:wake-word-engine starting, modelDir=\/models$/,
+        /^DEBUG:voice activity model=.+, ONNX Runtime=.+$/,
+        /^DEBUG:opening microphone\.\.\.$/,
+        /^DEBUG:Timing: mic-open <n>ms$/,
+        /^READY$/,
+        /^PAUSED$/,
+        /^DEBUG:Timing: resume-mic-open <n>ms$/,
+        /^READY$/,
+        /^RELEASED$/,
+      ]),
     exit: 0,
   },
 ];
 
+/**
+ * Read the self-test to learn whether ONNX Runtime and the Silero model can be
+ * found. Returns the reason each kind of scenario cannot run, or null.
+ */
+async function prerequisites(binary) {
+  const engine = new Engine(binary, ['--self-test']);
+  await engine.waitForExit();
+  const value = (key) => {
+    const prefix = `SELF-TEST:${key}=`;
+    const line = engine.lines.find((candidate) => candidate.startsWith(prefix));
+    return line ? line.slice(prefix.length) : 'not found';
+  };
+  const ort = value('ort') === 'not found' ? 'no ONNX Runtime found' : null;
+  const model = value('vad-model') === 'not found' ? 'no Silero model found' : null;
+  return { ort, microphone: ort ?? model };
+}
+
 async function runScenario(binary, scenario) {
-  const engine = new Engine(binary, scenario.args ?? []);
+  const engine = new Engine(binary, scenario.args ?? [], scenario.env ?? {});
   try {
     await scenario.drive(engine);
   } catch (err) {
@@ -353,13 +475,15 @@ async function runScenario(binary, scenario) {
 async function main() {
   const binary = resolveBinary();
   console.log(`Driving ${binary}\n`);
+  const missing = await prerequisites(binary);
 
   let failed = 0;
   let skipped = 0;
   for (const scenario of scenarios) {
-    if (scenario.skip) {
+    const skip = scenario.skip ?? (scenario.needs ? missing[scenario.needs] : null);
+    if (skip) {
       skipped++;
-      console.log(`skip  ${scenario.name} (${scenario.skip})`);
+      console.log(`skip  ${scenario.name} (${skip})`);
       continue;
     }
     const failure = await runScenario(binary, scenario);

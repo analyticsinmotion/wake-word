@@ -47,11 +47,17 @@ wake-word/
     keywords.js        # BPE piece decoding and the keyword list (boost and threshold per line) / lookup map
     control.js         # stdin line draining, config and command parsing, threshold clamp
     mic-errors.js      # decibri error codes to user-facing messages
-  engine-rs/           # Rust rewrite of the engine child process. Not wired in; see below
-    src/main.rs        # Argument handling, the stdin reader, signals, the event loop
+  engine-rs/           # Rust implementation of the engine child process. Not run by the extension; see below
+    src/main.rs        # Argument handling, the self-test, the stdin reader, signals, the event loop
     src/protocol.rs    # Chunk-safe line splitting, control-line parsing, the stdout vocabulary
     src/config.rs      # The config JSON shape, threshold clamp, audio device resolution
     src/lifecycle.rs   # The state machine and the capture session
+    src/capture.rs     # decibri microphone and Silero setup, the capture loop and its thread
+    src/hysteresis.rs  # Speech and silence transitions from the speech probability
+    src/gate.rs        # Pre-roll ring buffer and VAD gate
+    src/samples.rs     # The [-1, 1] sample clamp
+    src/mic_errors.rs  # decibri error codes to user-facing messages
+    src/assets.rs      # Where ONNX Runtime and the Silero model are looked for
     scripts/drive-protocol.mjs  # Pipes commands into the built binary and asserts the answers
   tests/
     unit/              # TypeScript tests for the extension host code
@@ -121,7 +127,7 @@ The engine cancels a pending crash-backoff retry in `stop()`, `pause()`, and `st
 
 **Diagnostics.** `wakeWord.diagnostics` runs `runDiagnostics()`, which gathers the report and hands it to `formatDiagnostics()` in `wakeWordCore.ts`. It resolves the engine's Node.js with `findSystemNode()` and runs `probeNodeVersion()` (`node --version`, 5 s timeout, never rejects), checks the model with `modelStatus()` without downloading, reads the lock with `readLock()`/`describeLock()`, and describes the extension's state with `describeState()`. `formatDiagnostics()` notes an engine Node.js older than `MIN_ENGINE_NODE_MAJOR` (22) and passes every line through `redactHome()`, which replaces the home directory with `~` (whole path segments only; case-insensitive on Windows), because the report is meant to be pasted into a public issue. The lines are logged, and the notification offers Show Log or Copy to Clipboard. No audio and no network.
 
-**Rust engine (`engine-rs/`).** `engine-rs/` is a Rust rewrite of the engine child process, being built in relays so the Node engine keeps working throughout. It removes the system Node.js prerequisite and the native addon ABI matching that goes with it: one static binary at `bin/wake-word-engine[.exe]` in place of `engine/audio-engine.js` plus `engine/node_modules`. The first relay covers the stdin and stdout protocol, the config parser, and the lifecycle state machine, including a `pause` or `stop` that lands while the capture device is still opening; there is no audio capture (Relay 2, decibri) and no keyword spotting (Relay 3, sherpa-onnx) yet, so it never writes a `DETECTED:` line. **`engine/audio-engine.js` under system Node.js is the active engine and stays that way until the switchover relay.** Nothing in `src/` spawns the binary, `engine-rs/**` is excluded from the `.vsix` by `.vscodeignore`, and `engine-rs/target/` is gitignored. Do not change `engine/` to suit the Rust port: the two run side by side until the switchover. `engine-rs/README.md` has the protocol, the build commands, and the relay plan.
+**Rust engine (`engine-rs/`).** `engine-rs/` is a Rust implementation of the engine child process, a native binary that needs no system Node.js and no native addon ABI matching. It speaks the same stdin and stdout protocol, parses the same config line, and runs the same lifecycle state machine, including a `pause` or `stop` that lands while the microphone is still opening. It captures audio through the `decibri` crate (pinned `=6.3.0`, features `capture`, `vad`, `gain`, `ort-load-dynamic`) with the Node engine's options and error messages, and gates it with decibri's Silero VAD, a 0.5 threshold, a 300 ms silence holdoff counted in samples, and a 500 ms pre-roll ring; the capture loop scores each chunk before gating it, so the chunk that trips the detector is not stranded behind the gate. No keyword spotter is attached, so it never writes a `DETECTED:` line. ONNX Runtime (1.28 or later) and `silero_vad.onnx` are loaded at run time, from `ortLibraryPath` and `vadModelPath` in the config, the `ORT_DYLIB_PATH` and `WAKE_WORD_VAD_MODEL` environment variables, or files beside the executable; `--self-test` reports which it found without opening a microphone. **`engine/audio-engine.js` under system Node.js is the engine the extension runs.** Nothing in `src/` spawns the binary, `engine-rs/**` is excluded from the `.vsix` by `.vscodeignore`, and `engine-rs/target/` is gitignored. Do not change `engine/` to suit the Rust engine: the two are kept side by side. `engine-rs/README.md` has the protocol, the build commands, and how to point a local build at ONNX Runtime and the model.
 
 **Open Settings.** `wakeWord.openSettings` opens the Settings editor filtered to `wakeWord`. The Off and Listening status bar tooltips are trusted `MarkdownString`s ending in a command link to it; the status bar click itself stays the toggle.
 
@@ -214,7 +220,7 @@ Manual testing checklist:
 7. Toggle, enable, disable, and reset consent commands all work
 8. Output panel shows "Wake Word" channel with timestamped logs
 9. Open a second window. Its status bar shows "Wake: Other window" and the first keeps listening. Close the first window; within about 10 s the second shows "Wake: Listening".
-10. Set `wakeWord.audioDevice` to part of a connected microphone's name. Confirm the engine restarts and the "Starting:" log line names the device. Set it to a name that matches nothing and confirm the error notification names that value.
+10. Set `wakeWord.audioDevice` to part of a connected microphone's name. Confirm the engine restarts and the "Starting:" log line names the device. Set it to a name that matches nothing and confirm the error notification names that value. On Windows, decibri names inputs by endpoint name alone (`Microphone`, `Microphone Array`), not by the device description Windows Settings shows in brackets, so use a name decibri reports, or an index where two inputs share a name.
 11. Change `wakeWord.audioDevice` after a few detections and confirm a "Session:" line with per-phrase counts appears in the output channel. The same line is written on deactivate, which in the Extension Development Host shows in the debug console.
 12. Run **Wake Word: Open Settings** from the command palette, then from the link in the status bar tooltip. Both open the Settings editor filtered to `wakeWord`.
 13. Enable `wakeWord.confirmationMode`. Say a wake phrase once: the status bar shows `Wake: Confirm "<label>"`, nothing fires, and after 5 s it returns to Listening. Say it, pause about three seconds, say it again: the second hearing fires the route and the log shows the "heard once" and "confirmed" lines. Disable the setting and confirm a single hearing fires immediately again.

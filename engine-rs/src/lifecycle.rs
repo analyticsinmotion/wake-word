@@ -7,42 +7,34 @@
 //!
 //! Everything here is driven by events and holds no threads of its own, so the
 //! cases that are hard to reach in a running process are reachable in a test:
-//! a `pause` or a `stop` that lands while the capture device is still opening,
-//! a `pause` that lands before the device has ever opened, and an event that
+//! a `pause` or a `stop` that lands while the microphone is still opening, a
+//! `pause` that lands before the microphone has ever opened, and an event that
 //! arrives after shutdown has started.
 //!
 //! Three flags carry the whole thing, and they are the Node engine's:
 //!
 //! - `stopping`: shutdown has begun, so every later command and event is
 //!   ignored. `RELEASED` is said once.
-//! - `capture_wanted`: whether the device should be open. A `pause` that
-//!   arrives before the first open clears it, and the device is then not
+//! - `capture_wanted`: whether the microphone should be open. A `pause` that
+//!   arrives before the first open clears it, and the microphone is then not
 //!   opened until a `resume` arrives.
 //! - `CaptureSession::wanted`: the same question for one open in flight. A
 //!   `pause` or `stop` during an open has already been acknowledged, so the
-//!   device that open eventually produces is closed instead of being kept.
+//!   microphone that open eventually produces is closed instead of being kept.
 //!
-//! This relay has no microphone and no keyword spotter. The device is a
-//! placeholder that opens after a short delay, which is what makes the
-//! in-flight cases real rather than theoretical. Relay 2 replaces it with
-//! decibri capture and Relay 3 adds the spotter; the state machine does not
-//! change when they do.
+//! Opening the microphone and running it happen elsewhere, behind the
+//! [`Spawner`] and [`CaptureDevice`] traits (`crate::capture` implements both
+//! over decibri). Each open carries an id, and everything a running microphone
+//! reports comes back tagged with it, so a line from a microphone that has
+//! since been closed is dropped here rather than acted on.
 
-use std::sync::mpsc::Sender;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Instant;
 
-use crate::config::Config;
+use crate::assets;
+use crate::config::{AudioDevice, Config};
+use crate::mic_errors::{mic_error_message, CaptureError};
 use crate::protocol::{parse_control_line, ControlLine, Reporter, Sink};
-
-/// How long the placeholder preparation step takes. Relay 3 replaces it with
-/// the module, BPE, tokenisation and model loads, which take seconds.
-const PREPARE_DELAY_MS: u64 = 20;
-
-/// How long the placeholder capture device takes to open. Long enough that a
-/// command written straight after the config lands while the open is in
-/// flight, which is the case the Node engine got wrong twice.
-const OPEN_DELAY_MS: u64 = 25;
 
 /// A monotonic millisecond clock, so a test can pin the timing lines.
 pub trait Clock: Send {
@@ -74,11 +66,29 @@ impl Clock for MonotonicClock {
     }
 }
 
-/// An open capture device. Relay 2 implements this over a decibri microphone.
+/// An open microphone.
 pub trait CaptureDevice: Send {
-    /// Close the device. Called at most once, and called even for a device
-    /// that arrived after the pause or stop that made it unwanted.
+    /// Close the microphone. Called at most once, and called even for a
+    /// microphone that arrived after the pause or stop that made it unwanted.
+    /// Once this returns, nothing from this microphone reaches the downstream
+    /// consumer.
     fn close(&mut self);
+}
+
+/// Everything needed to open one microphone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRequest {
+    /// Tags every [`Event::Capture`] this microphone produces.
+    pub id: u64,
+    /// The resolved `wakeWord.audioDevice` setting.
+    pub device: AudioDevice,
+    /// The Silero voice activity model file.
+    pub vad_model: PathBuf,
+    /// The ONNX Runtime library, when the config names one. Otherwise decibri
+    /// searches for it (see `crate::assets`).
+    pub ort_library: Option<PathBuf>,
+    /// Whether the capture loop should report debug lines.
+    pub debug: bool,
 }
 
 /// Starts the slow work the state machine waits on. Both calls return at once
@@ -86,8 +96,18 @@ pub trait CaptureDevice: Send {
 pub trait Spawner: Send {
     /// Load whatever the engine needs before capture can start.
     fn spawn_prepare(&mut self);
-    /// Open the capture device.
-    fn spawn_open(&mut self);
+    /// Open a microphone and, once it is open, run it.
+    fn spawn_open(&mut self, request: OpenRequest);
+}
+
+/// Something a running microphone has to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureReport {
+    /// A diagnostic line, written only in debug mode.
+    Debug(String),
+    /// The stream failed while running: the device went away, the driver
+    /// failed, or the voice activity detector could not score a chunk.
+    Failed(CaptureError),
 }
 
 /// Everything the state machine reacts to.
@@ -100,8 +120,10 @@ pub enum Event {
     Signal(&'static str),
     /// The preparation step finished.
     Prepared(Result<(), String>),
-    /// An open finished, with the device or the reason it failed.
-    CaptureOpened(Result<Box<dyn CaptureDevice>, String>),
+    /// An open finished, with the microphone or the reason it failed.
+    CaptureOpened(Result<Box<dyn CaptureDevice>, CaptureError>),
+    /// A report from the microphone opened with this id.
+    Capture { id: u64, report: CaptureReport },
 }
 
 /// What the state machine writes to and calls out to. Held apart from the
@@ -116,58 +138,72 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Report a capture failure. The message format is the fallback branch of
-    /// `micErrorMessage()` in `engine/lib/mic-errors.js`; Relay 2 brings the
-    /// rest of that mapping across with the typed decibri errors.
-    fn fail(&mut self, prefix: &str, message: &str) {
+    /// Report a fatal error. The first one wins.
+    fn fail(&mut self, message: String) {
         if self.fatal.is_none() {
-            self.fatal = Some(format!("{prefix}: {message}"));
+            self.fatal = Some(message);
         }
     }
 }
 
-/// The capture device's lifecycle: open, pause, resume, stop.
+/// How every microphone in this session is opened.
+struct CaptureOptions {
+    device: AudioDevice,
+    vad_model: PathBuf,
+    ort_library: Option<PathBuf>,
+    debug: bool,
+}
+
+/// The microphone's lifecycle: open, pause, resume, stop.
 ///
-/// Port of `CaptureSession` in `engine/lib/capture.js`. The engine process and
-/// its loaded models outlive a pause: `pause()` closes the device and says
-/// `PAUSED`, `resume()` opens a new one and says `READY`, and `stop()` closes
-/// it for good and says `RELEASED`.
+/// Port of `CaptureSession` in `engine/lib/capture.js`. The engine process
+/// outlives a pause: `pause()` closes the microphone and says `PAUSED`,
+/// `resume()` opens a new one and says `READY`, and `stop()` closes it for good
+/// and says `RELEASED`.
 pub struct CaptureSession {
+    options: CaptureOptions,
     device: Option<Box<dyn CaptureDevice>>,
     /// An open is in flight.
     opening: bool,
     /// Capture is wanted: `start()` and `resume()` set it, `pause()` and
     /// `stop()` clear it. An open that completes when it is clear closes the
-    /// device it produced.
+    /// microphone it produced.
     wanted: bool,
     stopped: bool,
+    /// The id given to the most recent open.
+    open_id: u64,
+    /// The id of the microphone currently held, whose reports are acted on.
+    current: Option<u64>,
     open_label: &'static str,
     open_began: u64,
 }
 
 impl CaptureSession {
-    fn new() -> CaptureSession {
+    fn new(options: CaptureOptions) -> CaptureSession {
         CaptureSession {
+            options,
             device: None,
             opening: false,
             wanted: false,
             stopped: false,
+            open_id: 0,
+            current: None,
             open_label: "mic-open",
             open_began: 0,
         }
     }
 
-    /// Open the device and say `READY`.
+    /// Open the microphone and say `READY`.
     fn start(&mut self, ctx: &mut Ctx) {
         self.capture(ctx, "mic-open");
     }
 
-    /// Reopen the device after a pause and say `READY`.
+    /// Reopen the microphone after a pause and say `READY`.
     fn resume(&mut self, ctx: &mut Ctx) {
         self.capture(ctx, "resume-mic-open");
     }
 
-    /// Close the device and say `PAUSED`.
+    /// Close the microphone and say `PAUSED`.
     ///
     /// Says `PAUSED` even when nothing was open: the acknowledgement is what
     /// the extension waits for before it hands the microphone to an assistant,
@@ -178,12 +214,10 @@ impl CaptureSession {
         }
         self.wanted = false;
         self.close();
-        // Relay 3 resets the spotter here, so nothing heard before the pause
-        // can complete a phrase after it.
         ctx.out.paused();
     }
 
-    /// Close the device for good and say `RELEASED`.
+    /// Close the microphone for good and say `RELEASED`.
     fn stop(&mut self, ctx: &mut Ctx) {
         if self.stopped {
             return;
@@ -204,16 +238,23 @@ impl CaptureSession {
             return;
         }
         self.opening = true;
+        self.open_id += 1;
         self.open_label = label;
         self.open_began = ctx.clock.now_ms();
-        ctx.spawner.spawn_open();
+        ctx.spawner.spawn_open(OpenRequest {
+            id: self.open_id,
+            device: self.options.device.clone(),
+            vad_model: self.options.vad_model.clone(),
+            ort_library: self.options.ort_library.clone(),
+            debug: self.options.debug,
+        });
     }
 
     /// An open finished.
-    fn opened(&mut self, ctx: &mut Ctx, result: Result<Box<dyn CaptureDevice>, String>) {
+    fn opened(&mut self, ctx: &mut Ctx, result: Result<Box<dyn CaptureDevice>, CaptureError>) {
         if !self.opening {
-            // No open was in flight, so this device belongs to nothing. Close
-            // it rather than leak it.
+            // No open was in flight, so this microphone belongs to nothing.
+            // Close it rather than leak it.
             if let Ok(mut device) = result {
                 device.close();
             }
@@ -222,25 +263,30 @@ impl CaptureSession {
         self.opening = false;
 
         match result {
-            Err(message) => {
+            Err(error) => {
                 // A pause or stop during the open has been acknowledged and
                 // the next resume tries again; the failure changes nothing now.
                 if self.wanted && !self.stopped {
-                    ctx.fail("Failed to open microphone", &message);
+                    ctx.fail(mic_error_message(
+                        &error,
+                        "Failed to open microphone",
+                        &self.options.device,
+                    ));
                 }
             }
             Ok(mut device) => {
                 if !self.wanted || self.stopped {
-                    // The pause or stop that made this device unwanted was
+                    // The pause or stop that made this microphone unwanted was
                     // answered while the open was still in flight. Closing it
-                    // here is what keeps the device from being left open on a
-                    // process that is on its way out.
+                    // here is what keeps it from being left open on a process
+                    // that is on its way out.
                     device.close();
                     ctx.out
-                        .debug("closed a capture device that arrived after a pause or a stop");
+                        .debug("closed a microphone that arrived after a pause or a stop");
                     return;
                 }
                 self.device = Some(device);
+                self.current = Some(self.open_id);
                 let elapsed = ctx.clock.now_ms().saturating_sub(self.open_began);
                 ctx.out.timing(self.open_label, elapsed);
                 ctx.out.ready();
@@ -248,7 +294,32 @@ impl CaptureSession {
         }
     }
 
+    /// A running microphone reported something. Only the microphone currently
+    /// held is listened to: a report from one that has been closed, or that
+    /// was closed on arrival, is dropped.
+    fn report(&mut self, ctx: &mut Ctx, id: u64, report: CaptureReport) {
+        if self.current != Some(id) {
+            return;
+        }
+        match report {
+            CaptureReport::Debug(line) => ctx.out.debug(&line),
+            CaptureReport::Failed(error) => {
+                // The stream has already ended; closing lets its capture
+                // thread finish before the process exits.
+                self.close();
+                ctx.fail(mic_error_message(
+                    &error,
+                    "Microphone error",
+                    &self.options.device,
+                ));
+            }
+        }
+    }
+
     fn close(&mut self) {
+        // Cleared before the close: anything this microphone reports from here
+        // on, including during the close itself, belongs to a closed session.
+        self.current = None;
         if let Some(mut device) = self.device.take() {
             device.close();
         }
@@ -263,11 +334,10 @@ pub struct Lifecycle {
     /// Shutdown has started; every later command and event is ignored.
     stopping: bool,
     /// Whether capture should be open once the engine is ready. A pause that
-    /// arrives while preparation is still running clears it, so the device is
-    /// not opened until a resume. The extension only pauses an engine that has
-    /// said READY, so this is defensive.
+    /// arrives while preparation is still running clears it, so the
+    /// microphone is not opened until a resume. The extension only pauses an
+    /// engine that has said READY, so this is defensive.
     capture_wanted: bool,
-    prepare_began: u64,
     exit_code: Option<i32>,
 }
 
@@ -284,7 +354,6 @@ impl Lifecycle {
             session: None,
             stopping: false,
             capture_wanted: true,
-            prepare_began: 0,
             exit_code: None,
         }
     }
@@ -296,13 +365,13 @@ impl Lifecycle {
     }
 
     /// True while an open is in flight. The event loop uses this to wait a
-    /// moment for the device on the way out, so it can be closed rather than
-    /// left to the operating system.
+    /// moment for the microphone on the way out, so it can be closed rather
+    /// than left to the operating system.
     pub fn open_in_flight(&self) -> bool {
         self.session.as_ref().is_some_and(|session| session.opening)
     }
 
-    /// True while a capture device is open and held.
+    /// True while a microphone is open and held.
     #[cfg(test)]
     fn holds_device(&self) -> bool {
         self.session
@@ -332,6 +401,7 @@ impl Lifecycle {
             }
             Event::Prepared(result) => self.on_prepared(result),
             Event::CaptureOpened(result) => self.on_opened(result),
+            Event::Capture { id, report } => self.on_capture(id, report),
         }
         self.settle();
     }
@@ -356,8 +426,8 @@ impl Lifecycle {
         }
         if self.config.is_some() {
             // The Node engine calls main() again for a second config line,
-            // which loads a second model and opens a second capture device
-            // while the first is still open and running. The extension sends
+            // which loads a second model and opens a second microphone while
+            // the first is still open and running. The extension sends
             // exactly one config line per child, so that path is unreachable
             // from the host, and ignoring it is the safe reading.
             self.ctx
@@ -371,7 +441,6 @@ impl Lifecycle {
             "wake-word-engine starting, modelDir={}",
             config.model_dir
         ));
-        self.prepare_began = self.ctx.clock.now_ms();
         self.config = Some(config);
         self.ctx.spawner.spawn_prepare();
     }
@@ -390,12 +459,9 @@ impl Lifecycle {
             return;
         }
 
-        let elapsed = self.ctx.clock.now_ms().saturating_sub(self.prepare_began);
-        self.ctx.out.timing("prepare", elapsed);
-
         // A stop during preparation has already said RELEASED, and a fatal
-        // error has already said ERROR. Opening the capture device now would
-        // only hold that exit up.
+        // error has already said ERROR. Opening the microphone now would only
+        // hold that exit up.
         if self.finished() {
             return;
         }
@@ -403,26 +469,36 @@ impl Lifecycle {
         let Some(config) = self.config.as_ref() else {
             return;
         };
-        let no_phrases = config.phrases.is_empty();
-        let device = config.audio_device.describe();
-
-        if no_phrases {
+        if config.phrases.is_empty() {
             self.fatal("No valid phrases to detect");
             return;
         }
 
-        self.session = Some(CaptureSession::new());
+        let options = CaptureOptions {
+            device: config.audio_device.clone(),
+            vad_model: assets::vad_model_path(config.vad_model_path.as_deref()),
+            ort_library: config.ort_library_path.as_ref().map(PathBuf::from),
+            debug: config.debug_mode,
+        };
+        let ort = assets::ort_location(config.ort_library_path.as_deref());
+        let device = config.audio_device.describe();
+        self.ctx.out.debug(&format!(
+            "voice activity model={}, ONNX Runtime={}",
+            options.vad_model.display(),
+            ort.describe()
+        ));
+        self.session = Some(CaptureSession::new(options));
 
         if !self.capture_wanted {
             self.ctx
                 .out
-                .debug("ready; paused before the capture device opened, waiting for resume");
+                .debug("ready; paused before the microphone opened, waiting for resume");
             return;
         }
 
         let opening = match device {
-            Some(described) => format!("opening capture device (device: {described})..."),
-            None => "opening capture device...".to_string(),
+            Some(described) => format!("opening microphone (device: {described})..."),
+            None => "opening microphone...".to_string(),
         };
         self.ctx.out.debug(&opening);
         if let Some(session) = self.session.as_mut() {
@@ -430,11 +506,11 @@ impl Lifecycle {
         }
     }
 
-    fn on_opened(&mut self, result: Result<Box<dyn CaptureDevice>, String>) {
+    fn on_opened(&mut self, result: Result<Box<dyn CaptureDevice>, CaptureError>) {
         match self.session.as_mut() {
             Some(session) => session.opened(&mut self.ctx, result),
-            // Nothing is holding this device: preparation never finished, or
-            // the engine was torn down. Close it rather than leak it.
+            // Nothing is holding this microphone: preparation never finished,
+            // or the engine was torn down. Close it rather than leak it.
             None => {
                 if let Ok(mut device) = result {
                     device.close();
@@ -443,7 +519,16 @@ impl Lifecycle {
         }
     }
 
-    /// `pause`: close the capture device and keep everything else loaded.
+    fn on_capture(&mut self, id: u64, report: CaptureReport) {
+        if self.finished() {
+            return;
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.report(&mut self.ctx, id, report);
+        }
+    }
+
+    /// `pause`: close the microphone and keep everything else loaded.
     fn pause_capture(&mut self) {
         if self.finished() {
             return;
@@ -452,18 +537,19 @@ impl Lifecycle {
         match self.session.as_mut() {
             Some(session) => session.pause(&mut self.ctx),
             // Still preparing, so nothing is open. on_prepared() leaves the
-            // device closed.
+            // microphone closed.
             None => self.ctx.out.paused(),
         }
     }
 
-    /// `resume`: reopen the capture device.
+    /// `resume`: reopen the microphone.
     fn resume_capture(&mut self) {
         if self.finished() {
             return;
         }
         self.capture_wanted = true;
-        // Still preparing: on_prepared() opens the device once it is ready.
+        // Still preparing: on_prepared() opens the microphone once it is
+        // ready.
         if let Some(session) = self.session.as_mut() {
             session.resume(&mut self.ctx);
         }
@@ -471,10 +557,10 @@ impl Lifecycle {
 
     /// `stop`, stdin EOF, SIGTERM, or SIGINT.
     ///
-    /// The capture device is closed and said to be closed before anything
-    /// else: the extension waits for `RELEASED` before it kills the process,
-    /// rather than killing it and trusting the operating system to have
-    /// reclaimed the device by then.
+    /// The microphone is closed and said to be closed before anything else:
+    /// the extension waits for `RELEASED` before it kills the process, rather
+    /// than killing it and trusting the operating system to have reclaimed
+    /// the device by then.
     fn shutdown(&mut self) {
         if self.finished() {
             return;
@@ -485,7 +571,6 @@ impl Lifecycle {
             Some(session) => session.stop(&mut self.ctx),
             None => self.ctx.out.released(),
         }
-        // Relay 3 frees the keyword spotter here.
         self.exit_code = Some(0);
     }
 
@@ -505,54 +590,6 @@ impl Lifecycle {
     }
 }
 
-/// The placeholder capture device for this relay. Relay 2 replaces it with a
-/// decibri microphone; nothing else in the state machine changes.
-struct PlaceholderCapture;
-
-impl CaptureDevice for PlaceholderCapture {
-    fn close(&mut self) {
-        // Nothing is open yet, so there is nothing to close.
-    }
-}
-
-/// Runs the placeholder prepare and open steps on short-lived threads, so the
-/// state machine sees them arrive the way the real ones will.
-pub struct ThreadSpawner {
-    events: Sender<Event>,
-    prepare_delay: Duration,
-    open_delay: Duration,
-}
-
-impl ThreadSpawner {
-    pub fn new(events: Sender<Event>) -> ThreadSpawner {
-        ThreadSpawner {
-            events,
-            prepare_delay: Duration::from_millis(PREPARE_DELAY_MS),
-            open_delay: Duration::from_millis(OPEN_DELAY_MS),
-        }
-    }
-}
-
-impl Spawner for ThreadSpawner {
-    fn spawn_prepare(&mut self) {
-        let events = self.events.clone();
-        let delay = self.prepare_delay;
-        thread::spawn(move || {
-            thread::sleep(delay);
-            let _ = events.send(Event::Prepared(Ok(())));
-        });
-    }
-
-    fn spawn_open(&mut self) {
-        let events = self.events.clone();
-        let delay = self.open_delay;
-        thread::spawn(move || {
-            thread::sleep(delay);
-            let _ = events.send(Event::CaptureOpened(Ok(Box::new(PlaceholderCapture))));
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,7 +599,7 @@ mod tests {
     #[derive(Default)]
     struct SpawnLog {
         prepares: usize,
-        opens: usize,
+        opens: Vec<OpenRequest>,
     }
 
     #[derive(Clone, Default)]
@@ -575,8 +612,8 @@ mod tests {
             self.log.lock().expect("spawn log").prepares += 1;
         }
 
-        fn spawn_open(&mut self) {
-            self.log.lock().expect("spawn log").opens += 1;
+        fn spawn_open(&mut self, request: OpenRequest) {
+            self.log.lock().expect("spawn log").opens.push(request);
         }
     }
 
@@ -596,6 +633,8 @@ mod tests {
         closed: Arc<Mutex<Vec<u32>>>,
     }
 
+    /// A microphone whose opens each test completes by hand, the way
+    /// `tests/engine/capture.test.js` drives the Node `CaptureSession`.
     struct FakeCapture {
         id: u32,
         log: CloseLog,
@@ -644,12 +683,29 @@ mod tests {
             self.sink.lines()
         }
 
+        /// The protocol lines alone, without the debug lines.
+        fn protocol(&self) -> Vec<String> {
+            self.sent()
+                .into_iter()
+                .filter(|line| !line.starts_with("DEBUG:"))
+                .collect()
+        }
+
         fn prepares(&self) -> usize {
             self.spawner.log.lock().expect("spawn log").prepares
         }
 
         fn opens(&self) -> usize {
-            self.spawner.log.lock().expect("spawn log").opens
+            self.spawner.log.lock().expect("spawn log").opens.len()
+        }
+
+        fn requests(&self) -> Vec<OpenRequest> {
+            self.spawner.log.lock().expect("spawn log").opens.clone()
+        }
+
+        /// The id the most recent open was given.
+        fn last_open_id(&self) -> u64 {
+            self.requests().last().expect("an open was requested").id
         }
 
         fn closed(&self) -> Vec<u32> {
@@ -669,7 +725,7 @@ mod tests {
         }
 
         /// Complete the open in flight after `elapsed` milliseconds and return
-        /// the identifier of the device it produced.
+        /// the identifier of the microphone it produced.
         fn complete_open(&mut self, elapsed: u64) -> u32 {
             self.advance(elapsed);
             self.devices += 1;
@@ -684,7 +740,19 @@ mod tests {
 
         fn fail_open(&mut self, message: &str) {
             self.lifecycle
-                .handle(Event::CaptureOpened(Err(message.to_string())));
+                .handle(Event::CaptureOpened(Err(CaptureError::uncoded(message))));
+        }
+
+        fn fail_open_with(&mut self, code: &'static str, message: &str) {
+            self.lifecycle
+                .handle(Event::CaptureOpened(Err(CaptureError {
+                    code: Some(code),
+                    message: message.to_string(),
+                })));
+        }
+
+        fn report(&mut self, id: u64, report: CaptureReport) {
+            self.lifecycle.handle(Event::Capture { id, report });
         }
 
         /// Send the config line and finish preparation.
@@ -822,11 +890,9 @@ mod tests {
         harness.line("stop");
         harness.complete_open(0);
         assert!(
-            harness
-                .sent()
-                .iter()
-                .any(|line| line
-                    == "DEBUG:closed a capture device that arrived after a pause or a stop"),
+            harness.sent().iter().any(
+                |line| line == "DEBUG:closed a microphone that arrived after a pause or a stop"
+            ),
             "lines were {:?}",
             harness.sent()
         );
@@ -908,6 +974,10 @@ mod tests {
         harness.complete_prepare();
         harness.lifecycle.handle(Event::StdinClosed);
         harness.lifecycle.handle(Event::Signal("SIGTERM"));
+        harness.report(
+            1,
+            CaptureReport::Failed(CaptureError::uncoded("late failure")),
+        );
         assert_eq!(harness.sent(), ["READY", "RELEASED"]);
         assert_eq!(harness.opens(), 1);
         assert_eq!(harness.lifecycle.exit_code(), Some(0));
@@ -974,6 +1044,47 @@ mod tests {
     }
 
     #[test]
+    fn reports_a_typed_open_failure_with_its_mapped_message() {
+        let mut harness = Harness::new();
+        harness.prepared();
+        harness.fail_open_with("PERMISSION_DENIED", "Microphone permission denied.");
+        assert_eq!(
+            harness.sent(),
+            ["ERROR:Microphone access denied. Enable microphone access for VS Code in your system privacy settings."]
+        );
+        assert_eq!(harness.lifecycle.exit_code(), Some(1));
+    }
+
+    #[test]
+    fn names_the_configured_device_when_the_open_cannot_find_it() {
+        let mut harness = Harness::new();
+        harness.line(r#"{"phrases":[{"phrase":"hey claude"}],"audioDevice":"Desk Mic 2"}"#);
+        harness.complete_prepare();
+        harness.fail_open_with(
+            "MICROPHONE_NOT_FOUND",
+            "No microphone found matching \"Desk Mic 2\"",
+        );
+        assert_eq!(
+            harness.sent(),
+            ["ERROR:No microphone matching \"Desk Mic 2\" was found. Check wakeWord.audioDevice against the input devices on this machine."]
+        );
+    }
+
+    #[test]
+    fn reports_a_detector_that_could_not_start() {
+        let mut harness = Harness::new();
+        harness.prepared();
+        harness.fail_open_with(
+            "ORT_LOAD_FAILED",
+            "decibri: failed to load ONNX Runtime from x",
+        );
+        assert_eq!(
+            harness.sent(),
+            ["ERROR:Failed to start voice activity detection: decibri: failed to load ONNX Runtime from x"]
+        );
+    }
+
+    #[test]
     fn does_not_report_an_open_that_failed_after_a_pause_or_a_stop() {
         let mut paused = Harness::new();
         paused.prepared();
@@ -1000,6 +1111,145 @@ mod tests {
         assert_eq!(harness.opens(), 2);
         harness.complete_open(0);
         assert_eq!(harness.sent(), ["PAUSED", "READY"]);
+    }
+
+    #[test]
+    fn a_stream_that_fails_while_listening_is_fatal_and_closes_the_microphone() {
+        let mut harness = Harness::new();
+        let device = harness.listening();
+        let id = harness.last_open_id();
+        harness.report(
+            id,
+            CaptureReport::Failed(CaptureError {
+                code: Some("DEVICE_FAILED"),
+                message: "decibri: audio device error: device unplugged".to_string(),
+            }),
+        );
+        assert_eq!(
+            harness.sent(),
+            [
+                "READY",
+                "ERROR:The microphone stopped responding: decibri: audio device error: device unplugged"
+            ]
+        );
+        assert_eq!(harness.closed(), [device]);
+        assert_eq!(harness.lifecycle.exit_code(), Some(1));
+    }
+
+    #[test]
+    fn a_stream_that_closes_without_a_cause_is_reported_under_the_microphone_prefix() {
+        let mut harness = Harness::new();
+        harness.listening();
+        let id = harness.last_open_id();
+        harness.report(
+            id,
+            CaptureReport::Failed(CaptureError {
+                code: Some("MICROPHONE_STREAM_CLOSED"),
+                message: "Microphone stream is closed".to_string(),
+            }),
+        );
+        assert_eq!(
+            harness.protocol(),
+            [
+                "READY",
+                "ERROR:Microphone error: Microphone stream is closed"
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_a_failure_from_a_microphone_that_has_been_closed() {
+        let mut harness = Harness::new();
+        harness.listening();
+        let first = harness.last_open_id();
+        harness.line("pause");
+        harness.line("resume");
+        harness.complete_open(0);
+
+        // The first microphone's thread was still on its way out.
+        harness.report(first, CaptureReport::Failed(CaptureError::uncoded("stale")));
+        assert_eq!(harness.sent(), ["READY", "PAUSED", "READY"]);
+        assert!(harness.lifecycle.exit_code().is_none());
+    }
+
+    #[test]
+    fn ignores_reports_from_a_microphone_closed_on_arrival() {
+        let mut harness = Harness::new();
+        harness.line(DEBUG_CONFIG);
+        harness.complete_prepare();
+        let id = harness.last_open_id();
+        harness.line("pause");
+        harness.complete_open(0);
+        harness.report(
+            id,
+            CaptureReport::Debug("VAD: speech (5 pre-roll chunks)".into()),
+        );
+        harness.report(id, CaptureReport::Failed(CaptureError::uncoded("stale")));
+        assert!(!harness.sent().iter().any(|line| line.contains("VAD:")));
+        assert!(harness.lifecycle.exit_code().is_none());
+    }
+
+    #[test]
+    fn forwards_debug_reports_from_the_current_microphone_in_debug_mode_only() {
+        let mut debug = Harness::new();
+        debug.line(DEBUG_CONFIG);
+        debug.complete_prepare();
+        debug.complete_open(0);
+        let id = debug.last_open_id();
+        debug.report(id, CaptureReport::Debug("VAD: silence".into()));
+        assert_eq!(
+            debug.sent().last().map(String::as_str),
+            Some("DEBUG:VAD: silence")
+        );
+
+        let mut quiet = Harness::new();
+        quiet.listening();
+        let id = quiet.last_open_id();
+        quiet.report(id, CaptureReport::Debug("VAD: silence".into()));
+        assert_eq!(quiet.sent(), ["READY"]);
+    }
+
+    #[test]
+    fn gives_every_open_its_own_id() {
+        let mut harness = Harness::new();
+        harness.listening();
+        harness.line("pause");
+        harness.line("resume");
+        harness.complete_open(0);
+        let ids: Vec<u64> = harness
+            .requests()
+            .iter()
+            .map(|request| request.id)
+            .collect();
+        assert_eq!(ids, [1, 2]);
+    }
+
+    #[test]
+    fn opens_with_the_configured_device_and_paths() {
+        let mut harness = Harness::new();
+        harness.line(
+            r#"{"phrases":[{"phrase":"hey claude"}],"audioDevice":"2","debugMode":true,
+                "vadModelPath":"/models/silero_vad.onnx","ortLibraryPath":"/ort/libonnxruntime.so"}"#,
+        );
+        harness.complete_prepare();
+        let request = harness.requests().pop().expect("an open was requested");
+        assert_eq!(request.device, AudioDevice::Index(2));
+        assert_eq!(request.vad_model, PathBuf::from("/models/silero_vad.onnx"));
+        assert_eq!(
+            request.ort_library,
+            Some(PathBuf::from("/ort/libonnxruntime.so"))
+        );
+        assert!(request.debug);
+    }
+
+    #[test]
+    fn leaves_the_onnx_runtime_to_decibri_when_none_is_configured() {
+        let mut harness = Harness::new();
+        harness.prepared();
+        let request = harness.requests().pop().expect("an open was requested");
+        assert_eq!(request.ort_library, None);
+        assert_eq!(request.device, AudioDevice::Default);
+        assert!(!request.debug);
     }
 
     #[test]
@@ -1102,7 +1352,6 @@ mod tests {
         assert_eq!(
             timings,
             [
-                "DEBUG:Timing: prepare 12ms",
                 "DEBUG:Timing: mic-open 87ms",
                 "DEBUG:Timing: resume-mic-open 34ms",
             ]
@@ -1122,13 +1371,33 @@ mod tests {
     fn names_the_configured_device_in_the_opening_debug_line() {
         let mut harness = Harness::new();
         harness.line(
-            r#"{"phrases":[{"phrase":"hey claude"}],"debugMode":true,"audioDevice":"Blue Yeti"}"#,
+            r#"{"phrases":[{"phrase":"hey claude"}],"debugMode":true,"audioDevice":"Desk Mic 2"}"#,
         );
         harness.complete_prepare();
         assert!(
             harness
                 .sent()
-                .contains(&"DEBUG:opening capture device (device: \"Blue Yeti\")...".to_string()),
+                .contains(&"DEBUG:opening microphone (device: \"Desk Mic 2\")...".to_string()),
+            "lines were {:?}",
+            harness.sent()
+        );
+    }
+
+    #[test]
+    fn names_the_voice_activity_model_in_a_debug_line() {
+        let mut harness = Harness::new();
+        harness.line(
+            r#"{"phrases":[{"phrase":"hey claude"}],"debugMode":true,
+                "vadModelPath":"/m/silero_vad.onnx","ortLibraryPath":"/o/ort.so"}"#,
+        );
+        harness.complete_prepare();
+        let expected = format!(
+            "DEBUG:voice activity model={}, ONNX Runtime={}",
+            PathBuf::from("/m/silero_vad.onnx").display(),
+            PathBuf::from("/o/ort.so").display()
+        );
+        assert!(
+            harness.sent().contains(&expected),
             "lines were {:?}",
             harness.sent()
         );
@@ -1142,7 +1411,7 @@ mod tests {
         harness.complete_prepare();
         assert!(
             harness.sent().iter().any(|line| line
-                == "DEBUG:ready; paused before the capture device opened, waiting for resume"),
+                == "DEBUG:ready; paused before the microphone opened, waiting for resume"),
             "lines were {:?}",
             harness.sent()
         );
