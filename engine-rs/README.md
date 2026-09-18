@@ -4,8 +4,9 @@ A Rust implementation of `engine/audio-engine.js`: the child process the Wake
 Word extension talks to over stdin and stdout.
 
 **The extension does not run this binary.** `engine/audio-engine.js` under
-system Node.js is the engine that runs. Nothing in `src/` spawns this binary
-and nothing in the packaged `.vsix` contains it.
+system Node.js is the engine that runs. Nothing in `src/` spawns this binary.
+Each platform `.vsix` carries it, built in CI, in `bin/` with the files it
+loads at run time; see [Release builds](#release-builds).
 
 ## What it does
 
@@ -162,6 +163,89 @@ On Windows the prebuilt libraries are compiled against the static C runtime, so
 file only when it is run from this directory, and a `RUSTFLAGS` environment
 variable replaces those flags rather than adding to them.
 
+## Release builds
+
+CI and the release workflow build the engine on each package target's own
+runner, with no cross-compilation, through `.github/actions/engine-rs`, then
+package it and check the package. Every input is pinned in
+`scripts/pinned-inputs.mjs` by size and SHA-256 and checked before it is
+used; a mismatch fails the build.
+
+| Target | Runner | Build |
+| --- | --- | --- |
+| `win32-x64` | `windows-latest` | `cargo rustc --release -- -D linker-messages`, so a linker warning such as LNK4098 fails it |
+| `darwin-arm64` | `macos-latest` | `cargo rustc --release`, deployment target macOS 11.0 |
+| `linux-x64` | `ubuntu-latest` | inside `quay.io/pypa/manylinux_2_28_x86_64` |
+| `linux-arm64` | `ubuntu-24.04-arm` | inside `quay.io/pypa/manylinux_2_28_aarch64` |
+
+**The sherpa-onnx libraries.** `scripts/prebuilt.mjs fetch` downloads the
+target's archive, or takes it from the workflow cache, and checks it.
+`SHERPA_ONNX_ARCHIVE_DIR` makes the build script copy that file instead of
+downloading its own, and `scripts/prebuilt.mjs check` then checks the copy the
+build script unpacked, because the build script uses an unpacked directory
+without looking at the archive. `prebuilt.mjs` refuses to run when
+`Cargo.lock` resolves a sherpa-onnx-sys version that has no pinned archives.
+
+**The Linux floor.** The Linux binary is built against glibc 2.28 and GCC 8's
+libstdc++ (GLIBCXX 3.4.25), the same floor the editor has on Linux, so it runs
+on every distribution the editor supports. A binary linked on the runner would
+take the runner's newer symbol versions instead. The sherpa-onnx libraries are
+compiled by GCC 11 against an older glibc; the image's compiler links the
+libstdc++ symbols newer than GCC 8 that they use into the binary. The runtime
+needs `libasound.so.2`, the ALSA library, which desktop distributions install.
+
+**The runtime files.** `scripts/stage.mjs` copies the binary into `bin/` at
+the repository root, which `.vscodeignore` ships, and adds the files it loads
+from beside itself. Both come from decibri's npm packages, version 5.7.0,
+checked against the registry's integrity value and then file by file:
+
+| File | From | Notes |
+| --- | --- | --- |
+| `onnxruntime.dll`, `libonnxruntime.dylib`, or `libonnxruntime.so` | `@decibri/decibri-<platform>` | ONNX Runtime 1.28.1 |
+| `silero_vad.onnx` | `decibri` | Silero VAD v6.2 |
+| `ONNXRUNTIME-NOTICES.md`, `SILERO-VAD-NOTICES.md` | the same packages | the license notices those files carry |
+
+The Linux packages also carry `libonnxruntime_providers_shared.so`. ONNX
+Runtime loads it only to register an execution provider other than the CPU,
+and `libonnxruntime.so` does not list it as a dependency, so it is not
+shipped.
+
+Each ONNX Runtime build sets a floor of its own. The macOS library needs
+macOS 14.0. The Windows library links the dynamic Visual C++ runtime
+(`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`), which is not part
+of Windows itself; the engine binary links the static runtime and needs none
+of it.
+
+On macOS, `stage.mjs` signs the binary ad hoc after copying it, because Apple
+silicon runs no unsigned code and stripping can leave the linker's signature
+stale, and verifies the signature.
+
+**The package check.** After `vsce package`, `scripts/verify-vsix.mjs` at the
+repository root reads the `.vsix` and fails unless:
+
+- the extension, the Node engine, and `node_modules/sentencepiece-js` are in it;
+- `bin/` holds the engine for the target's architecture, stored executable on
+  macOS and Linux, and the pinned runtime files and notices;
+- on Windows the engine imports no C runtime DLL and does not import ONNX
+  Runtime; on Linux neither the engine nor ONNX Runtime needs anything newer
+  than glibc 2.28 or GLIBCXX 3.4.25, and the engine exports no ONNX Runtime
+  symbol; on macOS neither needs anything newer than macOS 14.0, and both pass
+  `codesign --verify` once unpacked;
+- the engine's self-test, run from the unpacked package with no environment
+  variables pointing elsewhere, reports `OK`, the pinned sherpa-onnx version,
+  and ONNX Runtime and the Silero model as loaded from beside the binary. The
+  self-test exits 0 when either file is missing, so its exit code is not
+  enough.
+
+The workflows then run `scripts/drive-protocol.mjs --no-microphone` against
+the unpacked binary, with the keyword spotting model downloaded and checked
+by `scripts/fetch-model.mjs` at the repository root. The scenarios that open
+a microphone are skipped. The rest include loading the spotter and then a
+Silero session in one process, which puts both ONNX Runtimes in it. On Linux
+the workflow also fails if `nm -D --defined-only` finds a symbol matching
+`ort` or `onnx` in the engine. An exported symbol could be bound by the loaded
+ONNX Runtime in place of its own.
+
 ## The keyword spotting model
 
 `modelDir` in the config line is the extracted
@@ -208,9 +292,9 @@ the microphone cannot open without them.
 3. `silero_vad.onnx` in the directory that holds the executable.
 
 For local development, the decibri npm package the Node engine installs
-carries both files: the model in `engine/node_modules/decibri/models/` and, on
-Windows, ONNX Runtime in the platform package under
-`engine/node_modules/@decibri/`. Point the environment at them:
+carries both files: the model in `engine/node_modules/decibri/models/` and
+ONNX Runtime in the platform package under `engine/node_modules/@decibri/`.
+Point the environment at them:
 
 ```bash
 # from the repository root, after `cd engine && npm install`
@@ -218,9 +302,14 @@ export ORT_DYLIB_PATH="$PWD/engine/node_modules/@decibri/decibri-win32-x64-msvc/
 export WAKE_WORD_VAD_MODEL="$PWD/engine/node_modules/decibri/models/silero_vad.onnx"
 ```
 
-On macOS and Linux, use an ONNX Runtime 1.28 build from the ONNX Runtime
-releases, or copy both files next to the built binary instead of setting the
-variables.
+Or lay the binary out as the `.vsix` does, with both files beside it, which
+needs no variables:
+
+```bash
+# from the repository root, after `cargo build --release` in engine-rs/
+node engine-rs/scripts/stage.mjs --target win32-x64   # or darwin-arm64, linux-x64, linux-arm64
+bin/wake-word-engine.exe --self-test
+```
 
 `--self-test` shows what was found:
 
@@ -248,10 +337,11 @@ node scripts/drive-protocol.mjs            # add --bin <path> to drive another b
 
 The script pipes commands into the built binary over a real pipe and asserts
 the lines and exit codes that come back. Scenarios that load the keyword
-spotting model need `WAKE_WORD_MODEL_DIR` to point at it. Scenarios that reach
-`READY` also open the default microphone, so they need one, plus ONNX Runtime
-and the Silero model; the script reads the self-test first and skips, saying
-why, whatever cannot run.
+spotting model need `WAKE_WORD_MODEL_DIR` to point at it. Scenarios that load
+the Silero model need ONNX Runtime and the model, and scenarios that reach
+`READY` also open the default microphone, so they need one;
+`--no-microphone` skips those on a machine without one. The script reads the
+self-test first and skips, saying why, whatever cannot run.
 
 To watch it work, run the binary in debug mode and say the phrase. `cat` keeps
 stdin open after the config line, because the engine shuts down when stdin
@@ -406,6 +496,10 @@ engine-rs/
     assets.rs      where ONNX Runtime and the Silero model are looked for
   scripts/
     drive-protocol.mjs   pipes commands into the built binary and asserts the answers
+    pinned-inputs.mjs    the size and SHA-256 of everything the release build downloads
+    prebuilt.mjs         fetches and checks the sherpa-onnx archive, before and after the build
+    stage.mjs            puts the binary and its runtime files into bin/ for packaging
+    download.mjs         downloading and digest checks, shared by the scripts above
 ```
 
 The state machine holds no threads of its own and reacts only to events, so

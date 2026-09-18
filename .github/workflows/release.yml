@@ -70,15 +70,58 @@ jobs:
       - name: Smoke test engine
         run: node engine/audio-engine.js --self-test
 
-      - name: Lint and compile
+      - name: Lint
         if: matrix.lint
-        run: |
-          npm run lint
-          npm run compile
+        run: npm run lint
+
+      # Packaging compiles too; this is earlier because the model fetch below
+      # uses the extension's own archive extraction from dist/.
+      - name: Compile
+        run: npm run compile
+
+      # The native engine, built on this runner for this target, staged into
+      # bin/ with ONNX Runtime and the Silero model.
+      - name: Build the native engine
+        uses: ./.github/actions/engine-rs
+        with:
+          target: ${{ matrix.target }}
 
       # Build platform-specific .vsix package
       - name: Package extension
         run: npx vsce package --target ${{ matrix.target }} -o wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix
+
+      # Fail the release before anything is uploaded or published if the
+      # package is missing a file the engine needs, or its engine does not run
+      # from the unpacked package.
+      - name: Verify VSIX
+        shell: bash
+        run: node scripts/verify-vsix.mjs --target ${{ matrix.target }} --vsix wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix --extract-to "$RUNNER_TEMP/vsix"
+
+      - name: Model cache key
+        id: model-key
+        shell: bash
+        run: node scripts/fetch-model.mjs --print-sha >> "$GITHUB_OUTPUT"
+
+      - name: Cache the keyword spotting model
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/kws-model
+          key: kws-model-${{ steps.model-key.outputs.sha256 }}
+
+      - name: Fetch the keyword spotting model
+        id: model
+        shell: bash
+        run: |
+          out=$(node scripts/fetch-model.mjs --dir "$RUNNER_TEMP/kws-model")
+          echo "$out"
+          echo "$out" | grep '^model-dir=' >> "$GITHUB_OUTPUT"
+
+      - name: Drive the packaged engine
+        shell: bash
+        env:
+          WAKE_WORD_MODEL_DIR: ${{ steps.model.outputs.model-dir }}
+          EXE: ${{ startsWith(matrix.target, 'win32') && 'wake-word-engine.exe' || 'wake-word-engine' }}
+        run: node engine-rs/scripts/drive-protocol.mjs --bin "$RUNNER_TEMP/vsix/extension/bin/$EXE" --no-microphone
 
       # Attach .vsix to the GitHub release
       - name: Upload .vsix to release

@@ -1,0 +1,102 @@
+name: Build the engine
+description: >-
+  Build engine-rs natively for one package target from verified sherpa-onnx
+  libraries, and stage the binary with the runtime files it loads into bin/,
+  where the .vsix picks it up.
+
+inputs:
+  target:
+    description: The package target, as vsce names it (win32-x64, darwin-arm64, linux-x64, linux-arm64)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Name the sherpa-onnx archive
+      id: archive
+      shell: bash
+      run: node engine-rs/scripts/prebuilt.mjs name --target "${{ inputs.target }}" >> "$GITHUB_OUTPUT"
+
+    # The key carries the pinned digest, so a new pin never restores an old file.
+    - name: Cache the sherpa-onnx archive
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/sherpa-onnx-archives
+        key: sherpa-onnx-${{ steps.archive.outputs.name }}-${{ steps.archive.outputs.sha256 }}
+
+    # The build script checks no digest, so the archive is checked here, and
+    # SHERPA_ONNX_ARCHIVE_DIR below makes the build copy this file rather
+    # than download its own.
+    - name: Fetch and verify the sherpa-onnx archive
+      shell: bash
+      run: node engine-rs/scripts/prebuilt.mjs fetch --target "${{ inputs.target }}" --dir "$RUNNER_TEMP/sherpa-onnx-archives"
+
+    # Built inside a manylinux_2_28 image, so the binary needs glibc 2.28 and
+    # GCC 8's libstdc++ at most: the floor the editor itself has on Linux. A
+    # build on the runner would take the runner's newer glibc and libstdc++
+    # symbol versions instead. The image's compiler links the newer libstdc++
+    # symbols the sherpa-onnx libraries use statically. alsa-lib-devel is the
+    # ALSA development package the audio backend builds against.
+    # scripts/verify-vsix.mjs checks the floor on the packaged binary.
+    - name: Build the engine (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        IMAGE: quay.io/pypa/manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+      run: |
+        docker run --rm \
+          --volume "$GITHUB_WORKSPACE:/work" \
+          --volume "$RUNNER_TEMP/sherpa-onnx-archives:/archives:ro" \
+          --env SHERPA_ONNX_ARCHIVE_DIR=/archives \
+          --workdir /work/engine-rs \
+          "$IMAGE" \
+          bash -euo pipefail -c '
+            dnf install --assumeyes --quiet alsa-lib-devel pkgconf-pkg-config
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --quiet --profile minimal --default-toolchain stable
+            source "$HOME/.cargo/env"
+            rustc --version
+            cargo rustc --release --locked --bin wake-word-engine
+          '
+
+    # Run from engine-rs/ so .cargo/config.toml applies, and with no RUSTFLAGS,
+    # which would replace its flags. On Windows the sherpa-onnx libraries use
+    # the static C runtime; if +crt-static did not apply, the link still
+    # succeeds but warns LNK4098 and the image carries two runtimes, so any
+    # linker warning fails the Windows build.
+    - name: Build the engine
+      if: runner.os != 'Linux'
+      shell: bash
+      working-directory: engine-rs
+      env:
+        SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx-archives
+        MACOSX_DEPLOYMENT_TARGET: '11.0'
+      run: |
+        unset RUSTFLAGS
+        rustc --version
+        cargo rustc --release --locked --bin wake-word-engine -- ${{ runner.os == 'Windows' && '-D linker-messages' || '' }}
+
+    # The build script uses an already unpacked directory without looking at
+    # the archive, so check that the archive it did unpack is the verified one.
+    - name: Verify the archive the build unpacked
+      shell: bash
+      run: node engine-rs/scripts/prebuilt.mjs check --target "${{ inputs.target }}"
+
+    # The executable links one ONNX Runtime statically, and decibri loads
+    # another from a shared library. A symbol the executable exported could be
+    # bound by that library in place of its own, so it must export none.
+    - name: Check the engine exports no ONNX Runtime symbol (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        binary=engine-rs/target/release/wake-word-engine
+        echo "Dynamic symbols the engine defines:"
+        nm -D --defined-only "$binary"
+        if nm -D --defined-only "$binary" | grep -i -E 'ort|onnx'; then
+          echo "::error::The engine exports symbols matching ort or onnx"
+          exit 1
+        fi
+
+    - name: Stage the engine and its runtime files
+      shell: bash
+      run: node engine-rs/scripts/stage.mjs --target "${{ inputs.target }}"

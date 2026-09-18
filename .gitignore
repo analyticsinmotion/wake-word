@@ -6,3 +6,4 @@ dist/
 prototype/
 coverage/
 engine-rs/target/
+bin/

@@ -9,18 +9,20 @@
  * same order, flushes its last line before exiting, and exits with the right
  * code. Those are the parts a unit test cannot see.
  *
- *   node engine-rs/scripts/drive-protocol.mjs [--bin <path>]
+ *   node engine-rs/scripts/drive-protocol.mjs [--bin <path>] [--no-microphone]
  *
- * A scenario that needs `microphone` opens the default microphone, so it needs
- * one, plus ONNX Runtime and the Silero model where the engine looks for them:
- * ORT_DYLIB_PATH and WAKE_WORD_VAD_MODEL, or both files beside the binary. One
- * that needs `ort` builds the voice activity detector but fails before a
- * microphone opens. One that needs `model` loads the keyword spotting model,
- * which WAKE_WORD_MODEL_DIR must point at: the extracted
+ * A scenario that needs `ort` builds the voice activity detector but fails
+ * before the Silero model loads. One that needs `vad` also loads the Silero
+ * model, so it needs ONNX Runtime and the model where the engine looks for
+ * them: ORT_DYLIB_PATH and WAKE_WORD_VAD_MODEL, or both files beside the
+ * binary. One that needs `microphone` opens the default microphone as well,
+ * so it needs one; --no-microphone says there is none, as on a CI runner. One
+ * that needs `model` loads the keyword spotting model, which
+ * WAKE_WORD_MODEL_DIR must point at: the extracted
  * sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 directory. Everything
- * that gets as far as a microphone needs the model too, because the spotter
- * loads first. The script reads the engine's self-test first and skips, saying
- * why, any scenario whose prerequisite is missing.
+ * that gets as far as the voice activity detector needs the model too,
+ * because the spotter loads first. The script reads the engine's self-test
+ * first and skips, saying why, any scenario whose prerequisite is missing.
  *
  * Exits 0 when every scenario that ran passed, 1 otherwise.
  */
@@ -511,6 +513,36 @@ const scenarios = [
     exit: 1,
   },
   {
+    // The keyword spotter runs on the ONNX Runtime linked into the executable,
+    // and the voice activity detector on the one loaded from a shared library.
+    // The Silero session is created before the device is looked up, so an
+    // error about the device means the spotter's three sessions and the
+    // Silero session were all built in one process. No microphone is needed:
+    // on a machine with no audio devices the index is still out of range, or
+    // the device list cannot be read, and either is reported the same way.
+    name: 'the spotter and the voice activity detector load in one process',
+    needs: ['model', 'vad'],
+    async drive(engine) {
+      engine.write(config({ audioDevice: '999' }) + '\n');
+    },
+    expect: (lines) => {
+      if (lines.length !== 1) return `expected one line, got ${JSON.stringify(lines)}`;
+      const [line] = lines;
+      if (!line.startsWith('ERROR:')) return `line was ${line}`;
+      const beforeTheDevice = [
+        'ERROR:Failed to load KWS model:',
+        'ERROR:Failed to start voice activity detection:',
+      ];
+      return beforeTheDevice.some((prefix) => line.startsWith(prefix))
+        ? `failed before the device was looked up: ${line}`
+        : null;
+    },
+    // ALSA's library reports devices it cannot open on stderr while the list
+    // is built, which on a machine without a sound card is every one of them.
+    stderrAllowed: /^ALSA lib /,
+    exit: 1,
+  },
+  {
     name: 'a device name that matches no microphone names the setting',
     needs: ['model', 'microphone'],
     async drive(engine) {
@@ -604,8 +636,12 @@ async function prerequisites(binary) {
   };
   const ort = value('ort') === 'not found' ? 'no ONNX Runtime found' : null;
   const vadModel = value('vad-model') === 'not found' ? 'no Silero model found' : null;
+  const vad = ort ?? vadModel;
+  const noMicrophone = process.argv.includes('--no-microphone')
+    ? 'no microphone: --no-microphone'
+    : null;
   const model = MODEL_DIR ? null : 'no keyword spotting model: set WAKE_WORD_MODEL_DIR';
-  return { ort, microphone: ort ?? vadModel, model };
+  return { ort, vad, microphone: vad ?? noMicrophone, model };
 }
 
 async function runScenario(binary, scenario) {
@@ -631,8 +667,12 @@ async function runScenario(binary, scenario) {
   if (code !== scenario.exit) {
     return `expected exit ${scenario.exit}, got ${code}`;
   }
-  if (engine.stderr.trim().length > 0) {
-    return `unexpected stderr: ${engine.stderr.trim()}`;
+  const stderr = engine.stderr
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+    .filter((line) => !scenario.stderrAllowed?.test(line));
+  if (stderr.length > 0) {
+    return `unexpected stderr: ${stderr.join('\n')}`;
   }
   return null;
 }
