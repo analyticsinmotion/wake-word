@@ -10,7 +10,7 @@
 //! | stdout line | when |
 //! |---|---|
 //! | `READY` | capture open and listening; answers both the start and a resume |
-//! | `DETECTED:<phrase>` | a wake phrase was heard (Relay 3) |
+//! | `DETECTED:<phrase>` | a wake phrase was heard |
 //! | `PAUSED` | capture closed, everything else still loaded |
 //! | `RELEASED` | capture closed for good, process exiting |
 //! | `ERROR:<msg>` | fatal, the process exits 1 |
@@ -170,8 +170,9 @@ impl Reporter {
     ///
     /// The keyword spotter applies its own threshold and returns no usable
     /// score, so the line carries no confidence suffix even though the
-    /// extension's parser accepts one. Relay 3 is what calls this; the format
-    /// is pinned here so the vocabulary is complete in one place.
+    /// extension's parser accepts one. No keyword spotter is attached in this
+    /// build, so nothing calls this; the format is pinned here so the
+    /// vocabulary is complete in one place.
     #[allow(dead_code)]
     pub fn detected(&mut self, phrase: &str) {
         self.line(&format!("DETECTED:{phrase}"));

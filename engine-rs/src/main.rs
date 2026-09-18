@@ -6,10 +6,9 @@
 //! `DETECTED:<phrase>`, `PAUSED`, `RELEASED`, `ERROR:<msg>`, and, in debug
 //! mode, `DEBUG:<msg>`.
 //!
-//! This relay is the skeleton: the protocol, the config parser, and the
-//! lifecycle state machine. There is no audio capture and no keyword spotting
-//! yet, so no `DETECTED` line is ever written. The Node engine in `engine/` is
-//! still the engine the extension runs, and it is untouched.
+//! The engine captures audio through decibri and gates it with Silero voice
+//! activity detection. No keyword spotter is attached, so no `DETECTED` line
+//! is written.
 //!
 //! Three threads and one channel:
 //!
@@ -20,27 +19,39 @@
 //! - a signal thread turns SIGTERM and SIGINT, or their Windows console
 //!   equivalents, into the same shutdown the `stop` command causes.
 //!
-//! The slow steps (preparation, opening the capture device) run on short-lived
-//! threads of their own and report back through the same channel, which is
-//! what lets a `pause` or a `stop` be answered while an open is still in
-//! flight.
+//! Each microphone gets a thread of its own, which opens it, reports back
+//! through the same channel, and then runs its capture loop until it is
+//! closed. That is what lets a `pause` or a `stop` be answered while an open is
+//! still in flight.
 
+mod assets;
+mod capture;
 mod config;
+mod gate;
+mod hysteresis;
 mod lifecycle;
+mod mic_errors;
 mod protocol;
+mod samples;
 
 use std::io::{self, Read};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lifecycle::{Event, Lifecycle, MonotonicClock, ThreadSpawner};
+use capture::ThreadSpawner;
+use lifecycle::{Event, Lifecycle, MonotonicClock};
 use protocol::{flush_and_exit, LineSplitter, Reporter, StdoutSink};
 
-/// How long shutdown waits for a capture device that is still opening, so it
-/// can be closed rather than left to the operating system to reclaim.
-/// `RELEASED` has already been written by then, so nothing the extension is
-/// waiting for is held up.
+/// The decibri release this binary is built against, as pinned in
+/// `Cargo.toml`. The crate exports no version constant of its own; a test
+/// keeps the two in step.
+const DECIBRI_VERSION: &str = "6.3.0";
+
+/// How long shutdown waits for a microphone that is still opening, so it can
+/// be closed rather than left to the operating system to reclaim. `RELEASED`
+/// has already been written by then, so nothing the extension is waiting for
+/// is held up.
 const SHUTDOWN_DRAIN_MS: u64 = 250;
 
 fn main() {
@@ -81,14 +92,12 @@ fn main() {
 
 /// Confirm the engine runs on this platform and exit.
 ///
-/// CI runs this on every target. Relays 2 and 3 add the decibri and
-/// sherpa-onnx load checks here, which is where a missing shared library or a
-/// bad build shows up; the Node engine's equivalent caught exactly that
-/// failure twice.
+/// CI runs this on every target: a missing or incompatible shared library
+/// shows up here rather than on a user's machine. It opens no microphone.
 fn run_self_test() -> ! {
     let mut out = Reporter::new(Box::new(StdoutSink));
-    match self_test_checks() {
-        Ok(()) => {
+    match self_test::run() {
+        Ok(report) => {
             out.self_test("OK");
             out.self_test(&format!(
                 "platform={}-{}",
@@ -96,6 +105,9 @@ fn run_self_test() -> ! {
                 std::env::consts::ARCH
             ));
             out.self_test(&format!("version={}", env!("CARGO_PKG_VERSION")));
+            out.self_test(&format!("decibri={DECIBRI_VERSION}"));
+            out.self_test(&format!("ort={}", report.ort));
+            out.self_test(&format!("vad-model={}", report.vad_model));
             flush_and_exit(0)
         }
         Err(message) => {
@@ -103,12 +115,6 @@ fn run_self_test() -> ! {
             flush_and_exit(1)
         }
     }
-}
-
-/// What the self-test actually checks. Nothing yet: this relay links no audio
-/// or model libraries, so running at all is the whole test.
-fn self_test_checks() -> Result<(), String> {
-    Ok(())
 }
 
 /// Read stdin and post one event per complete line, then one for EOF.
@@ -158,6 +164,70 @@ fn drain_open_in_flight(engine: &mut Lifecycle, incoming: &Receiver<Event>) {
             Ok(_) => {}
             Err(_) => return,
         }
+    }
+}
+
+/// The checks behind `--self-test`.
+mod self_test {
+    use decibri::{SileroVad, VadConfig};
+
+    use crate::assets;
+    use crate::capture::{SAMPLE_RATE, SPEECH_THRESHOLD};
+    use crate::config::AudioDevice;
+    use crate::mic_errors::{mic_error_message, CaptureError};
+
+    /// What the self-test found.
+    pub struct Report {
+        /// The ONNX Runtime library that initialised, or `not found`.
+        pub ort: String,
+        /// The Silero model that loaded, or `not found`.
+        pub vad_model: String,
+    }
+
+    /// Initialise ONNX Runtime and load the Silero model the way an open
+    /// does, without opening a microphone.
+    ///
+    /// decibri initialises ONNX Runtime before it loads the model, so a model
+    /// failure proves the runtime loaded. No runtime at all, with none named
+    /// and none beside the executable, is reported as `not found` rather than
+    /// as a failure, and so is a missing model: both are installed beside the
+    /// binary, and the binary itself is sound without them. A runtime or model
+    /// that is present but cannot be used is a failure.
+    pub fn run() -> Result<Report, String> {
+        let model = assets::vad_model_path(None);
+        let model_found = model.is_file();
+        let ort = assets::ort_location(None);
+
+        let mut config = VadConfig::default();
+        config.model_path = model.clone();
+        config.sample_rate = SAMPLE_RATE;
+        config.threshold = SPEECH_THRESHOLD;
+
+        let (ort_line, model_line) = match SileroVad::new(config) {
+            Ok(_) => (ort.describe(), model.display().to_string()),
+            Err(error) if error.code() == "VAD_MODEL_LOAD_FAILED" && !model_found => {
+                (ort.describe(), "not found".to_string())
+            }
+            Err(error) if error.variant_name() == "OrtPathInvalid" && !ort.is_explicit() => {
+                let model_line = if model_found {
+                    format!("{} (not loaded: no ONNX Runtime)", model.display())
+                } else {
+                    "not found".to_string()
+                };
+                ("not found".to_string(), model_line)
+            }
+            Err(error) => {
+                return Err(mic_error_message(
+                    &CaptureError::from(error),
+                    "decibri failed to initialise",
+                    &AudioDevice::Default,
+                ));
+            }
+        };
+        Ok(Report {
+            ort: ort_line,
+            vad_model: model_line,
+        })
     }
 }
 
@@ -296,5 +366,20 @@ mod signals {
             *guard = Some(events);
         }
         let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_event), TRUE) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DECIBRI_VERSION;
+
+    #[test]
+    fn the_reported_decibri_version_is_the_pinned_one() {
+        let manifest = include_str!("../Cargo.toml");
+        let pin = format!("decibri = {{ version = \"={DECIBRI_VERSION}\"");
+        assert!(
+            manifest.lines().any(|line| line.starts_with(&pin)),
+            "Cargo.toml does not pin decibri {DECIBRI_VERSION}"
+        );
     }
 }
