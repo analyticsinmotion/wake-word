@@ -14,7 +14,8 @@
 //! "hey" commonly scores below the threshold, and Silero scores in 32 ms
 //! windows, so the chunk that crosses the threshold usually starts after the
 //! phrase has. The spotter needs the start of the phrase to match it, so the
-//! ring carries the 500 ms of audio that precedes the transition.
+//! ring carries the audio that precedes the transition: 400 ms, which with the
+//! chunk that trips the detector gives the spotter 500 ms of lead-in.
 //!
 //! The gate holds no audio knowledge: a chunk is whatever the caller pushes.
 

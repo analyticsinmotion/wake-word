@@ -22,11 +22,12 @@
 //!   `pause` or `stop` during an open has already been acknowledged, so the
 //!   microphone that open eventually produces is closed instead of being kept.
 //!
-//! Opening the microphone and running it happen elsewhere, behind the
-//! [`Spawner`] and [`CaptureDevice`] traits (`crate::capture` implements both
-//! over decibri). Each open carries an id, and everything a running microphone
-//! reports comes back tagged with it, so a line from a microphone that has
-//! since been closed is dropped here rather than acted on.
+//! Loading the keyword spotter, opening the microphone, and running it happen
+//! elsewhere, behind the [`Spawner`] and [`CaptureDevice`] traits
+//! (`crate::capture` implements both, over `crate::spotter` and decibri). Each
+//! open carries an id, and everything a running microphone reports comes back
+//! tagged with it, so a line from a microphone that has since been closed, a
+//! detection included, is dropped here rather than acted on.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -91,13 +92,74 @@ pub struct OpenRequest {
     pub debug: bool,
 }
 
-/// Starts the slow work the state machine waits on. Both calls return at once
+/// Everything needed to build the keyword spotter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrepareRequest {
+    /// The configured phrases, as sent.
+    pub phrases: Vec<String>,
+    /// The clamped trigger threshold every keyword line carries.
+    pub threshold: f64,
+    /// Where the extension unpacked the keyword spotting model.
+    pub model_dir: String,
+}
+
+/// What preparation has to say while it runs. Written only in debug mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareProgress {
+    /// A diagnostic line.
+    Debug(String),
+    /// One phase finished, and how long it took.
+    Timing {
+        phase: &'static str,
+        elapsed_ms: u64,
+    },
+}
+
+/// Preparation finished and the keyword spotter is loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Prepared {
+    /// The phrases the spotter reports, for the debug line that follows the
+    /// first `READY`.
+    pub listening_for: Vec<String>,
+}
+
+/// Why preparation failed. Each is fatal, with the Node engine's wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareError {
+    /// No configured phrase survived tokenising.
+    NoValidPhrases,
+    /// The transducer could not be loaded.
+    ModelLoad(String),
+    /// Anything else, the tokeniser model included.
+    Startup(String),
+}
+
+impl PrepareError {
+    /// The text of the `ERROR:` line.
+    pub fn message(&self) -> String {
+        match self {
+            PrepareError::NoValidPhrases => "No valid phrases to detect".to_string(),
+            PrepareError::ModelLoad(detail) => format!("Failed to load KWS model: {detail}"),
+            PrepareError::Startup(detail) => format!("Startup error: {detail}"),
+        }
+    }
+}
+
+/// Starts the slow work the state machine waits on, and holds the keyword
+/// spotter that work produces. `spawn_prepare` and `spawn_open` return at once
 /// and the result arrives later as an [`Event`].
 pub trait Spawner: Send {
-    /// Load whatever the engine needs before capture can start.
-    fn spawn_prepare(&mut self);
+    /// Load the tokeniser and the keyword spotter.
+    fn spawn_prepare(&mut self, request: PrepareRequest);
     /// Open a microphone and, once it is open, run it.
     fn spawn_open(&mut self, request: OpenRequest);
+    /// Give the keyword spotter a new stream. Called once a pause has closed
+    /// the microphone, so nothing heard before the pause can complete a phrase
+    /// after it.
+    fn reset_spotter(&mut self);
+    /// Shutdown has started: drop the keyword spotter, and abandon preparation
+    /// if it is still running.
+    fn release(&mut self);
 }
 
 /// Something a running microphone has to say.
@@ -105,6 +167,8 @@ pub trait Spawner: Send {
 pub enum CaptureReport {
     /// A diagnostic line, written only in debug mode.
     Debug(String),
+    /// The keyword spotter heard this configured phrase.
+    Detected(String),
     /// The stream failed while running: the device went away, the driver
     /// failed, or the voice activity detector could not score a chunk.
     Failed(CaptureError),
@@ -118,8 +182,10 @@ pub enum Event {
     StdinClosed,
     /// SIGTERM, SIGINT, or the Windows console equivalent.
     Signal(&'static str),
-    /// The preparation step finished.
-    Prepared(Result<(), String>),
+    /// Preparation has something to say before it finishes.
+    Preparing(PrepareProgress),
+    /// Preparation finished, with the spotter loaded or the reason it is not.
+    Prepared(Result<Prepared, PrepareError>),
     /// An open finished, with the microphone or the reason it failed.
     CaptureOpened(Result<Box<dyn CaptureDevice>, CaptureError>),
     /// A report from the microphone opened with this id.
@@ -152,6 +218,9 @@ struct CaptureOptions {
     vad_model: PathBuf,
     ort_library: Option<PathBuf>,
     debug: bool,
+    /// The phrases the spotter reports, for the debug line after the first
+    /// `READY`.
+    listening_for: Vec<String>,
 }
 
 /// The microphone's lifecycle: open, pause, resume, stop.
@@ -178,6 +247,11 @@ pub struct CaptureSession {
     open_began: u64,
 }
 
+/// The timing phase of the open that starts the engine.
+const START_LABEL: &str = "mic-open";
+/// The timing phase of an open that follows a pause.
+const RESUME_LABEL: &str = "resume-mic-open";
+
 impl CaptureSession {
     fn new(options: CaptureOptions) -> CaptureSession {
         CaptureSession {
@@ -188,22 +262,26 @@ impl CaptureSession {
             stopped: false,
             open_id: 0,
             current: None,
-            open_label: "mic-open",
+            open_label: START_LABEL,
             open_began: 0,
         }
     }
 
     /// Open the microphone and say `READY`.
     fn start(&mut self, ctx: &mut Ctx) {
-        self.capture(ctx, "mic-open");
+        self.capture(ctx, START_LABEL);
     }
 
     /// Reopen the microphone after a pause and say `READY`.
     fn resume(&mut self, ctx: &mut Ctx) {
-        self.capture(ctx, "resume-mic-open");
+        self.capture(ctx, RESUME_LABEL);
     }
 
-    /// Close the microphone and say `PAUSED`.
+    /// Close the microphone, give the spotter a new stream, and say `PAUSED`.
+    ///
+    /// The close waits for the microphone's capture thread, so nothing is
+    /// feeding the spotter by the time its stream is replaced, and nothing
+    /// heard before the pause can complete a phrase after it.
     ///
     /// Says `PAUSED` even when nothing was open: the acknowledgement is what
     /// the extension waits for before it hands the microphone to an assistant,
@@ -214,6 +292,7 @@ impl CaptureSession {
         }
         self.wanted = false;
         self.close();
+        ctx.spawner.reset_spotter();
         ctx.out.paused();
     }
 
@@ -290,6 +369,14 @@ impl CaptureSession {
                 let elapsed = ctx.clock.now_ms().saturating_sub(self.open_began);
                 ctx.out.timing(self.open_label, elapsed);
                 ctx.out.ready();
+                // Said once, for the open that started the engine, as the Node
+                // engine does; a resume only says READY.
+                if self.open_label == START_LABEL {
+                    ctx.out.debug(&format!(
+                        "mic open, VAD-gated, listening for: {}",
+                        self.options.listening_for.join(", ")
+                    ));
+                }
             }
         }
     }
@@ -303,6 +390,7 @@ impl CaptureSession {
         }
         match report {
             CaptureReport::Debug(line) => ctx.out.debug(&line),
+            CaptureReport::Detected(phrase) => ctx.out.detected(&phrase),
             CaptureReport::Failed(error) => {
                 // The stream has already ended; closing lets its capture
                 // thread finish before the process exits.
@@ -338,6 +426,8 @@ pub struct Lifecycle {
     /// microphone is not opened until a resume. The extension only pauses an
     /// engine that has said READY, so this is defensive.
     capture_wanted: bool,
+    /// Preparation has been started and has not reported back.
+    preparing: bool,
     exit_code: Option<i32>,
 }
 
@@ -354,6 +444,7 @@ impl Lifecycle {
             session: None,
             stopping: false,
             capture_wanted: true,
+            preparing: false,
             exit_code: None,
         }
     }
@@ -369,6 +460,12 @@ impl Lifecycle {
     /// than left to the operating system.
     pub fn open_in_flight(&self) -> bool {
         self.session.as_ref().is_some_and(|session| session.opening)
+    }
+
+    /// True while preparation is running. The event loop uses this to let a
+    /// model load finish on the way out rather than exit underneath it.
+    pub fn prepare_in_flight(&self) -> bool {
+        self.preparing
     }
 
     /// True while a microphone is open and held.
@@ -399,6 +496,7 @@ impl Lifecycle {
                 self.ctx.out.debug(&format!("received {name}"));
                 self.shutdown();
             }
+            Event::Preparing(progress) => self.on_preparing(progress),
             Event::Prepared(result) => self.on_prepared(result),
             Event::CaptureOpened(result) => self.on_opened(result),
             Event::Capture { id, report } => self.on_capture(id, report),
@@ -441,44 +539,63 @@ impl Lifecycle {
             "wake-word-engine starting, modelDir={}",
             config.model_dir
         ));
+        let request = PrepareRequest {
+            phrases: config.phrases.clone(),
+            threshold: config.threshold,
+            model_dir: config.model_dir.clone(),
+        };
         self.config = Some(config);
-        self.ctx.spawner.spawn_prepare();
+        self.preparing = true;
+        self.ctx.spawner.spawn_prepare(request);
     }
 
-    fn on_prepared(&mut self, result: Result<(), String>) {
+    fn on_preparing(&mut self, progress: PrepareProgress) {
+        // Nothing follows the last line: not RELEASED, and not ERROR.
+        if self.finished() {
+            return;
+        }
+        match progress {
+            PrepareProgress::Debug(line) => self.ctx.out.debug(&line),
+            PrepareProgress::Timing { phase, elapsed_ms } => self.ctx.out.timing(phase, elapsed_ms),
+        }
+    }
+
+    fn on_prepared(&mut self, result: Result<Prepared, PrepareError>) {
+        self.preparing = false;
         if self.session.is_some() {
             return;
         }
-        if let Err(message) = result {
-            // A stop during preparation has already said RELEASED and the
-            // process is on its way out; an error line after it would only
-            // confuse the extension's reader.
-            if !self.finished() {
-                self.fatal(&format!("Startup error: {message}"));
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // A stop during preparation has already said RELEASED and the
+                // process is on its way out; an error line after it would only
+                // confuse the extension's reader.
+                if !self.finished() {
+                    self.fatal(&error.message());
+                }
+                return;
             }
-            return;
-        }
+        };
 
         // A stop during preparation has already said RELEASED, and a fatal
         // error has already said ERROR. Opening the microphone now would only
-        // hold that exit up.
+        // hold that exit up. The spotter that was just loaded is dropped.
         if self.finished() {
+            self.ctx.spawner.release();
             return;
         }
 
         let Some(config) = self.config.as_ref() else {
             return;
         };
-        if config.phrases.is_empty() {
-            self.fatal("No valid phrases to detect");
-            return;
-        }
 
         let options = CaptureOptions {
             device: config.audio_device.clone(),
             vad_model: assets::vad_model_path(config.vad_model_path.as_deref()),
             ort_library: config.ort_library_path.as_ref().map(PathBuf::from),
             debug: config.debug_mode,
+            listening_for: prepared.listening_for,
         };
         let ort = assets::ort_location(config.ort_library_path.as_deref());
         let device = config.audio_device.describe();
@@ -492,7 +609,7 @@ impl Lifecycle {
         if !self.capture_wanted {
             self.ctx
                 .out
-                .debug("ready; paused before the microphone opened, waiting for resume");
+                .debug("models loaded; paused before the microphone opened, waiting for resume");
             return;
         }
 
@@ -560,7 +677,8 @@ impl Lifecycle {
     /// The microphone is closed and said to be closed before anything else:
     /// the extension waits for `RELEASED` before it kills the process, rather
     /// than killing it and trusting the operating system to have reclaimed
-    /// the device by then.
+    /// the device by then. The keyword spotter is freed after that, so freeing
+    /// it never holds the acknowledgement up.
     fn shutdown(&mut self) {
         if self.finished() {
             return;
@@ -571,14 +689,24 @@ impl Lifecycle {
             Some(session) => session.stop(&mut self.ctx),
             None => self.ctx.out.released(),
         }
+        self.ctx.spawner.release();
         self.exit_code = Some(0);
     }
 
+    /// Say `ERROR:` and leave with exit code 1.
+    ///
+    /// The line goes first. The microphone is then closed and the spotter
+    /// dropped, so no capture thread and no model load is still running native
+    /// code when the process exits underneath it.
     fn fatal(&mut self, message: &str) {
         if self.exit_code.is_some() {
             return;
         }
         self.ctx.out.error(message);
+        if let Some(session) = self.session.as_mut() {
+            session.close();
+        }
+        self.ctx.spawner.release();
         self.exit_code = Some(1);
     }
 
@@ -598,8 +726,11 @@ mod tests {
 
     #[derive(Default)]
     struct SpawnLog {
-        prepares: usize,
+        prepares: Vec<PrepareRequest>,
         opens: Vec<OpenRequest>,
+        /// Everything asked of the spawner and every microphone close, in
+        /// order, so a test can pin what happens before what.
+        order: Vec<String>,
     }
 
     #[derive(Clone, Default)]
@@ -608,12 +739,26 @@ mod tests {
     }
 
     impl Spawner for FakeSpawner {
-        fn spawn_prepare(&mut self) {
-            self.log.lock().expect("spawn log").prepares += 1;
+        fn spawn_prepare(&mut self, request: PrepareRequest) {
+            let mut log = self.log.lock().expect("spawn log");
+            log.prepares.push(request);
+            log.order.push("prepare".to_string());
         }
 
         fn spawn_open(&mut self, request: OpenRequest) {
-            self.log.lock().expect("spawn log").opens.push(request);
+            let mut log = self.log.lock().expect("spawn log");
+            log.order.push(format!("open {}", request.id));
+            log.opens.push(request);
+        }
+
+        fn reset_spotter(&mut self) {
+            let mut log = self.log.lock().expect("spawn log");
+            log.order.push("reset spotter".to_string());
+        }
+
+        fn release(&mut self) {
+            let mut log = self.log.lock().expect("spawn log");
+            log.order.push("release".to_string());
         }
     }
 
@@ -638,11 +783,17 @@ mod tests {
     struct FakeCapture {
         id: u32,
         log: CloseLog,
+        spawned: Arc<Mutex<SpawnLog>>,
     }
 
     impl CaptureDevice for FakeCapture {
         fn close(&mut self) {
             self.log.closed.lock().expect("close log").push(self.id);
+            self.spawned
+                .lock()
+                .expect("spawn log")
+                .order
+                .push(format!("close {}", self.id));
         }
     }
 
@@ -692,7 +843,24 @@ mod tests {
         }
 
         fn prepares(&self) -> usize {
-            self.spawner.log.lock().expect("spawn log").prepares
+            self.spawner.log.lock().expect("spawn log").prepares.len()
+        }
+
+        fn prepare_requests(&self) -> Vec<PrepareRequest> {
+            self.spawner.log.lock().expect("spawn log").prepares.clone()
+        }
+
+        /// What the spawner was asked to do and which microphones were
+        /// closed, in order.
+        fn order(&self) -> Vec<String> {
+            self.spawner.log.lock().expect("spawn log").order.clone()
+        }
+
+        fn releases(&self) -> usize {
+            self.order()
+                .iter()
+                .filter(|step| *step == "release")
+                .count()
         }
 
         fn opens(&self) -> usize {
@@ -721,7 +889,17 @@ mod tests {
         }
 
         fn complete_prepare(&mut self) {
-            self.lifecycle.handle(Event::Prepared(Ok(())));
+            self.lifecycle.handle(Event::Prepared(Ok(Prepared {
+                listening_for: vec!["hey claude".to_string(), "open chat".to_string()],
+            })));
+        }
+
+        fn fail_prepare(&mut self, error: PrepareError) {
+            self.lifecycle.handle(Event::Prepared(Err(error)));
+        }
+
+        fn preparing(&mut self, progress: PrepareProgress) {
+            self.lifecycle.handle(Event::Preparing(progress));
         }
 
         /// Complete the open in flight after `elapsed` milliseconds and return
@@ -732,6 +910,7 @@ mod tests {
             let device = FakeCapture {
                 id: self.devices,
                 log: self.closes.clone(),
+                spawned: Arc::clone(&self.spawner.log),
             };
             self.lifecycle
                 .handle(Event::CaptureOpened(Ok(Box::new(device))));
@@ -1256,9 +1435,7 @@ mod tests {
     fn reports_a_preparation_failure_as_a_startup_error() {
         let mut harness = Harness::new();
         harness.line(CONFIG);
-        harness
-            .lifecycle
-            .handle(Event::Prepared(Err("bpe.model is missing".to_string())));
+        harness.fail_prepare(PrepareError::Startup("bpe.model is missing".to_string()));
         assert_eq!(
             harness.sent(),
             ["ERROR:Startup error: bpe.model is missing"]
@@ -1267,25 +1444,278 @@ mod tests {
     }
 
     #[test]
+    fn reports_a_model_that_could_not_load() {
+        let mut harness = Harness::new();
+        harness.line(CONFIG);
+        harness.fail_prepare(PrepareError::ModelLoad(
+            "/models/tokens.txt does not exist".to_string(),
+        ));
+        assert_eq!(
+            harness.sent(),
+            ["ERROR:Failed to load KWS model: /models/tokens.txt does not exist"]
+        );
+        assert_eq!(harness.lifecycle.exit_code(), Some(1));
+        assert_eq!(harness.opens(), 0);
+    }
+
+    #[test]
     fn stays_quiet_about_a_preparation_failure_after_a_stop() {
         let mut harness = Harness::new();
         harness.line(CONFIG);
         harness.line("stop");
-        harness
-            .lifecycle
-            .handle(Event::Prepared(Err("bpe.model is missing".to_string())));
+        harness.fail_prepare(PrepareError::Startup("bpe.model is missing".to_string()));
         assert_eq!(harness.sent(), ["RELEASED"]);
         assert_eq!(harness.lifecycle.exit_code(), Some(0));
     }
 
     #[test]
     fn refuses_a_config_with_no_usable_phrase() {
+        // Whether a phrase is usable is only known once it has been
+        // tokenised, so the refusal comes from preparation, not from the
+        // config line.
         let mut harness = Harness::new();
         harness.line(r#"{"phrases":[{"phrase":42},{"phrase":"  "}],"modelDir":"/models"}"#);
-        harness.complete_prepare();
+        assert_eq!(harness.prepares(), 1, "preparation still runs");
+        assert!(harness.sent().is_empty());
+
+        harness.fail_prepare(PrepareError::NoValidPhrases);
         assert_eq!(harness.sent(), ["ERROR:No valid phrases to detect"]);
         assert_eq!(harness.lifecycle.exit_code(), Some(1));
         assert_eq!(harness.opens(), 0);
+    }
+
+    #[test]
+    fn hands_preparation_the_phrases_the_threshold_and_the_model_directory() {
+        let mut harness = Harness::new();
+        harness.line(
+            r#"{"phrases":[{"phrase":["Hey Claude","open claude"]},{"phrase":"hey chat"}],
+                "threshold":0.3,"modelDir":"/models/kws"}"#,
+        );
+        assert_eq!(
+            harness.prepare_requests(),
+            [PrepareRequest {
+                phrases: vec![
+                    "Hey Claude".to_string(),
+                    "open claude".to_string(),
+                    "hey chat".to_string()
+                ],
+                threshold: 0.3,
+                model_dir: "/models/kws".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_a_detection_from_the_current_microphone() {
+        let mut harness = Harness::new();
+        harness.listening();
+        let id = harness.last_open_id();
+        harness.report(id, CaptureReport::Detected("hey claude".to_string()));
+        assert_eq!(harness.sent(), ["READY", "DETECTED:hey claude"]);
+        assert!(harness.lifecycle.exit_code().is_none());
+    }
+
+    #[test]
+    fn does_not_report_a_detection_from_a_closed_microphone() {
+        let mut harness = Harness::new();
+        harness.listening();
+        let first = harness.last_open_id();
+
+        // Paused: the capture thread's last report was already in the queue.
+        harness.line("pause");
+        harness.report(first, CaptureReport::Detected("hey claude".to_string()));
+        assert_eq!(harness.sent(), ["READY", "PAUSED"]);
+
+        // Resumed on a new microphone: the old one still has no say.
+        harness.line("resume");
+        harness.complete_open(0);
+        harness.report(first, CaptureReport::Detected("hey claude".to_string()));
+        assert_eq!(harness.sent(), ["READY", "PAUSED", "READY"]);
+
+        let second = harness.last_open_id();
+        harness.report(second, CaptureReport::Detected("open chat".to_string()));
+        assert_eq!(
+            harness.sent(),
+            ["READY", "PAUSED", "READY", "DETECTED:open chat"]
+        );
+    }
+
+    #[test]
+    fn does_not_report_a_detection_once_stopping() {
+        let mut harness = Harness::new();
+        harness.listening();
+        let id = harness.last_open_id();
+        harness.line("stop");
+        harness.report(id, CaptureReport::Detected("hey claude".to_string()));
+        assert_eq!(harness.sent(), ["READY", "RELEASED"]);
+    }
+
+    #[test]
+    fn a_pause_gives_the_spotter_a_new_stream_once_the_microphone_is_closed() {
+        let mut harness = Harness::new();
+        let device = harness.listening();
+        harness.line("pause");
+        assert_eq!(
+            harness.order(),
+            [
+                "prepare".to_string(),
+                "open 1".to_string(),
+                format!("close {device}"),
+                "reset spotter".to_string(),
+            ],
+            "the stream is replaced after the close, which waits for the capture thread"
+        );
+        assert_eq!(harness.sent(), ["READY", "PAUSED"]);
+    }
+
+    #[test]
+    fn every_pause_replaces_the_stream() {
+        let mut harness = Harness::new();
+        harness.listening();
+        for _ in 0..3 {
+            harness.line("pause");
+            harness.line("resume");
+            harness.complete_open(0);
+        }
+        let resets = harness
+            .order()
+            .iter()
+            .filter(|step| *step == "reset spotter")
+            .count();
+        assert_eq!(resets, 3);
+    }
+
+    #[test]
+    fn a_pause_before_the_spotter_is_loaded_resets_nothing() {
+        let mut harness = Harness::new();
+        harness.line(CONFIG);
+        harness.line("pause");
+        assert_eq!(harness.sent(), ["PAUSED"]);
+        assert_eq!(harness.order(), ["prepare"]);
+    }
+
+    #[test]
+    fn a_stop_frees_the_spotter_after_it_has_said_released() {
+        let mut harness = Harness::new();
+        let device = harness.listening();
+        harness.line("stop");
+        assert_eq!(
+            harness.order(),
+            [
+                "prepare".to_string(),
+                "open 1".to_string(),
+                format!("close {device}"),
+                "release".to_string(),
+            ]
+        );
+        assert_eq!(harness.sent(), ["READY", "RELEASED"]);
+    }
+
+    #[test]
+    fn a_stop_during_preparation_abandons_it_and_drops_a_spotter_that_arrives_late() {
+        let mut harness = Harness::new();
+        harness.line(CONFIG);
+        assert!(harness.lifecycle.prepare_in_flight());
+        harness.line("stop");
+        assert_eq!(harness.releases(), 1, "preparation is told to stop");
+        assert!(harness.lifecycle.prepare_in_flight());
+
+        harness.complete_prepare();
+        assert!(!harness.lifecycle.prepare_in_flight());
+        assert_eq!(harness.releases(), 2, "the late spotter is dropped");
+        assert_eq!(harness.opens(), 0);
+        assert_eq!(harness.sent(), ["RELEASED"]);
+    }
+
+    #[test]
+    fn a_fatal_error_closes_the_microphone_and_frees_the_spotter_after_the_error_line() {
+        let mut harness = Harness::new();
+        let device = harness.listening();
+        harness.line("paws");
+        assert_eq!(harness.closed(), [device]);
+        assert_eq!(harness.releases(), 1);
+        assert_eq!(harness.lifecycle.exit_code(), Some(1));
+        assert!(harness.sent()[1].starts_with("ERROR:Invalid config JSON: "));
+    }
+
+    #[test]
+    fn writes_preparation_progress_in_debug_mode_as_it_arrives() {
+        let mut harness = Harness::new();
+        harness.line(DEBUG_CONFIG);
+        harness.preparing(PrepareProgress::Timing {
+            phase: "bpe-load",
+            elapsed_ms: 4,
+        });
+        harness.preparing(PrepareProgress::Timing {
+            phase: "tokenise",
+            elapsed_ms: 1,
+        });
+        harness.preparing(PrepareProgress::Debug(
+            "phrase: hey claude -> tokens: \u{2581}HE Y -> decoded: HEY".to_string(),
+        ));
+        harness.preparing(PrepareProgress::Debug(
+            "loading sherpa-onnx KWS model...".to_string(),
+        ));
+        harness.preparing(PrepareProgress::Timing {
+            phase: "model-load",
+            elapsed_ms: 212,
+        });
+        assert_eq!(
+            harness.sent()[1..],
+            [
+                "DEBUG:Timing: bpe-load 4ms",
+                "DEBUG:Timing: tokenise 1ms",
+                "DEBUG:phrase: hey claude -> tokens: \u{2581}HE Y -> decoded: HEY",
+                "DEBUG:loading sherpa-onnx KWS model...",
+                "DEBUG:Timing: model-load 212ms",
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_no_preparation_progress_outside_debug_mode_or_after_the_last_line() {
+        let mut quiet = Harness::new();
+        quiet.line(CONFIG);
+        quiet.preparing(PrepareProgress::Timing {
+            phase: "model-load",
+            elapsed_ms: 212,
+        });
+        assert!(quiet.sent().is_empty());
+
+        let mut stopped = Harness::new();
+        stopped.line(DEBUG_CONFIG);
+        stopped.line("stop");
+        let after_stop = stopped.sent();
+        stopped.preparing(PrepareProgress::Timing {
+            phase: "model-load",
+            elapsed_ms: 212,
+        });
+        assert_eq!(stopped.sent(), after_stop);
+    }
+
+    #[test]
+    fn names_the_phrases_once_after_the_first_ready_and_not_after_a_resume() {
+        let mut harness = Harness::new();
+        harness.line(DEBUG_CONFIG);
+        harness.complete_prepare();
+        harness.complete_open(0);
+        let listening = "DEBUG:mic open, VAD-gated, listening for: hey claude, open chat";
+        let lines = harness.sent();
+        let ready = lines
+            .iter()
+            .position(|line| line == "READY")
+            .expect("READY");
+        assert_eq!(lines[ready + 1], listening, "straight after READY");
+
+        harness.line("pause");
+        harness.line("resume");
+        harness.complete_open(0);
+        let count = harness
+            .sent()
+            .iter()
+            .filter(|line| *line == listening)
+            .count();
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -1411,7 +1841,7 @@ mod tests {
         harness.complete_prepare();
         assert!(
             harness.sent().iter().any(|line| line
-                == "DEBUG:ready; paused before the microphone opened, waiting for resume"),
+                == "DEBUG:models loaded; paused before the microphone opened, waiting for resume"),
             "lines were {:?}",
             harness.sent()
         );

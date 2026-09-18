@@ -25,6 +25,8 @@
 
 use serde_json::Value;
 
+use crate::protocol::js_trim;
+
 /// Lowest usable keyword threshold, matching `clampThreshold()` in
 /// `src/wakeWordCore.ts` and `clampKeywordThreshold()` in
 /// `engine/lib/control.js`.
@@ -68,11 +70,8 @@ pub struct Config {
     /// line per phrase and one flat lookup map.
     pub phrases: Vec<String>,
     /// The clamped trigger threshold, the value every keyword line carries.
-    /// No keyword spotter reads it in this build.
-    #[allow(dead_code)]
     pub threshold: f64,
-    /// Where the extension unpacked the keyword spotting model. Reported in a
-    /// debug line; no keyword spotter reads it in this build.
+    /// Where the extension unpacked the keyword spotting model.
     pub model_dir: String,
     /// Whether to emit `DEBUG:` lines.
     pub debug_mode: bool,
@@ -130,7 +129,7 @@ fn collect_phrases(value: Option<&Value>) -> Vec<String> {
             let Some(text) = candidate.as_str() else {
                 continue;
             };
-            if text.trim().is_empty() {
+            if js_trim(text).is_empty() {
                 continue;
             }
             phrases.push(text.to_string());
@@ -145,10 +144,18 @@ fn collect_phrases(value: Option<&Value>) -> Vec<String> {
 /// `threshold || 0.05` in JavaScript sends zero, NaN, null, and a missing value
 /// to the default; a negative or oversized number is clamped into range.
 pub fn clamp_keyword_threshold(value: Option<&Value>) -> f64 {
-    let raw = match value.and_then(Value::as_f64) {
-        // Zero and NaN are falsy in JavaScript and take the default with them.
-        Some(number) if number != 0.0 && !number.is_nan() => number,
-        _ => DEFAULT_THRESHOLD,
+    clamp_threshold(value.and_then(Value::as_f64).unwrap_or(f64::NAN))
+}
+
+/// The same clamp for a number already in hand. The keyword line builder
+/// applies it again, so a threshold that reaches it by any route is one the
+/// spotter can parse.
+pub fn clamp_threshold(threshold: f64) -> f64 {
+    // Zero and NaN are falsy in JavaScript and take the default with them.
+    let raw = if threshold == 0.0 || threshold.is_nan() {
+        DEFAULT_THRESHOLD
+    } else {
+        threshold
     };
     raw.clamp(MIN_THRESHOLD, MAX_THRESHOLD)
 }
@@ -274,8 +281,28 @@ mod tests {
 
     #[test]
     fn skips_blank_phrases() {
-        let parsed = config(r#"{"phrases":[{"phrase":"   "},{"phrase":""},{"phrase":"\t\r\n"}]}"#);
+        let parsed = config(
+            r#"{"phrases":[{"phrase":"   "},{"phrase":""},{"phrase":"\t\r\n"},{"phrase":"﻿  "}]}"#,
+        );
         assert!(parsed.phrases.is_empty());
+    }
+
+    #[test]
+    fn decides_what_is_blank_the_way_javascript_trims() {
+        // U+0085 is white space to Rust and not to JavaScript, so the Node
+        // engine keeps a phrase made of it and so does this one.
+        let parsed = config(r#"{"phrases":[{"phrase":""}]}"#);
+        assert_eq!(parsed.phrases, vec!["\u{85}"]);
+    }
+
+    #[test]
+    fn clamps_a_number_the_same_way_as_a_json_value() {
+        assert!(close(clamp_threshold(0.5), 0.5));
+        assert!(close(clamp_threshold(7.0), MAX_THRESHOLD));
+        assert!(close(clamp_threshold(-7.0), MIN_THRESHOLD));
+        assert!(close(clamp_threshold(0.0), DEFAULT_THRESHOLD));
+        assert!(close(clamp_threshold(f64::NAN), DEFAULT_THRESHOLD));
+        assert!(close(clamp_threshold(f64::INFINITY), MAX_THRESHOLD));
     }
 
     #[test]
