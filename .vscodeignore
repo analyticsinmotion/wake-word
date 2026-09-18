@@ -17,3 +17,4 @@ eslint.config.mjs
 test-*.js
 **/*.ts
 **/*.map
+engine-rs/**

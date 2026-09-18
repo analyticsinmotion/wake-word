@@ -1,0 +1,32 @@
+[package]
+name = "wake-word-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Wake word detection engine for the Wake Word VS Code extension"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "wake-word-engine"
+path = "src/main.rs"
+
+# serde_json alone. The config line is parsed into a serde_json::Value and read
+# field by field rather than derived into a struct, because the Node engine
+# accepts whatever JSON.parse() produces and coerces it in JavaScript: a
+# non-string phrase is skipped, not fatal, and a missing threshold falls back
+# to the default. A derived struct would reject those lines outright and change
+# the engine's behaviour. serde itself arrives as serde_json's own dependency.
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+# Relays 2 and 3 add decibri and sherpa-onnx, and this binary ships inside the
+# .vsix, so size and start-up cost matter. panic = "abort" is deliberate: a
+# panic on a worker thread would otherwise unwind that thread alone and leave
+# the engine alive but deaf, where aborting lets the extension see the exit and
+# restart the child.
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

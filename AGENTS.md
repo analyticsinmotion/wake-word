@@ -47,6 +47,12 @@ wake-word/
     keywords.js        # BPE piece decoding and the keyword list (boost and threshold per line) / lookup map
     control.js         # stdin line draining, config and command parsing, threshold clamp
     mic-errors.js      # decibri error codes to user-facing messages
+  engine-rs/           # Rust rewrite of the engine child process. Not wired in; see below
+    src/main.rs        # Argument handling, the stdin reader, signals, the event loop
+    src/protocol.rs    # Chunk-safe line splitting, control-line parsing, the stdout vocabulary
+    src/config.rs      # The config JSON shape, threshold clamp, audio device resolution
+    src/lifecycle.rs   # The state machine and the capture session
+    scripts/drive-protocol.mjs  # Pipes commands into the built binary and asserts the answers
   tests/
     unit/              # TypeScript tests for the extension host code
     engine/            # JavaScript tests for engine/lib
@@ -114,6 +120,8 @@ The engine cancels a pending crash-backoff retry in `stop()`, `pause()`, and `st
 **Phrase checks.** `startListening()` calls `reportPhraseChecks()` once it holds the lock, just before the engine starts. `validatePhraseQuality()` warns about a single word, a phrase under `SHORT_PHRASE_LENGTH` (4) characters, and a word from `COMMON_WORDS` on its own; one phrase can draw all three. `detectPhraseCollisions()` flags the same phrase on two routes (only the first can fire: `matchRoute()` takes the first match) and a phrase contained in another route's phrase, by plain substring. Routes are compared by position, not label, and aliases on one route are never compared with each other. Both work on normalised phrases, so they skip what the engine skips. `formatPhraseChecks()` renders one warn line each and a single notification points at them. The report is repeated only when `phraseChecksKey()` (each route's label and normalised phrases) differs from the last one reported, so resumes, restarts, and lock takeovers stay quiet, and so does editing a command or cooldown. Nothing is ever blocked.
 
 **Diagnostics.** `wakeWord.diagnostics` runs `runDiagnostics()`, which gathers the report and hands it to `formatDiagnostics()` in `wakeWordCore.ts`. It resolves the engine's Node.js with `findSystemNode()` and runs `probeNodeVersion()` (`node --version`, 5 s timeout, never rejects), checks the model with `modelStatus()` without downloading, reads the lock with `readLock()`/`describeLock()`, and describes the extension's state with `describeState()`. `formatDiagnostics()` notes an engine Node.js older than `MIN_ENGINE_NODE_MAJOR` (22) and passes every line through `redactHome()`, which replaces the home directory with `~` (whole path segments only; case-insensitive on Windows), because the report is meant to be pasted into a public issue. The lines are logged, and the notification offers Show Log or Copy to Clipboard. No audio and no network.
+
+**Rust engine (`engine-rs/`).** `engine-rs/` is a Rust rewrite of the engine child process, being built in relays so the Node engine keeps working throughout. It removes the system Node.js prerequisite and the native addon ABI matching that goes with it: one static binary at `bin/wake-word-engine[.exe]` in place of `engine/audio-engine.js` plus `engine/node_modules`. The first relay covers the stdin and stdout protocol, the config parser, and the lifecycle state machine, including a `pause` or `stop` that lands while the capture device is still opening; there is no audio capture (Relay 2, decibri) and no keyword spotting (Relay 3, sherpa-onnx) yet, so it never writes a `DETECTED:` line. **`engine/audio-engine.js` under system Node.js is the active engine and stays that way until the switchover relay.** Nothing in `src/` spawns the binary, `engine-rs/**` is excluded from the `.vsix` by `.vscodeignore`, and `engine-rs/target/` is gitignored. Do not change `engine/` to suit the Rust port: the two run side by side until the switchover. `engine-rs/README.md` has the protocol, the build commands, and the relay plan.
 
 **Open Settings.** `wakeWord.openSettings` opens the Settings editor filtered to `wakeWord`. The Off and Listening status bar tooltips are trusted `MarkdownString`s ending in a command link to it; the status bar click itself stays the toggle.
 
