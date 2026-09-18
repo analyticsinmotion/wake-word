@@ -100,9 +100,17 @@ pub fn parse_control_line(line: &str) -> ControlLine {
     }
 }
 
-/// JavaScript's `String.prototype.trim()`, which also strips a byte order mark.
-fn js_trim(line: &str) -> &str {
-    line.trim_matches(|character: char| character.is_whitespace() || character == '\u{feff}')
+/// JavaScript's `String.prototype.trim()`.
+///
+/// It differs from Rust's `str::trim()` in two characters. JavaScript strips
+/// U+FEFF, the byte order mark, and Rust does not; Rust strips U+0085, the C1
+/// next-line control, and JavaScript does not. The Node engine trims control
+/// lines, phrases, and decoded keywords with it, so the same input has to give
+/// the same text here.
+pub fn js_trim(text: &str) -> &str {
+    text.trim_matches(|character: char| {
+        character == '\u{feff}' || (character.is_whitespace() && character != '\u{85}')
+    })
 }
 
 /// Where protocol lines go. The engine writes through this so the state
@@ -170,10 +178,7 @@ impl Reporter {
     ///
     /// The keyword spotter applies its own threshold and returns no usable
     /// score, so the line carries no confidence suffix even though the
-    /// extension's parser accepts one. No keyword spotter is attached in this
-    /// build, so nothing calls this; the format is pinned here so the
-    /// vocabulary is complete in one place.
-    #[allow(dead_code)]
+    /// extension's parser accepts one.
     pub fn detected(&mut self, phrase: &str) {
         self.line(&format!("DETECTED:{phrase}"));
     }
@@ -373,6 +378,20 @@ mod tests {
         assert_eq!(kind("pause\r"), "pause");
         assert_eq!(kind(" resume \r"), "resume");
         assert_eq!(kind("\tstop  "), "stop");
+    }
+
+    #[test]
+    fn trims_what_javascript_trims_and_nothing_else() {
+        assert_eq!(js_trim("\u{feff} stop \u{feff}"), "stop");
+        assert_eq!(
+            js_trim("\u{a0}\u{2003}\u{3000}stop\u{2028}\u{2029}\t\r\n"),
+            "stop"
+        );
+        // White space to Rust, not to JavaScript.
+        assert_eq!(js_trim("\u{85}stop\u{85}"), "\u{85}stop\u{85}");
+        // White space to neither.
+        assert_eq!(js_trim("\u{200b}stop"), "\u{200b}stop");
+        assert_eq!(js_trim(""), "");
     }
 
     #[test]

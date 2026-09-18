@@ -11,18 +11,23 @@
  *
  *   node engine-rs/scripts/drive-protocol.mjs [--bin <path>]
  *
- * A scenario marked `needs: 'microphone'` opens the default microphone, so it
- * needs one, plus ONNX Runtime and the Silero model where the engine looks for
- * them: ORT_DYLIB_PATH and WAKE_WORD_VAD_MODEL, or both files beside the
- * binary. One marked `needs: 'ort'` builds the voice activity detector but
- * fails before a microphone opens. The script reads the engine's self-test
- * first and skips, saying why, any scenario whose prerequisite is missing.
+ * A scenario that needs `microphone` opens the default microphone, so it needs
+ * one, plus ONNX Runtime and the Silero model where the engine looks for them:
+ * ORT_DYLIB_PATH and WAKE_WORD_VAD_MODEL, or both files beside the binary. One
+ * that needs `ort` builds the voice activity detector but fails before a
+ * microphone opens. One that needs `model` loads the keyword spotting model,
+ * which WAKE_WORD_MODEL_DIR must point at: the extracted
+ * sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 directory. Everything
+ * that gets as far as a microphone needs the model too, because the spotter
+ * loads first. The script reads the engine's self-test first and skips, saying
+ * why, any scenario whose prerequisite is missing.
  *
  * Exits 0 when every scenario that ran passed, 1 otherwise.
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +41,27 @@ const TIMEOUT_MS = 10000;
 
 /** An ONNX Runtime path that cannot exist, for the failure scenarios. */
 const MISSING_ORT = path.join(ENGINE_DIR, 'no-such-dir', 'onnxruntime-missing');
+
+/** A model directory that cannot exist. */
+const MISSING_MODEL_DIR = path.join(ENGINE_DIR, 'no-such-dir', 'model');
+
+/** The files the engine loads from the model directory. */
+const MODEL_FILES = [
+  'encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+  'decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+  'joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+  'tokens.txt',
+  'bpe.model',
+];
+
+/** The keyword spotting model, when WAKE_WORD_MODEL_DIR names a complete one. */
+const MODEL_DIR = (() => {
+  const dir = process.env.WAKE_WORD_MODEL_DIR;
+  if (!dir || !MODEL_FILES.every((file) => existsSync(path.join(dir, file)))) {
+    return null;
+  }
+  return path.resolve(dir);
+})();
 
 function resolveBinary() {
   const flag = process.argv.indexOf('--bin');
@@ -58,7 +84,7 @@ function config(overrides = {}) {
       { phrase: 'hey chat', label: 'Chat' },
     ],
     threshold: 0.05,
-    modelDir: '/models',
+    modelDir: MODEL_DIR ?? MISSING_MODEL_DIR,
     debugMode: false,
     audioDevice: '',
     ...overrides,
@@ -147,11 +173,13 @@ class Engine {
 
 /**
  * Timing numbers vary run to run; the shape of the line does not. Lines about
- * voice activity depend on what the microphone hears, so they are dropped.
+ * voice activity and detections depend on what the microphone hears, so they
+ * are dropped.
  */
 function normalise(lines) {
   return lines
-    .filter((line) => !/^DEBUG:(VAD: |segment: |overruns: )/.test(line))
+    .filter((line) => !/^DEBUG:(VAD: |KWS result: |Unmatched KWS result: |overruns: )/.test(line))
+    .filter((line) => !line.startsWith('DETECTED:'))
     .map((line) => line.replace(/ \d+ms$/, ' <n>ms'));
 }
 
@@ -174,7 +202,7 @@ function oneLineStartingWith(prefix) {
 
 const scenarios = [
   {
-    name: 'self-test prints six lines and exits 0',
+    name: 'self-test prints seven lines and exits 0',
     args: ['--self-test'],
     async drive() {},
     expect: (lines) =>
@@ -183,6 +211,7 @@ const scenarios = [
         /^SELF-TEST:platform=\w+-\w+$/,
         /^SELF-TEST:version=\d+\.\d+\.\d+$/,
         /^SELF-TEST:decibri=\d+\.\d+\.\d+$/,
+        /^SELF-TEST:sherpa-onnx=\d+\.\d+\.\d+$/,
         /^SELF-TEST:ort=.+$/,
         /^SELF-TEST:vad-model=.+$/,
       ]),
@@ -198,7 +227,7 @@ const scenarios = [
   },
   {
     name: 'config, pause, resume, stop',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write(config() + '\n');
       await engine.waitFor('READY');
@@ -224,7 +253,7 @@ const scenarios = [
   },
   {
     name: 'a stop during an in-flight open closes the microphone it produces',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write(config({ debugMode: true }) + '\n');
       await engine.waitFor('READY');
@@ -248,7 +277,7 @@ const scenarios = [
   },
   {
     name: 'a config line split across three chunks is reassembled',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       const line = config();
       const first = line.slice(0, 20);
@@ -270,7 +299,7 @@ const scenarios = [
   },
   {
     name: 'blank lines and CRLF are tolerated',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write('\n\r\n   \n');
       engine.write(config() + '\r\n');
@@ -285,7 +314,7 @@ const scenarios = [
   },
   {
     name: 'closing stdin releases and exits 0',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write(config() + '\n');
       await engine.waitFor('READY');
@@ -304,7 +333,7 @@ const scenarios = [
   },
   {
     name: 'an unknown command is fatal',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write(config() + '\n');
       await engine.waitFor('READY');
@@ -320,15 +349,91 @@ const scenarios = [
     exit: 1,
   },
   {
-    name: 'a config with no usable phrase is fatal',
+    name: 'a config with no usable phrase is fatal once the tokeniser has loaded',
+    needs: ['model'],
     async drive(engine) {
-      engine.write(JSON.stringify({ phrases: [{ phrase: 42 }, { phrase: '  ' }] }) + '\n');
+      engine.write(config({ phrases: [{ phrase: 42 }, { phrase: '  ' }] }) + '\n');
     },
     lines: ['ERROR:No valid phrases to detect'],
     exit: 1,
   },
   {
+    name: 'a model directory without the tokeniser model is a startup error',
+    async drive(engine) {
+      engine.write(config({ modelDir: MISSING_MODEL_DIR }) + '\n');
+    },
+    expect: oneLineStartingWith('ERROR:Startup error: Failed to read '),
+    exit: 1,
+  },
+  {
+    name: 'a model directory without the transducer says which file is missing',
+    needs: ['model'],
+    async drive(engine) {
+      // The tokeniser model alone: tokenising succeeds and the model load fails.
+      const partial = mkdtempSync(path.join(os.tmpdir(), 'wake-word-partial-model-'));
+      try {
+        copyFileSync(path.join(MODEL_DIR, 'bpe.model'), path.join(partial, 'bpe.model'));
+        engine.write(config({ modelDir: partial }) + '\n');
+        await engine.waitForExit();
+      } finally {
+        rmSync(partial, { recursive: true, force: true });
+      }
+    },
+    expect: (lines) => {
+      if (lines.length !== 1) return `expected one line, got ${JSON.stringify(lines)}`;
+      const ok =
+        lines[0].startsWith('ERROR:Failed to load KWS model: ') &&
+        lines[0].endsWith('encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx does not exist');
+      return ok ? null : `line was ${lines[0]}`;
+    },
+    exit: 1,
+  },
+  {
+    name: 'a phrase the model has no pieces for is refused by name instead of ending the process',
+    needs: ['model'],
+    async drive(engine) {
+      engine.write(config({ phrases: [{ phrase: 'hey claude' }, { phrase: 'route 66' }] }) + '\n');
+    },
+    lines: [
+      'ERROR:Failed to load KWS model: the phrase "route 66" cannot be spotted: ' +
+        '"66" is not in the model\'s vocabulary',
+    ],
+    exit: 1,
+  },
+  {
+    name: 'a pause during the model load is answered at once and the microphone stays closed',
+    needs: ['model'],
+    async drive(engine) {
+      engine.write(config({ debugMode: true }) + '\npause\n');
+      await engine.waitFor('PAUSED');
+      await engine.waitFor(
+        'DEBUG:models loaded; paused before the microphone opened, waiting for resume'
+      );
+      engine.write('stop\n');
+    },
+    expect: (lines) => {
+      const protocolLines = lines.filter((line) => !line.startsWith('DEBUG:'));
+      if (protocolLines.join('|') !== 'PAUSED|RELEASED') {
+        return `expected PAUSED, RELEASED, got ${protocolLines.join(', ')}`;
+      }
+      return lines.some((line) => line.startsWith('DEBUG:opening microphone'))
+        ? 'the microphone was opened'
+        : null;
+    },
+    exit: 0,
+  },
+  {
+    name: 'a stop during the model load is answered at once',
+    needs: ['model'],
+    async drive(engine) {
+      engine.write(config() + '\nstop\n');
+    },
+    lines: ['RELEASED'],
+    exit: 0,
+  },
+  {
     name: 'an ONNX Runtime that cannot be loaded is reported before any microphone opens',
+    needs: ['model'],
     env: { ORT_DYLIB_PATH: MISSING_ORT },
     async drive(engine) {
       engine.write(config() + '\n');
@@ -340,7 +445,7 @@ const scenarios = [
   },
   {
     name: 'a Silero model that does not exist is reported',
-    needs: 'ort',
+    needs: ['model', 'ort'],
     async drive(engine) {
       const vadModelPath = path.join(ENGINE_DIR, 'no-such-dir', 'silero_vad.onnx');
       engine.write(config({ vadModelPath }) + '\n');
@@ -352,7 +457,7 @@ const scenarios = [
   },
   {
     name: 'a device name that matches no microphone names the setting',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write(config({ audioDevice: 'No Microphone Has This Name 7f3a' }) + '\n');
     },
@@ -364,7 +469,7 @@ const scenarios = [
   },
   {
     name: 'a device index past the end of the list names the setting',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write(config({ audioDevice: '999' }) + '\n');
     },
@@ -376,7 +481,7 @@ const scenarios = [
   },
   {
     name: 'SIGTERM releases and exits 0',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     skip: process.platform === 'win32' ? 'Windows has no POSIX signals' : null,
     async drive(engine) {
       engine.write(config() + '\n');
@@ -388,7 +493,7 @@ const scenarios = [
   },
   {
     name: 'SIGINT releases and exits 0',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     skip: process.platform === 'win32' ? 'Windows has no POSIX signals' : null,
     async drive(engine) {
       engine.write(config() + '\n');
@@ -400,7 +505,7 @@ const scenarios = [
   },
   {
     name: 'debug mode reports every phase',
-    needs: 'microphone',
+    needs: ['model', 'microphone'],
     async drive(engine) {
       engine.write(config({ debugMode: true }) + '\n');
       await engine.waitFor('READY');
@@ -412,11 +517,19 @@ const scenarios = [
     },
     expect: (lines) =>
       matchShapes(lines, [
-        /^DEBUG:wake-word-engine starting, modelDir=\/models$/,
+        /^DEBUG:wake-word-engine starting, modelDir=.+$/,
+        /^DEBUG:Timing: bpe-load <n>ms$/,
+        /^DEBUG:Timing: tokenise <n>ms$/,
+        /^DEBUG:phrase: hey claude -> tokens: \u2581HE Y \u2581C LA U DE -> decoded: HEY CLAUDE$/,
+        /^DEBUG:phrase: open claude -> tokens: \u2581O P EN \u2581C LA U DE -> decoded: OPEN CLAUDE$/,
+        /^DEBUG:phrase: hey chat -> tokens: \u2581HE Y \u2581CHA T -> decoded: HEY CHAT$/,
+        /^DEBUG:loading sherpa-onnx KWS model\.\.\.$/,
+        /^DEBUG:Timing: model-load <n>ms$/,
         /^DEBUG:voice activity model=.+, ONNX Runtime=.+$/,
         /^DEBUG:opening microphone\.\.\.$/,
         /^DEBUG:Timing: mic-open <n>ms$/,
         /^READY$/,
+        /^DEBUG:mic open, VAD-gated, listening for: hey claude, open claude, hey chat$/,
         /^PAUSED$/,
         /^DEBUG:Timing: resume-mic-open <n>ms$/,
         /^READY$/,
@@ -428,7 +541,8 @@ const scenarios = [
 
 /**
  * Read the self-test to learn whether ONNX Runtime and the Silero model can be
- * found. Returns the reason each kind of scenario cannot run, or null.
+ * found, and the environment for the keyword spotting model. Returns the
+ * reason each kind of scenario cannot run, or null.
  */
 async function prerequisites(binary) {
   const engine = new Engine(binary, ['--self-test']);
@@ -439,8 +553,9 @@ async function prerequisites(binary) {
     return line ? line.slice(prefix.length) : 'not found';
   };
   const ort = value('ort') === 'not found' ? 'no ONNX Runtime found' : null;
-  const model = value('vad-model') === 'not found' ? 'no Silero model found' : null;
-  return { ort, microphone: ort ?? model };
+  const vadModel = value('vad-model') === 'not found' ? 'no Silero model found' : null;
+  const model = MODEL_DIR ? null : 'no keyword spotting model: set WAKE_WORD_MODEL_DIR';
+  return { ort, microphone: ort ?? vadModel, model };
 }
 
 async function runScenario(binary, scenario) {
@@ -480,7 +595,8 @@ async function main() {
   let failed = 0;
   let skipped = 0;
   for (const scenario of scenarios) {
-    const skip = scenario.skip ?? (scenario.needs ? missing[scenario.needs] : null);
+    const needs = scenario.needs ?? [];
+    const skip = scenario.skip ?? needs.map((need) => missing[need]).find(Boolean) ?? null;
     if (skip) {
       skipped++;
       console.log(`skip  ${scenario.name} (${skip})`);

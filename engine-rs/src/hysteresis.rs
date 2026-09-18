@@ -12,17 +12,30 @@
 //! inside a phrase that is shorter than the holdoff does not split the phrase
 //! into two segments.
 //!
-//! The policy is decibri's: its bindings apply exactly this state machine
-//! (`_processVadValue` in the Node.js package), with a threshold of 0.5 and a
+//! The policy is decibri's: its Node.js microphone applies exactly this state
+//! machine (`Microphone._processVadValue`), with a threshold of 0.5 and a
 //! holdoff of 300 ms by default. The Rust crate scores audio but leaves the
 //! transitions to its caller, so they are implemented here.
 //!
-//! The holdoff is counted in samples received rather than wall-clock time,
-//! the way decibri's file source counts it. The transition then depends only on
-//! the audio, never on how promptly a chunk was processed. The quiet span
-//! starts at the first sample of the first chunk below the threshold, and
-//! silence is declared on the chunk whose last sample completes the holdoff:
-//! with 100 ms chunks and a 300 ms holdoff, the third consecutive quiet chunk.
+//! The holdoff runs from the moment the first quiet chunk has arrived, which is
+//! the end of that chunk. decibri's live microphone starts a 300 ms timer when
+//! it scores the first chunk below the threshold, and it scores a chunk only
+//! after delivering it, so the timer comes due as the third chunk after that
+//! one arrives, and that chunk is delivered first. With 100 ms chunks, silence
+//! is therefore declared on the fourth consecutive quiet chunk, and everything
+//! up to and including it is part of the speech segment.
+//!
+//! Where the holdoff starts decides how much audio follows a phrase before the
+//! segment ends, and the keyword spotter depends on that audio. It decodes in
+//! steps of 320 ms and reports a keyword only once a step has covered the
+//! phrase's last piece and the blank after it; whatever is still undecoded when
+//! the segment ends is cut off from the phrase by the reset. Ending every
+//! segment one chunk earlier, by counting the holdoff from the start of the
+//! first quiet chunk, loses a large share of phrases said on their own.
+//!
+//! The holdoff is counted in samples rather than on a wall-clock timer, so the
+//! transition depends only on the audio, never on how promptly a chunk was
+//! processed.
 
 /// A change of state reported by [`SpeechHysteresis::update`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +55,8 @@ pub struct SpeechHysteresis {
     /// Samples received so far, which is where the next chunk starts.
     position: u64,
     speaking: bool,
-    /// Where the current run of below-threshold chunks began, while speaking.
+    /// While speaking: the position at which the first chunk of the current
+    /// run of below-threshold chunks ended, which is when the holdoff started.
     quiet_since: Option<u64>,
 }
 
@@ -72,8 +86,7 @@ impl SpeechHysteresis {
     /// Returns the transition this chunk caused, if any. A NaN probability is
     /// below every threshold and counts as quiet.
     pub fn update(&mut self, probability: f32, samples: usize) -> Option<Transition> {
-        let start = self.position;
-        let end = start + samples as u64;
+        let end = self.position + samples as u64;
         self.position = end;
 
         if probability >= self.threshold {
@@ -88,7 +101,7 @@ impl SpeechHysteresis {
         if !self.speaking {
             return None;
         }
-        let quiet_since = *self.quiet_since.get_or_insert(start);
+        let quiet_since = *self.quiet_since.get_or_insert(end);
         if end - quiet_since >= self.holdoff_samples {
             self.speaking = false;
             self.quiet_since = None;
@@ -160,9 +173,10 @@ mod tests {
     #[test]
     fn a_quiet_spell_shorter_than_the_holdoff_does_not_end_speech() {
         let mut machine = detector();
-        // Two quiet chunks is 200 ms, then speech resumes.
+        // Three quiet chunks: the holdoff started when the first had arrived
+        // and is 200 ms old when speech resumes.
         assert_eq!(
-            run(&mut machine, &[0.9, 0.2, 0.1, 0.9, 0.9]),
+            run(&mut machine, &[0.9, 0.2, 0.1, 0.1, 0.9, 0.9]),
             [(0, Transition::Speech)]
         );
         assert!(machine.speaking());
@@ -171,30 +185,45 @@ mod tests {
     #[test]
     fn speech_during_the_holdoff_restarts_it_from_the_next_quiet_chunk() {
         let mut machine = detector();
-        // Quiet, quiet, speech, then three more quiet chunks: the holdoff is
+        // Quiet, quiet, speech, then four more quiet chunks: the holdoff is
         // counted from the first chunk after the speech, not from the first
         // quiet chunk overall.
         assert_eq!(
-            run(&mut machine, &[0.9, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1]),
-            [(0, Transition::Speech), (6, Transition::Silence)]
+            run(&mut machine, &[0.9, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1]),
+            [(0, Transition::Speech), (7, Transition::Silence)]
         );
     }
 
     #[test]
-    fn a_full_holdoff_below_the_threshold_ends_speech() {
+    fn silence_is_declared_on_the_fourth_quiet_chunk() {
+        // The holdoff starts once the first quiet chunk has arrived, so three
+        // more 100 ms chunks complete it. All four are delivered as the tail
+        // of the speech segment.
+        let mut machine = detector();
+        assert_eq!(
+            run(&mut machine, &[0.9, 0.1, 0.1, 0.1, 0.1]),
+            [(0, Transition::Speech), (4, Transition::Silence)]
+        );
+        assert!(!machine.speaking());
+    }
+
+    #[test]
+    fn three_quiet_chunks_are_not_yet_silence() {
         let mut machine = detector();
         assert_eq!(
             run(&mut machine, &[0.9, 0.1, 0.1, 0.1]),
-            [(0, Transition::Speech), (3, Transition::Silence)]
+            [(0, Transition::Speech)]
         );
-        assert!(!machine.speaking());
+        assert!(machine.speaking());
     }
 
     #[test]
     fn silence_is_declared_on_the_exact_sample_that_completes_the_holdoff() {
         let mut machine = detector();
         machine.update(0.9, CHUNK);
-        // 4799 quiet samples is one short of 300 ms at 16 kHz.
+        // The first quiet chunk only starts the holdoff.
+        assert_eq!(machine.update(0.1, CHUNK), None);
+        // 4799 more quiet samples is one short of 300 ms at 16 kHz.
         assert_eq!(machine.update(0.1, 4799), None);
         assert!(machine.speaking());
         assert_eq!(machine.update(0.1, 1), Some(Transition::Silence));
@@ -204,6 +233,7 @@ mod tests {
     fn the_holdoff_boundary_holds_for_uneven_chunk_sizes() {
         let mut machine = detector();
         machine.update(0.9, CHUNK);
+        assert_eq!(machine.update(0.1, 250), None, "starts the holdoff");
         assert_eq!(machine.update(0.1, 1000), None);
         assert_eq!(machine.update(0.1, 3000), None);
         assert_eq!(machine.update(0.1, 799), None);
@@ -211,9 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn one_long_quiet_chunk_can_complete_the_holdoff_on_its_own() {
+    fn the_first_quiet_chunk_never_ends_speech_however_long_it_is() {
+        // The holdoff starts when that chunk has arrived, so it cannot also
+        // complete it; the next chunk can.
         let mut machine = detector();
         machine.update(0.9, CHUNK);
+        assert_eq!(machine.update(0.1, 48_000), None);
         assert_eq!(machine.update(0.1, 4800), Some(Transition::Silence));
     }
 
@@ -229,20 +262,20 @@ mod tests {
     fn repeated_speech_and_silence_cycles_alternate() {
         let mut machine = detector();
         let scores = [
-            0.9, 0.1, 0.1, 0.1, // speech, then silence on the third quiet chunk
+            0.9, 0.1, 0.1, 0.1, 0.1, // speech, then silence on the fourth quiet chunk
             0.0, 0.0, // silent and staying silent
-            0.7, 0.8, 0.2, 0.2, 0.2, // second segment
-            0.6, 0.1, 0.1, 0.1, // third segment
+            0.7, 0.8, 0.2, 0.2, 0.2, 0.2, // second segment
+            0.6, 0.1, 0.1, 0.1, 0.1, // third segment
         ];
         assert_eq!(
             run(&mut machine, &scores),
             [
                 (0, Transition::Speech),
-                (3, Transition::Silence),
-                (6, Transition::Speech),
-                (10, Transition::Silence),
-                (11, Transition::Speech),
-                (14, Transition::Silence),
+                (4, Transition::Silence),
+                (7, Transition::Speech),
+                (12, Transition::Silence),
+                (13, Transition::Speech),
+                (17, Transition::Silence),
             ]
         );
     }
@@ -253,8 +286,8 @@ mod tests {
         assert_eq!(machine.update(f32::NAN, CHUNK), None);
         machine.update(0.9, CHUNK);
         assert_eq!(
-            run(&mut machine, &[f32::NAN, f32::NAN, f32::NAN]),
-            [(2, Transition::Silence)]
+            run(&mut machine, &[f32::NAN, f32::NAN, f32::NAN, f32::NAN]),
+            [(3, Transition::Silence)]
         );
     }
 
@@ -262,6 +295,7 @@ mod tests {
     fn the_holdoff_scales_with_the_sample_rate() {
         let mut machine = SpeechHysteresis::new(0.5, 300, 8_000);
         machine.update(0.9, 800);
+        assert_eq!(machine.update(0.1, 800), None, "starts the holdoff");
         assert_eq!(machine.update(0.1, 2399), None);
         assert_eq!(machine.update(0.1, 1), Some(Transition::Silence));
     }

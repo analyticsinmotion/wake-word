@@ -6,9 +6,9 @@
 //! `DETECTED:<phrase>`, `PAUSED`, `RELEASED`, `ERROR:<msg>`, and, in debug
 //! mode, `DEBUG:<msg>`.
 //!
-//! The engine captures audio through decibri and gates it with Silero voice
-//! activity detection. No keyword spotter is attached, so no `DETECTED` line
-//! is written.
+//! The engine captures audio through decibri, gates it with Silero voice
+//! activity detection, and feeds what passes the gate to a sherpa-onnx keyword
+//! spotter, which listens for the configured phrases.
 //!
 //! Three threads and one channel:
 //!
@@ -19,20 +19,24 @@
 //! - a signal thread turns SIGTERM and SIGINT, or their Windows console
 //!   equivalents, into the same shutdown the `stop` command causes.
 //!
-//! Each microphone gets a thread of its own, which opens it, reports back
-//! through the same channel, and then runs its capture loop until it is
-//! closed. That is what lets a `pause` or a `stop` be answered while an open is
-//! still in flight.
+//! The tokeniser and the keyword spotting model load on a thread of their own,
+//! and each microphone gets one too, which opens it, reports back through the
+//! same channel, and then runs its capture loop, keyword spotting included,
+//! until it is closed. That is what lets a `pause` or a `stop` be answered
+//! while a load or an open is still in flight.
 
 mod assets;
 mod capture;
 mod config;
 mod gate;
 mod hysteresis;
+mod keywords;
 mod lifecycle;
 mod mic_errors;
 mod protocol;
 mod samples;
+mod spotter;
+mod tokeniser;
 
 use std::io::{self, Read};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -53,6 +57,13 @@ const DECIBRI_VERSION: &str = "6.3.0";
 /// has already been written by then, so nothing the extension is waiting for
 /// is held up.
 const SHUTDOWN_DRAIN_MS: u64 = 250;
+
+/// How long shutdown waits for a model load that is still running. Exiting
+/// runs the C++ runtime's static destructors, and doing that underneath a
+/// thread that is inside the model loader can crash the process on its way
+/// out. The load is told to stop at its next step, so this is the most one
+/// step can take; the last line has already been written.
+const PREPARE_DRAIN_MS: u64 = 3000;
 
 fn main() {
     // --self-test runs before the stdin wiring below, which would otherwise
@@ -84,7 +95,7 @@ fn main() {
             Err(_) => engine.handle(Event::StdinClosed),
         }
         if let Some(code) = engine.exit_code() {
-            drain_open_in_flight(&mut engine, &incoming);
+            drain_in_flight(&mut engine, &incoming);
             flush_and_exit(code);
         }
     }
@@ -93,7 +104,9 @@ fn main() {
 /// Confirm the engine runs on this platform and exit.
 ///
 /// CI runs this on every target: a missing or incompatible shared library
-/// shows up here rather than on a user's machine. It opens no microphone.
+/// shows up here rather than on a user's machine. It opens no microphone and
+/// loads no keyword spotting model; the sherpa-onnx line is the version the
+/// statically linked library reports, which proves it linked and runs.
 fn run_self_test() -> ! {
     let mut out = Reporter::new(Box::new(StdoutSink));
     match self_test::run() {
@@ -106,6 +119,7 @@ fn run_self_test() -> ! {
             ));
             out.self_test(&format!("version={}", env!("CARGO_PKG_VERSION")));
             out.self_test(&format!("decibri={DECIBRI_VERSION}"));
+            out.self_test(&format!("sherpa-onnx={}", sherpa_onnx::version()));
             out.self_test(&format!("ort={}", report.ort));
             out.self_test(&format!("vad-model={}", report.vad_model));
             flush_and_exit(0)
@@ -146,20 +160,29 @@ fn spawn_stdin_reader(events: Sender<Event>) {
     });
 }
 
-/// Wait briefly for a capture device that was still opening when shutdown
-/// started, so the state machine can close it.
-fn drain_open_in_flight(engine: &mut Lifecycle, incoming: &Receiver<Event>) {
-    if !engine.open_in_flight() {
-        return;
-    }
-    let deadline = Instant::now() + Duration::from_millis(SHUTDOWN_DRAIN_MS);
+/// Wait briefly for whatever was still in flight when the engine decided to
+/// exit: a microphone that was opening, so the state machine can close it, and
+/// a model load, so the process does not exit underneath it.
+fn drain_in_flight(engine: &mut Lifecycle, incoming: &Receiver<Event>) {
+    let started = Instant::now();
+    let open_deadline = started + Duration::from_millis(SHUTDOWN_DRAIN_MS);
+    let prepare_deadline = started + Duration::from_millis(PREPARE_DRAIN_MS);
 
-    while engine.open_in_flight() {
+    loop {
+        let deadline = if engine.prepare_in_flight() {
+            prepare_deadline
+        } else if engine.open_in_flight() {
+            open_deadline
+        } else {
+            return;
+        };
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return;
         };
         match incoming.recv_timeout(remaining) {
-            Ok(opened @ Event::CaptureOpened(_)) => engine.handle(opened),
+            Ok(finished @ (Event::CaptureOpened(_) | Event::Prepared(_))) => {
+                engine.handle(finished);
+            }
             // A command or a signal after shutdown changes nothing.
             Ok(_) => {}
             Err(_) => return,
@@ -380,6 +403,20 @@ mod tests {
         assert!(
             manifest.lines().any(|line| line.starts_with(&pin)),
             "Cargo.toml does not pin decibri {DECIBRI_VERSION}"
+        );
+    }
+
+    #[test]
+    fn the_linked_sherpa_onnx_library_is_the_pinned_version() {
+        // The version comes from the C library that was linked in, not from
+        // the Rust crate, so this also catches prebuilt libraries of another
+        // release being picked up at build time.
+        let linked = sherpa_onnx::version();
+        let manifest = include_str!("../Cargo.toml");
+        let pin = format!("sherpa-onnx = {{ version = \"={linked}\"");
+        assert!(
+            manifest.lines().any(|line| line.starts_with(&pin)),
+            "the linked sherpa-onnx library is {linked}, which Cargo.toml does not pin"
         );
     }
 }

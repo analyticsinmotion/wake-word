@@ -16,7 +16,14 @@
 //!
 //! Scoring before gating is what puts the chunk that trips the detector on the
 //! right side of the gate: it is delivered with the speech it starts, after
-//! the pre-roll that precedes it.
+//! the pre-roll that precedes it. That chunk is the last 100 ms of the 500 ms
+//! lead-in, so the ring holds the four chunks before it. The Node engine hands
+//! its spotter the same five chunks: decibri's Node.js microphone emits a chunk
+//! before scoring it, so that engine's five-chunk ring already holds the
+//! tripping chunk when speech is declared. The keyword spotter decodes in steps
+//! of 320 ms counted from the first sample it is given, so one chunk more or
+//! less of lead-in moves every step and changes which phrases complete before
+//! a segment ends.
 //!
 //! Nothing here writes to stdout. Everything a microphone has to say goes back
 //! to the event loop as an `Event::Capture` tagged with that microphone's id,
@@ -36,9 +43,12 @@ use decibri::{
 use crate::config::AudioDevice;
 use crate::gate::VadGate;
 use crate::hysteresis::{SpeechHysteresis, Transition};
-use crate::lifecycle::{CaptureDevice, CaptureReport, Event, OpenRequest, Spawner};
+use crate::lifecycle::{
+    CaptureDevice, CaptureReport, Event, OpenRequest, PrepareRequest, Prepared, Spawner,
+};
 use crate::mic_errors::CaptureError;
 use crate::samples::clamp_in_place;
+use crate::spotter::{self, SpotterSlot};
 
 /// Capture rate. The keyword spotting model and Silero both take 16 kHz; the
 /// device is opened at its native rate and decibri resamples.
@@ -48,11 +58,13 @@ pub const CHUNK_SAMPLES: usize = 1600;
 /// AGC target in dBFS: quiet input is driven toward a consistent level, which
 /// is the level the keyword threshold is calibrated against.
 pub const AGC_TARGET_DBFS: i8 = -18;
-/// Pre-roll ring size: 5 chunks, 500 ms of lead-in.
+/// Lead-in handed to the spotter when speech starts: 5 chunks, 500 ms,
+/// counting the chunk that trips the detector.
 pub const PREROLL_CHUNKS: usize = 5;
 /// Speech probability at or above which a chunk is speech.
 pub const SPEECH_THRESHOLD: f32 = 0.5;
-/// How long the probability must stay below the threshold before silence.
+/// How long the probability must stay below the threshold before silence,
+/// counted from the arrival of the first quiet chunk (see `crate::hysteresis`).
 pub const SILENCE_HOLDOFF_MS: u32 = 300;
 /// How often debug mode checks the stream's overrun counter.
 pub const OVERRUN_CHECK_MS: u64 = 30_000;
@@ -97,36 +109,14 @@ pub fn vad_config(request: &OpenRequest) -> VadConfig {
 }
 
 /// Where gated audio goes: every chunk of a speech segment in order, then the
-/// end of that segment, so two segments are never joined into one phrase.
+/// end of that segment, so two segments are never joined into one phrase. The
+/// keyword spotter implements it (see `crate::spotter`).
 pub trait SpeechSink: Send {
     fn accept(&mut self, samples: &[f32], report: &mut dyn FnMut(CaptureReport));
     fn end_segment(&mut self, report: &mut dyn FnMut(CaptureReport));
-}
-
-/// A sink that counts what the gate lets through. No keyword spotter is
-/// attached in this build, so this is what the capture loop feeds; in debug
-/// mode it reports each segment's size when the segment ends.
-#[derive(Default)]
-pub struct ChunkCounter {
-    chunks: usize,
-    samples: usize,
-}
-
-impl SpeechSink for ChunkCounter {
-    fn accept(&mut self, samples: &[f32], _report: &mut dyn FnMut(CaptureReport)) {
-        self.chunks += 1;
-        self.samples += samples.len();
-    }
-
-    fn end_segment(&mut self, report: &mut dyn FnMut(CaptureReport)) {
-        let millis = self.samples as u64 * 1000 / u64::from(SAMPLE_RATE);
-        report(CaptureReport::Debug(format!(
-            "segment: {} chunks, {millis} ms passed the gate",
-            self.chunks
-        )));
-        self.chunks = 0;
-        self.samples = 0;
-    }
+    /// Listening paused: forget everything accepted so far, decoded or not.
+    /// Called from the event loop, never from a capture thread.
+    fn reset(&mut self);
 }
 
 /// One read from a capture stream.
@@ -251,7 +241,9 @@ pub fn run_capture(
             report(line);
         }
     };
-    let mut gate: VadGate<Vec<f32>> = VadGate::new(PREROLL_CHUNKS);
+    // The tripping chunk is delivered as the end of the lead-in, so the ring
+    // holds one chunk fewer than the lead-in.
+    let mut gate: VadGate<Vec<f32>> = VadGate::new(PREROLL_CHUNKS - 1);
     let mut hysteresis = SpeechHysteresis::new(SPEECH_THRESHOLD, SILENCE_HOLDOFF_MS, SAMPLE_RATE);
     let mut overruns = OverrunReporter::new(now_ms());
 
@@ -307,9 +299,11 @@ pub fn run_capture(
         }
         match transition {
             Some(Transition::Speech) => {
+                // Counted the way the Node engine counts it: the chunks held
+                // back, and the chunk that tripped the detector.
                 report(CaptureReport::Debug(format!(
                     "VAD: speech ({} pre-roll chunks)",
-                    gate.preroll_len()
+                    gate.preroll_len() + 1
                 )));
                 for held in gate.speech_started() {
                     sink.accept(&held, &mut report);
@@ -416,34 +410,61 @@ fn capture_thread(request: OpenRequest, events: Sender<Event>, sink: Arc<Mutex<d
     drop(finished_sender);
 }
 
-/// Runs preparation and microphone opens for the real engine.
+/// Runs preparation and microphone opens for the real engine, and holds the
+/// keyword spotter between them.
 pub struct ThreadSpawner {
     events: Sender<Event>,
-    /// Shared by every microphone this engine opens. Only one captures at a
-    /// time: a microphone's thread has finished before its close returns.
-    sink: Arc<Mutex<dyn SpeechSink>>,
+    /// The keyword spotter, once preparation has loaded it. Shared by every
+    /// microphone this engine opens, because the spotter outlives a pause.
+    /// Only one microphone captures at a time: a microphone's thread has
+    /// finished before its close returns.
+    spotter: Arc<Mutex<SpotterSlot>>,
 }
 
 impl ThreadSpawner {
     pub fn new(events: Sender<Event>) -> ThreadSpawner {
         ThreadSpawner {
             events,
-            sink: Arc::new(Mutex::new(ChunkCounter::default())),
+            spotter: Arc::new(Mutex::new(SpotterSlot::default())),
         }
     }
 }
 
 impl Spawner for ThreadSpawner {
-    fn spawn_prepare(&mut self) {
-        // Nothing has to be loaded before the microphone opens: the detector
-        // is built as part of each open.
-        let _ = self.events.send(Event::Prepared(Ok(())));
+    /// The tokeniser and the transducer load on a thread of their own, so a
+    /// `pause` or a `stop` is still answered while they do.
+    fn spawn_prepare(&mut self, request: PrepareRequest) {
+        let events = self.events.clone();
+        let slot = Arc::clone(&self.spotter);
+        thread::spawn(move || {
+            let outcome = spotter::prepare_into(&request, &slot, &mut |progress| {
+                let _ = events.send(Event::Preparing(progress));
+            });
+            // Nothing to report means shutdown overtook the load. The event
+            // loop is waiting to hear that preparation is over either way.
+            let result = outcome.unwrap_or_else(|| Ok(Prepared::default()));
+            let _ = events.send(Event::Prepared(result));
+        });
     }
 
     fn spawn_open(&mut self, request: OpenRequest) {
         let events = self.events.clone();
-        let sink = Arc::clone(&self.sink);
+        let sink: Arc<Mutex<dyn SpeechSink>> = self.spotter.clone();
         thread::spawn(move || capture_thread(request, events, sink));
+    }
+
+    fn reset_spotter(&mut self) {
+        self.spotter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reset();
+    }
+
+    fn release(&mut self) {
+        self.spotter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release();
     }
 }
 
@@ -598,6 +619,58 @@ mod tests {
             self.events.push("end".to_string());
             report(CaptureReport::Debug("sink: segment ended".to_string()));
         }
+
+        fn reset(&mut self) {
+            self.events.push("reset".to_string());
+        }
+    }
+
+    /// A sink that completes a keyword on a chosen chunk, the way the spotter
+    /// does, so the loop's handling of a detection can be pinned.
+    struct DetectingSink {
+        accepted: usize,
+        detect_on: usize,
+    }
+
+    impl SpeechSink for DetectingSink {
+        fn accept(&mut self, _samples: &[f32], report: &mut dyn FnMut(CaptureReport)) {
+            self.accepted += 1;
+            if self.accepted == self.detect_on {
+                report(CaptureReport::Debug("KWS result: {}".to_string()));
+                report(CaptureReport::Detected("hey claude".to_string()));
+            }
+        }
+
+        fn end_segment(&mut self, _report: &mut dyn FnMut(CaptureReport)) {}
+
+        fn reset(&mut self) {}
+    }
+
+    /// Run a scripted stream into a [`DetectingSink`] and return the reports.
+    fn run_detecting(steps: Vec<Step>, debug: bool, detect_on: usize) -> Vec<CaptureReport> {
+        let source = FakeSource::new(steps);
+        let sink = Mutex::new(DetectingSink {
+            accepted: 0,
+            detect_on,
+        });
+        let mut detector = FakeDetector {
+            scores: Rc::clone(&source.scores),
+            seen: Vec::new(),
+            fail_on_call: None,
+        };
+        let clock = Rc::clone(&source.clock);
+        let closed = Arc::clone(&source.closed);
+        let mut reports = Vec::new();
+        run_capture(
+            &source,
+            &mut detector,
+            &sink,
+            &closed,
+            debug,
+            &|| clock.get(),
+            &mut |report| reports.push(report),
+        );
+        reports
     }
 
     struct Run {
@@ -663,7 +736,7 @@ mod tests {
             .iter()
             .filter_map(|report| match report {
                 CaptureReport::Debug(line) => Some(line.clone()),
-                CaptureReport::Failed(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -673,7 +746,7 @@ mod tests {
             .iter()
             .filter_map(|report| match report {
                 CaptureReport::Failed(error) => Some(error.clone()),
-                CaptureReport::Debug(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -731,35 +804,39 @@ mod tests {
     fn holds_silent_chunks_and_flushes_them_ahead_of_the_chunk_that_trips_speech() {
         let run = run(vec![quiet(0.01), quiet(0.02), loud(0.03), loud(0.04)]);
         assert_eq!(run.sink, ["0.01", "0.02", "0.03", "0.04"]);
-        assert_eq!(debug_lines(&run), ["VAD: speech (2 pre-roll chunks)"]);
+        assert_eq!(debug_lines(&run), ["VAD: speech (3 pre-roll chunks)"]);
         assert!(ends_closed(&run));
     }
 
     #[test]
-    fn keeps_five_chunks_of_pre_roll() {
+    fn hands_over_five_chunks_of_lead_in_counting_the_one_that_trips_speech() {
         let steps: Vec<Step> = (1..=8)
             .map(|index| quiet(index as f32 / 100.0))
             .chain([loud(0.5)])
             .collect();
         let run = run(steps);
-        assert_eq!(run.sink, ["0.04", "0.05", "0.06", "0.07", "0.08", "0.5"]);
+        assert_eq!(run.sink, ["0.05", "0.06", "0.07", "0.08", "0.5"]);
         assert_eq!(debug_lines(&run), ["VAD: speech (5 pre-roll chunks)"]);
     }
 
     #[test]
     fn ends_the_segment_after_the_holdoff_and_delivers_the_quiet_tail_first() {
+        // Four quiet chunks follow the speech into the sink before the
+        // segment ends: the one that starts the holdoff and the 300 ms after
+        // it. The fifth is held as pre-roll for whatever comes next.
         let run = run(vec![
             loud(0.1),
             quiet(0.2),
             quiet(0.3),
             quiet(0.4),
             quiet(0.5),
+            quiet(0.6),
         ]);
-        assert_eq!(run.sink, ["0.1", "0.2", "0.3", "0.4", "end"]);
+        assert_eq!(run.sink, ["0.1", "0.2", "0.3", "0.4", "0.5", "end"]);
         assert_eq!(
             debug_lines(&run),
             [
-                "VAD: speech (0 pre-roll chunks)",
+                "VAD: speech (1 pre-roll chunks)",
                 "VAD: silence",
                 "sink: segment ended"
             ]
@@ -780,12 +857,13 @@ mod tests {
             quiet(0.09),
             quiet(0.10),
             quiet(0.11),
+            quiet(0.12),
         ]);
         assert_eq!(
             run.sink,
             [
-                "0.01", "0.02", "0.03", "0.04", "0.05", "end", "0.06", "0.07", "0.08", "0.09",
-                "0.1", "0.11", "end"
+                "0.01", "0.02", "0.03", "0.04", "0.05", "0.06", "end", "0.07", "0.08", "0.09",
+                "0.1", "0.11", "0.12", "end"
             ]
         );
     }
@@ -793,12 +871,18 @@ mod tests {
     #[test]
     fn reports_nothing_but_failures_outside_debug_mode() {
         let run = run_with(
-            FakeSource::new(vec![loud(0.1), quiet(0.2), quiet(0.3), quiet(0.4)]),
+            FakeSource::new(vec![
+                loud(0.1),
+                quiet(0.2),
+                quiet(0.3),
+                quiet(0.4),
+                quiet(0.5),
+            ]),
             false,
             None,
         );
         assert!(debug_lines(&run).is_empty());
-        assert_eq!(run.sink, ["0.1", "0.2", "0.3", "0.4", "end"]);
+        assert_eq!(run.sink, ["0.1", "0.2", "0.3", "0.4", "0.5", "end"]);
         assert!(ends_closed(&run));
     }
 
@@ -941,22 +1025,39 @@ mod tests {
     }
 
     #[test]
-    fn the_counting_sink_reports_each_segment_and_starts_again() {
-        let mut counter = ChunkCounter::default();
-        let mut lines = Vec::new();
-        let mut report = |line: CaptureReport| lines.push(line);
-        for _ in 0..4 {
-            counter.accept(&[0.0; 1600], &mut report);
-        }
-        counter.end_segment(&mut report);
-        counter.accept(&[0.0; 800], &mut report);
-        counter.end_segment(&mut report);
+    fn passes_a_detection_on_whether_or_not_debug_mode_is_on() {
+        let steps = || vec![loud(0.1), loud(0.2), loud(0.3)];
+        let detected = CaptureReport::Detected("hey claude".to_string());
+
+        let quiet = run_detecting(steps(), false, 2);
         assert_eq!(
-            lines,
+            quiet
+                .iter()
+                .filter(|report| !matches!(report, CaptureReport::Failed(_)))
+                .collect::<Vec<_>>(),
+            [&detected],
+            "outside debug mode the detection is all that is said"
+        );
+
+        let debug = run_detecting(steps(), true, 2);
+        assert_eq!(
+            debug[..3],
             [
-                CaptureReport::Debug("segment: 4 chunks, 400 ms passed the gate".to_string()),
-                CaptureReport::Debug("segment: 1 chunks, 50 ms passed the gate".to_string()),
+                CaptureReport::Debug("VAD: speech (1 pre-roll chunks)".to_string()),
+                CaptureReport::Debug("KWS result: {}".to_string()),
+                detected,
             ]
+        );
+    }
+
+    #[test]
+    fn a_detection_in_the_pre_roll_is_reported_while_the_ring_is_flushed() {
+        // The phrase can finish inside the audio held back as pre-roll, so
+        // the sink must be able to report from the flush itself.
+        let reports = run_detecting(vec![quiet(0.01), quiet(0.02), loud(0.03)], false, 1);
+        assert_eq!(
+            reports.first(),
+            Some(&CaptureReport::Detected("hey claude".to_string()))
         );
     }
 }
