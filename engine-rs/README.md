@@ -15,7 +15,8 @@ with Silero voice activity detection, and feeds what passes the gate to a
 [sherpa-onnx](https://crates.io/crates/sherpa-onnx) keyword spotter. When the
 spotter hears a configured phrase the engine writes `DETECTED:<phrase>`. The
 model files, the keyword line syntax, the boost, and the thresholds are the
-Node engine's.
+Node engine's. The engine has no tokeniser: the extension tokenises the wake
+phrases and sends the finished keyword lines in the config line.
 
 The Node engine needs a system Node.js 22 or later on the user's machine, plus
 npm packages with native addons shipped inside the `.vsix`. A native binary
@@ -74,32 +75,39 @@ engine configures it:
 | encoder, decoder, joiner | the three `*-epoch-12-avg-2-chunk-16-left-64.int8.onnx` files in `modelDir` |
 | tokens | `tokens.txt` |
 | provider, threads | `cpu`, 1 |
-| modeling unit, BPE vocabulary | `bpe`, `bpe.model` |
+| `modeling_unit`, `bpe_vocab` | `bpe`, `bpe.model`, as the Node engine passes them; the keyword spotter uses neither and does not check that the file exists |
 | max active paths | 4 |
 | trailing blanks | 1 |
 | keywords score | 1.0 |
 | keywords threshold | the clamped `threshold` from the config |
-| keywords | passed in memory, never written to a file |
+| keywords | `keywordLines` from the config, passed in memory, never written to a file |
 
-The spotter does not take plain text. Each phrase reaches it as one line: the
-tokeniser's pieces for the upper-cased phrase, then a boost score and the
-phrase's own trigger threshold, for example `▁HE Y ▁C LA U DE :3.0 #0.05`. The
-boost is always 3.0 and the threshold is the clamped `threshold` from the
-config. A per-phrase threshold replaces the spotter-wide one, so the lines are
-where `wakeWord.confidenceThreshold` takes effect. The spotter reports a hit as
-the decoded text of the pieces (`HEY CLAUDE`), and the engine maps that back to
-the phrase as configured, lower-cased, before writing `DETECTED:`.
+The spotter does not take plain text. Each phrase reaches it as one keyword
+line: the SentencePiece pieces for the upper-cased phrase, then a boost score
+and the phrase's own trigger threshold, for example
+`▁HE Y ▁C LA U DE :3.0 #0.05`. The extension builds the lines, with a boost of
+3.0 and the clamped `wakeWord.confidenceThreshold` as every line's threshold.
+A per-phrase threshold replaces the spotter-wide one, so the lines are where
+that setting takes effect. The spotter reports a hit as the decoded text of the
+pieces (`HEY CLAUDE`), and the engine maps that back through `phraseMap` to the
+phrase as configured, lower-cased, before writing `DETECTED:`.
 
-The pieces come from the model's own SentencePiece file, `bpe.model`, read by
-the [sentencepiece-rust](https://crates.io/crates/sentencepiece-rust) crate.
-Despite its name the file is a Unigram model with the `nmt_nfkc` normaliser, so
-pieces are chosen by a best-path search over piece scores, and full-width and
-ligature forms fold to plain letters first. The pieces must be the ones the
-Node engine's tokeniser produces, because a different piece sequence is a
-different keyword. They are, except for text with the same letter three times
-running where the doubled letter is itself a piece (`LLL`, `PPP`, `FFF`): there
-two segmentations score exactly the same, floating-point rounding decides, and
-builds of SentencePiece disagree with each other.
+The pieces come from the model's SentencePiece file, `bpe.model`, which the
+extension reads with the same tokeniser the Node engine uses. Despite its name
+the file is a Unigram model with the `nmt_nfkc` normaliser: pieces are chosen
+by a best-path search over piece scores, not by merge rules, and full-width and
+ligature forms fold to plain letters first.
+
+Before the model loads, the engine checks every keyword line against the
+model's `tokens.txt`. The library does not report a bad line as an error: a
+word it cannot find in the token table (a digit or an accented letter, which
+SentencePiece returns as itself) makes it end the process, and so does a boost
+or threshold it cannot read as a number, with nothing written for the extension
+to show. The engine refuses such a line first, as a fatal
+`Failed to load KWS model:` error that names the phrase or the line, and it
+refuses a line with a NUL character, a line break, or no pieces in the same
+way. The extension leaves such phrases out before they reach the engine; the
+check is there for any line that arrives anyway.
 
 The spotter's stream, its decoding state, is restarted in three places:
 
@@ -154,19 +162,13 @@ On Windows the prebuilt libraries are compiled against the static C runtime, so
 file only when it is run from this directory, and a `RUSTFLAGS` environment
 variable replaces those flags rather than adding to them.
 
-Some tokeniser tests need the real model and are ignored by default. To run
-them, point `WAKE_WORD_MODEL_DIR` at the model directory described below:
-
-```bash
-WAKE_WORD_MODEL_DIR=<path> cargo test -- --ignored
-```
-
 ## The keyword spotting model
 
 `modelDir` in the config line is the extracted
 `sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01` directory. The engine
-reads five files from it: the three int8 networks, `tokens.txt`, and
-`bpe.model`. The extension downloads and verifies the archive (`MODEL_URL` and
+reads four files from it: the three int8 networks and `tokens.txt`. The
+directory also holds `bpe.model`, the SentencePiece model the extension
+tokenises the phrases with. The extension downloads and verifies the archive (`MODEL_URL` and
 `MODEL_SHA256` in `src/sherpaEngine.ts`) the first time listening is enabled,
 so for local development the directory is already in the editor's global
 storage once the extension has run:
@@ -256,14 +258,11 @@ stdin open after the config line, because the engine shuts down when stdin
 closes; type `stop` and press Enter to end it:
 
 ```bash
-{ printf '{"phrases":[{"phrase":"hey computer"}],"modelDir":"<path>","debugMode":true}\n'; cat; } | ./target/release/wake-word-engine
+{ printf '{"keywordLines":["▁HE Y ▁COMP U TER :3.0 #0.05"],"phraseMap":{"HEY COMPUTER":"hey computer"},"modelDir":"<path>","debugMode":true}\n'; cat; } | ./target/release/wake-word-engine
 ```
 
 ```text
 DEBUG:wake-word-engine starting, modelDir=<path>
-DEBUG:Timing: bpe-load 2ms
-DEBUG:Timing: tokenise 0ms
-DEBUG:phrase: hey computer -> tokens: ▁HE Y ▁COMP U TER -> decoded: HEY COMPUTER
 DEBUG:loading sherpa-onnx KWS model...
 DEBUG:Timing: model-load 450ms
 DEBUG:voice activity model=<path>, ONNX Runtime=<path>
@@ -284,7 +283,7 @@ Identical to the Node engine's. The extension's side of it lives in
 
 ### stdin
 
-The first line is a JSON config object. Every field is optional:
+The first line is a JSON config object:
 
 ```json
 {
@@ -292,20 +291,31 @@ The first line is a JSON config object. Every field is optional:
   "threshold": 0.05,
   "modelDir": "<path>",
   "debugMode": false,
-  "audioDevice": ""
+  "audioDevice": "",
+  "keywordLines": ["▁HE Y ▁C LA U DE :3.0 #0.05"],
+  "phraseMap": { "HEY CLAUDE": "hey claude" }
 }
 ```
 
-`phrase` is a string or an array of aliases. `label` is never read by the
-engine. `threshold` is clamped to 0.01 to 0.9, defaulting to 0.05, and a phrase
-that is not a string or is blank is skipped rather than being fatal: the routes
-are user-edited JSON and one bad entry must not take the engine down. A config
-with no usable phrase at all is fatal, which is decided once the phrases have
-been tokenised. `modelDir` is the keyword spotting model directory described
-above. `audioDevice` is a device index when it
-is nothing but digits, otherwise a case-insensitive name substring; empty means
-the system default. `vadModelPath` and `ortLibraryPath` are described above;
-the extension does not send them.
+`keywordLines` and `phraseMap` are required; every other field is optional.
+The extension tokenises the phrases: `keywordLines` holds one keyword line per
+phrase, and `phraseMap` maps the decoded text of each line's pieces, which is
+what the spotter reports on a hit, to the phrase as configured, lower-cased.
+Entries that are not strings are ignored. Without `keywordLines` the engine
+answers `ERROR:Startup error: ...`, with an empty array
+`ERROR:No valid phrases to detect`, and without `phraseMap` entries
+`ERROR:Startup error: ...`, all before anything loads. The extension leaves out
+a phrase whose pieces are not all in the model's token table, with a warning,
+so one bad route does not take the engine down; the engine's own check, above,
+catches any such line that arrives anyway.
+
+`phrases` is there for engines that tokenise for themselves; this one does not
+read it. `threshold` is clamped to 0.01 to 0.9, defaulting to 0.05, and passed
+as the spotter-wide threshold; each line carries its own. `modelDir` is the
+keyword spotting model directory described above. `audioDevice` is a device
+index when it is nothing but digits, otherwise a case-insensitive name
+substring; empty means the system default. `vadModelPath` and `ortLibraryPath`
+are described above; the extension does not send them.
 
 Every line after the config is a command:
 
@@ -341,20 +351,22 @@ threshold and returns no usable score. The extension's parser accepts an
 optional `|<conf>` suffix, and nothing sends one.
 
 In debug mode each startup phase is timed as a `DEBUG:Timing: <phase> <n>ms`
-line: `bpe-load` for the tokeniser model, `tokenise` for building the keyword
-lines, `model-load` for the transducer, and `mic-open` for the microphone; each
-reopen after a pause is `resume-mic-open`. The microphone figures include
-loading the Silero model, which happens on every open. Debug mode also reports
-how each phrase was tokenised, each speech and silence transition, the
-spotter's full result for each detection, and, every 30 seconds, decibri's
-overrun count when it has changed since the last report: a rising count means
-the capture loop, keyword spotting included, is falling behind the microphone.
+line: `model-load` for checking the keyword lines and loading the transducer,
+and `mic-open` for the microphone; each reopen after a pause is
+`resume-mic-open`. The extension times the tokenising itself. The microphone
+figures include loading the Silero model, which happens on every open. Debug
+mode also reports each speech and silence transition, the spotter's full
+result for each detection, and, every 30 seconds, decibri's overrun count when
+it has changed since the last report: a rising count means the capture loop,
+keyword spotting included, is falling behind the microphone.
 
 A failure before the microphone opens is one of three lines. `ERROR:Startup
-error: <detail>` means the tokeniser model could not be read. `ERROR:No valid
-phrases to detect` means no phrase survived tokenising. `ERROR:Failed to load
-KWS model: <detail>` means a model file is missing or sherpa-onnx refused the
-configuration, in which case the library's own explanation is on stderr.
+error: <detail>` means the config has no `keywordLines` or no `phraseMap`.
+`ERROR:No valid phrases to detect` means `keywordLines` is empty.
+`ERROR:Failed to load KWS model: <detail>` means a model file is missing, a
+keyword line is one the spotter cannot take (the detail names the phrase or the
+line), or sherpa-onnx refused the configuration, in which case the library's
+own explanation is on stderr.
 
 ### Shutdown
 
@@ -383,15 +395,13 @@ engine-rs/
   src/
     main.rs        argument handling, the self-test, the stdin reader, signals, the event loop
     protocol.rs    chunk-safe line splitting, control-line parsing, stdout lines
-    config.rs      the config JSON shape and its defaults
+    config.rs      the config JSON shape, its defaults, and the decoded-to-phrase map
     lifecycle.rs   the state machine and the capture session
     capture.rs     decibri microphone and Silero setup, the capture loop, the capture and preparation threads
     hysteresis.rs  speech and silence transitions from the speech probability
     gate.rs        the pre-roll ring and the gate
     samples.rs     the [-1, 1] sample clamp
-    keywords.rs    keyword lines (pieces, boost, threshold) and the decoded-to-phrase lookup
-    tokeniser.rs   the SentencePiece tokeniser over the model's bpe.model
-    spotter.rs     the sherpa-onnx spotter configuration, the decode loop, the stream resets, preparation
+    spotter.rs     the sherpa-onnx spotter configuration, the decode loop, the stream resets, the keyword line check, preparation
     mic_errors.rs  decibri error codes to user-facing messages
     assets.rs      where ONNX Runtime and the Silero model are looked for
   scripts/
@@ -400,8 +410,8 @@ engine-rs/
 
 The state machine holds no threads of its own and reacts only to events, so
 every case can be driven from a test, including the ones that need an open to
-still be in flight. The tokeniser and the transducer load on one thread, and
-each microphone runs on a thread of its own: the thread opens it, reports back
+still be in flight. The transducer loads on one thread, and each microphone
+runs on a thread of its own: the thread opens it, reports back
 through the same channel the stdin reader and the signal handler use, and then
 runs the capture loop, keyword spotting included, until the microphone is
 closed. Everything a microphone reports, a detection included, carries the id
@@ -416,13 +426,12 @@ stream can be replaced safely once a pause has closed the microphone.
 | --- | --- |
 | `decibri` `=6.3.0` | microphone capture, conditioning, device selection, Silero voice activity detection, and the typed errors. Built without default features, with `capture`, `vad`, `gain`, and `ort-load-dynamic` |
 | `sherpa-onnx` `=1.13.8` | the keyword spotter. The same release as the Node engine's `sherpa-onnx` package, so the model and its configuration carry over. Built with `static`, which links the C library and its own ONNX Runtime into the executable |
-| `sentencepiece-rust` `=0.1.1` | tokenises the wake phrases with the model's `bpe.model`. Pure Rust, no dependencies of its own |
 | `serde_json` | the config line |
 
 The config line is read out of a `serde_json::Value` field by field rather than
 deserialised into a struct, because the Node engine coerces rather than
-rejects, and a derived struct would turn a phrase of the wrong type into a
-fatal parse error instead of skipping it.
+rejects, and a derived struct would turn a value of the wrong type into a
+fatal parse error instead of ignoring it.
 
 decibri is pinned to an exact version and bumped deliberately. `gain` provides
 the AGC stage. decibri's default feature set would also build playback, the
@@ -430,7 +439,4 @@ denoise stage, and echo cancellation, none of which the engine uses.
 
 sherpa-onnx is pinned to the release the Node engine uses and the two are
 bumped together; a unit test fails if the library that was linked reports a
-different version from the one `Cargo.toml` pins. The tokeniser is pure Rust
-because the SentencePiece C++ library carries its own copy of protobuf, and so
-does the ONNX Runtime inside the sherpa-onnx static libraries: one executable
-cannot link both.
+different version from the one `Cargo.toml` pins.

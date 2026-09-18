@@ -1,31 +1,36 @@
 //! The config line the extension sends as the first line of stdin.
 //!
 //! Port of the config half of `engine/lib/control.js` (`clampKeywordThreshold`,
-//! `resolveAudioDevice`) and of the phrase filtering `buildKeywordSpec()` does
-//! in `engine/lib/keywords.js`.
+//! `resolveAudioDevice`).
 //!
 //! The shape, as `src/sherpaEngine.ts` writes it:
 //!
 //! ```json
 //! { "phrases": [{ "phrase": "hey claude", "label": "Claude" }],
 //!   "threshold": 0.05, "modelDir": "<path>",
-//!   "debugMode": false, "audioDevice": "" }
+//!   "debugMode": false, "audioDevice": "",
+//!   "keywordLines": ["▁HE Y ▁C LA U DE :3.0 #0.05"],
+//!   "phraseMap": { "HEY CLAUDE": "hey claude" } }
 //! ```
 //!
-//! `phrase` is a string or an array of strings, `label` is never read by the
-//! engine, and every field is optional. Two more optional fields,
-//! `vadModelPath` and `ortLibraryPath`, locate the Silero model and the ONNX
-//! Runtime library; the extension does not send them, and without them the
-//! engine searches the places `crate::assets` describes. The values are read one at a time out
-//! of a `serde_json::Value` rather than deserialised into a struct, because the
-//! Node engine coerces rather than rejects: a phrase that is not a string is
-//! skipped, a threshold of zero becomes the default, and a missing field is
-//! simply absent. Deserialising into typed fields would turn each of those into
-//! a fatal `Invalid config JSON`, which is a different engine.
+//! The extension tokenises the phrases. `keywordLines` holds one keyword line
+//! per phrase, SentencePiece pieces followed by the boost and the trigger
+//! threshold, and `phraseMap` maps the decoded text of each line's pieces,
+//! which is what the spotter reports on a hit, to the phrase as configured,
+//! lower-cased. The engine needs both and has no tokeniser, so it does not
+//! read `phrases`, which is there for engines that tokenise for themselves.
+//!
+//! Two more optional fields, `vadModelPath` and `ortLibraryPath`, locate the
+//! Silero model and the ONNX Runtime library; the extension does not send
+//! them, and without them the engine searches the places `crate::assets`
+//! describes. The values are read one at a time out of a `serde_json::Value`
+//! rather than deserialised into a struct, because the Node engine coerces
+//! rather than rejects: a threshold of zero becomes the default, and a value
+//! of the wrong type is ignored. Deserialising into typed fields would turn
+//! each of those into a fatal `Invalid config JSON`, which is a different
+//! engine.
 
 use serde_json::Value;
-
-use crate::protocol::js_trim;
 
 /// Lowest usable keyword threshold, matching `clampThreshold()` in
 /// `src/wakeWordCore.ts` and `clampKeywordThreshold()` in
@@ -61,15 +66,47 @@ impl AudioDevice {
     }
 }
 
+/// Decoded keyword to configured phrase: what the spotter reports on a hit, and
+/// the phrase to write in `DETECTED:` for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhraseMap {
+    entries: Vec<(String, String)>,
+}
+
+impl PhraseMap {
+    /// Add an entry, or replace the phrase of an existing one in place.
+    pub fn insert(&mut self, decoded: String, phrase: String) {
+        match self.entries.iter_mut().find(|(key, _)| *key == decoded) {
+            Some(entry) => entry.1 = phrase,
+            None => self.entries.push((decoded, phrase)),
+        }
+    }
+
+    /// The configured phrase for a keyword the spotter reported.
+    pub fn get(&self, decoded: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(key, _)| key == decoded)
+            .map(|(_, phrase)| phrase.as_str())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// The parsed config line.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Every phrase from every route, flattened in the order they were sent,
-    /// with non-string and blank entries dropped. The engine has no use for the
-    /// route grouping or the label: `buildKeywordSpec()` builds one keyword
-    /// line per phrase and one flat lookup map.
-    pub phrases: Vec<String>,
-    /// The clamped trigger threshold, the value every keyword line carries.
+    /// `keywordLines`: one keyword line per phrase, in the order sent, with
+    /// entries that are not strings dropped. `None` when the config carries
+    /// no such array.
+    pub keyword_lines: Option<Vec<String>>,
+    /// `phraseMap`, without entries whose phrase is not a string. Empty when
+    /// the config carries no such object.
+    pub phrase_map: PhraseMap,
+    /// The clamped trigger threshold. The extension writes the same value on
+    /// every keyword line; here it is the spotter-wide threshold.
     pub threshold: f64,
     /// Where the extension unpacked the keyword spotting model.
     pub model_dir: String,
@@ -91,7 +128,8 @@ impl Config {
     /// finding every field undefined.
     pub fn from_json(value: &Value) -> Config {
         Config {
-            phrases: collect_phrases(value.get("phrases")),
+            keyword_lines: collect_keyword_lines(value.get("keywordLines")),
+            phrase_map: collect_phrase_map(value.get("phraseMap")),
             threshold: clamp_keyword_threshold(value.get("threshold")),
             model_dir: value
                 .get("modelDir")
@@ -106,36 +144,35 @@ impl Config {
     }
 }
 
-/// Flatten `phrases` into the phrase strings the spotter can actually use.
-///
-/// Mirrors the skipping in `buildKeywordSpec()`: a falsy route entry, a
-/// `phrase` that is not a string, and a phrase that is blank once trimmed are
-/// all dropped rather than thrown on. `wakeWord.routes` is user-edited JSON and
-/// one bad entry must not take the engine down before the microphone opens.
-fn collect_phrases(value: Option<&Value>) -> Vec<String> {
-    let mut phrases = Vec::new();
-    let Some(Value::Array(routes)) = value else {
-        return phrases;
+/// Read `keywordLines`: `None` unless it is an array. An entry that is not a
+/// string cannot be a keyword line and is dropped. The strings are kept as
+/// sent; whether the spotter can take each one is checked before the model
+/// loads.
+fn collect_keyword_lines(value: Option<&Value>) -> Option<Vec<String>> {
+    let Some(Value::Array(entries)) = value else {
+        return None;
     };
-    for route in routes {
-        let Some(phrase) = route.get("phrase") else {
-            continue;
-        };
-        let candidates: Vec<&Value> = match phrase {
-            Value::Array(aliases) => aliases.iter().collect(),
-            other => vec![other],
-        };
-        for candidate in candidates {
-            let Some(text) = candidate.as_str() else {
-                continue;
-            };
-            if js_trim(text).is_empty() {
-                continue;
+    Some(
+        entries
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Read `phraseMap`, dropping entries whose phrase is not a string. Anything
+/// but an object is an empty map.
+fn collect_phrase_map(value: Option<&Value>) -> PhraseMap {
+    let mut map = PhraseMap::default();
+    if let Some(Value::Object(entries)) = value {
+        for (decoded, phrase) in entries {
+            if let Some(phrase) = phrase.as_str() {
+                map.insert(decoded.clone(), phrase.to_string());
             }
-            phrases.push(text.to_string());
         }
     }
-    phrases
+    map
 }
 
 /// Clamp the keyword-spotting threshold into the range
@@ -147,10 +184,8 @@ pub fn clamp_keyword_threshold(value: Option<&Value>) -> f64 {
     clamp_threshold(value.and_then(Value::as_f64).unwrap_or(f64::NAN))
 }
 
-/// The same clamp for a number already in hand. The keyword line builder
-/// applies it again, so a threshold that reaches it by any route is one the
-/// spotter can parse.
-pub fn clamp_threshold(threshold: f64) -> f64 {
+/// The same clamp for a number already in hand.
+fn clamp_threshold(threshold: f64) -> f64 {
     // Zero and NaN are falsy in JavaScript and take the default with them.
     let raw = if threshold == 0.0 || threshold.is_nan() {
         DEFAULT_THRESHOLD
@@ -228,9 +263,15 @@ mod tests {
     fn parses_the_config_the_extension_sends_on_start() {
         let parsed = config(
             r#"{"phrases":[{"phrase":"hey claude","label":"Claude"}],"threshold":0.3,
-                "modelDir":"C:\\Users\\me\\models","debugMode":true,"audioDevice":""}"#,
+                "modelDir":"C:\\Users\\me\\models","debugMode":true,"audioDevice":"",
+                "keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3"],
+                "phraseMap":{"HEY CLAUDE":"hey claude"}}"#,
         );
-        assert_eq!(parsed.phrases, vec!["hey claude"]);
+        assert_eq!(
+            parsed.keyword_lines,
+            Some(vec!["\u{2581}HE Y \u{2581}C LA U DE :3.0 #0.3".to_string()])
+        );
+        assert_eq!(parsed.phrase_map.get("HEY CLAUDE"), Some("hey claude"));
         assert!(close(parsed.threshold, 0.3));
         assert_eq!(parsed.model_dir, "C:\\Users\\me\\models");
         assert!(parsed.debug_mode);
@@ -238,21 +279,10 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_phrase_as_a_string_and_as_an_array_of_aliases() {
-        let parsed = config(
-            r#"{"phrases":[{"phrase":["hey claude","open claude"],"label":"Claude"},
-                {"phrase":"hey chat","label":"Chat"}]}"#,
-        );
-        assert_eq!(
-            parsed.phrases,
-            vec!["hey claude", "open claude", "hey chat"]
-        );
-    }
-
-    #[test]
     fn defaults_every_field_that_is_missing() {
         let parsed = config("{}");
-        assert!(parsed.phrases.is_empty());
+        assert_eq!(parsed.keyword_lines, None);
+        assert!(parsed.phrase_map.is_empty());
         assert!(close(parsed.threshold, DEFAULT_THRESHOLD));
         assert_eq!(parsed.model_dir, "");
         assert!(!parsed.debug_mode);
@@ -265,34 +295,101 @@ mod tests {
     fn treats_json_that_is_not_an_object_as_an_empty_config() {
         for json in ["123", "null", "\"hey\"", "[]"] {
             let parsed = config(json);
-            assert!(parsed.phrases.is_empty(), "{json} should carry no phrases");
+            assert_eq!(parsed.keyword_lines, None, "{json}");
+            assert!(parsed.phrase_map.is_empty(), "{json}");
             assert!(close(parsed.threshold, DEFAULT_THRESHOLD), "{json}");
         }
     }
 
     #[test]
-    fn skips_phrases_that_are_not_strings_rather_than_failing() {
-        let parsed = config(
-            r#"{"phrases":[{"phrase":42},{"phrase":null},{"phrase":["hey claude",7,true]},
-                {"label":"no phrase"},null,"hey",{"phrase":{}}]}"#,
+    fn reads_the_keyword_lines_exactly_as_sent_and_in_order() {
+        let parsed =
+            config(r#"{"keywordLines":["▁HE Y ▁CHA T :3.0 #0.05"," ▁O P EN ▁CHA T  :3.0 #0.05"]}"#);
+        assert_eq!(
+            parsed.keyword_lines,
+            Some(vec![
+                "\u{2581}HE Y \u{2581}CHA T :3.0 #0.05".to_string(),
+                " \u{2581}O P EN \u{2581}CHA T  :3.0 #0.05".to_string(),
+            ])
         );
-        assert_eq!(parsed.phrases, vec!["hey claude"]);
     }
 
     #[test]
-    fn skips_blank_phrases() {
-        let parsed = config(
-            r#"{"phrases":[{"phrase":"   "},{"phrase":""},{"phrase":"\t\r\n"},{"phrase":"﻿  "}]}"#,
-        );
-        assert!(parsed.phrases.is_empty());
+    fn has_no_keyword_lines_when_the_field_is_missing_or_not_an_array() {
+        for json in [
+            "{}",
+            r#"{"keywordLines":null}"#,
+            r#"{"keywordLines":"▁HE Y :3.0 #0.05"}"#,
+            r#"{"keywordLines":{}}"#,
+            r#"{"keywordLines":5}"#,
+        ] {
+            assert_eq!(config(json).keyword_lines, None, "{json}");
+        }
     }
 
     #[test]
-    fn decides_what_is_blank_the_way_javascript_trims() {
-        // U+0085 is white space to Rust and not to JavaScript, so the Node
-        // engine keeps a phrase made of it and so does this one.
-        let parsed = config(r#"{"phrases":[{"phrase":""}]}"#);
-        assert_eq!(parsed.phrases, vec!["\u{85}"]);
+    fn reads_an_empty_array_as_no_lines_rather_than_no_field() {
+        assert_eq!(
+            config(r#"{"keywordLines":[]}"#).keyword_lines,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn drops_keyword_lines_that_are_not_strings() {
+        // A blank line is kept: it is refused, with the other lines the
+        // spotter cannot take, before the model loads.
+        let parsed = config(r#"{"keywordLines":[42,null,["▁A"],"▁HE Y :3.0 #0.05",{},""]}"#);
+        assert_eq!(
+            parsed.keyword_lines,
+            Some(vec!["\u{2581}HE Y :3.0 #0.05".to_string(), String::new()])
+        );
+    }
+
+    #[test]
+    fn reads_the_phrase_map() {
+        let parsed = config(r#"{"phraseMap":{"HEY CLAUDE":"hey claude","OPEN CHAT":"open chat"}}"#);
+        assert_eq!(parsed.phrase_map.get("HEY CLAUDE"), Some("hey claude"));
+        assert_eq!(parsed.phrase_map.get("OPEN CHAT"), Some("open chat"));
+        assert_eq!(parsed.phrase_map.get("hey claude"), None);
+    }
+
+    #[test]
+    fn drops_phrase_map_entries_whose_phrase_is_not_a_string() {
+        let parsed =
+            config(r#"{"phraseMap":{"HEY CLAUDE":"hey claude","A":1,"B":null,"C":["c"]}}"#);
+        assert_eq!(parsed.phrase_map.get("HEY CLAUDE"), Some("hey claude"));
+        for key in ["A", "B", "C"] {
+            assert_eq!(parsed.phrase_map.get(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn has_an_empty_phrase_map_when_the_field_is_missing_or_not_an_object() {
+        for json in [
+            "{}",
+            r#"{"phraseMap":null}"#,
+            r#"{"phraseMap":[["HEY CLAUDE","hey claude"]]}"#,
+            r#"{"phraseMap":"HEY CLAUDE"}"#,
+        ] {
+            assert!(config(json).phrase_map.is_empty(), "{json}");
+        }
+    }
+
+    #[test]
+    fn replaces_the_phrase_of_an_entry_already_in_the_map_and_keeps_its_place() {
+        let mut map = PhraseMap::default();
+        map.insert("HEY CLAUDE".into(), "hey claude".into());
+        map.insert("OPEN CHAT".into(), "open chat".into());
+        map.insert("HEY CLAUDE".into(), "hey  claude".into());
+        assert_eq!(map.get("HEY CLAUDE"), Some("hey  claude"));
+        assert_eq!(
+            map.entries,
+            [
+                ("HEY CLAUDE".to_string(), "hey  claude".to_string()),
+                ("OPEN CHAT".to_string(), "open chat".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -303,25 +400,6 @@ mod tests {
         assert!(close(clamp_threshold(0.0), DEFAULT_THRESHOLD));
         assert!(close(clamp_threshold(f64::NAN), DEFAULT_THRESHOLD));
         assert!(close(clamp_threshold(f64::INFINITY), MAX_THRESHOLD));
-    }
-
-    #[test]
-    fn keeps_a_phrase_exactly_as_sent() {
-        // Case folding and trimming belong to the keyword builder, which
-        // needs both the upper case form and the lower case one.
-        let parsed = config(r#"{"phrases":[{"phrase":"  Hey Claude  "}]}"#);
-        assert_eq!(parsed.phrases, vec!["  Hey Claude  "]);
-    }
-
-    #[test]
-    fn ignores_a_phrases_field_that_is_not_an_array() {
-        for json in [
-            r#"{"phrases":5}"#,
-            r#"{"phrases":"hey"}"#,
-            r#"{"phrases":{}}"#,
-        ] {
-            assert!(config(json).phrases.is_empty(), "{json}");
-        }
     }
 
     #[test]

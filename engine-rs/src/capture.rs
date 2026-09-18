@@ -431,8 +431,8 @@ impl ThreadSpawner {
 }
 
 impl Spawner for ThreadSpawner {
-    /// The tokeniser and the transducer load on a thread of their own, so a
-    /// `pause` or a `stop` is still answered while they do.
+    /// The transducer loads on a thread of its own, so a `pause` or a `stop`
+    /// is still answered while it does.
     fn spawn_prepare(&mut self, request: PrepareRequest) {
         let events = self.events.clone();
         let slot = Arc::clone(&self.spotter);

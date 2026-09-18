@@ -18,9 +18,11 @@
 //!   in place, and that audio would be decoded ahead of whatever is heard after
 //!   the resume. A new stream holds nothing from before the pause.
 //!
-//! The spotter reports a keyword as the decoded text of its pieces, so a hit is
-//! mapped back to the configured phrase through the lookup the keyword builder
-//! made. A keyword with no entry is dropped, and the search still restarts.
+//! The phrases arrive as keyword lines the extension has already tokenised,
+//! with a phrase map from the decoded text of each line's pieces, which is how
+//! the spotter reports a keyword, to the phrase as configured. A hit is mapped
+//! back through that map. A keyword with no entry is dropped, and the search
+//! still restarts.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -31,16 +33,23 @@ use sherpa_onnx::OnlineTransducerModelConfig;
 use sherpa_onnx::{KeywordSpotter, KeywordSpotterConfig, OnlineModelConfig, OnlineStream};
 
 use crate::capture::{SpeechSink, SAMPLE_RATE};
-use crate::keywords::{build_keyword_spec, KeywordSpec, PhraseMap};
+use crate::config::PhraseMap;
 use crate::lifecycle::{CaptureReport, PrepareError, PrepareProgress, PrepareRequest, Prepared};
 use crate::protocol::js_trim;
-use crate::tokeniser::{Tokeniser, TOKENISER_MODEL_FILE};
 
 /// The transducer's three networks, int8 quantised, and its token table.
 pub const ENCODER_FILE: &str = "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx";
 pub const DECODER_FILE: &str = "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx";
 pub const JOINER_FILE: &str = "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx";
 pub const TOKENS_FILE: &str = "tokens.txt";
+/// The model's SentencePiece file. The configuration names it, as the Node
+/// engine's does, but the keyword spotter neither reads it nor checks that it
+/// exists, and the keyword lines arrive tokenised, so the engine does not need
+/// it either.
+pub const TOKENISER_MODEL_FILE: &str = "bpe.model";
+
+/// SentencePiece marks a word boundary with U+2581 LOWER ONE EIGHTH BLOCK.
+const WORD_BOUNDARY: char = '\u{2581}';
 
 /// Mel filterbank bins per frame, which is what the model was trained on.
 pub const FEATURE_DIM: i32 = 80;
@@ -185,9 +194,10 @@ impl SpeechSink for SpotterSlot {
 /// `keywords_threshold` is the spotter-wide trigger threshold. Every keyword
 /// line carries its own `#` threshold, which replaces it, so the value decides
 /// nothing; it is passed because a line without the field would fall back to
-/// it. `modeling_unit` and `bpe_vocab` are validated by the library and are
-/// otherwise unused by the keyword spotter, which expects lines that are
-/// already tokenised.
+/// it. `modeling_unit` and `bpe_vocab` are passed because the Node engine
+/// passes them. The keyword spotter expects lines that are already tokenised
+/// and uses neither: it creates a spotter with `bpe_vocab` naming an empty
+/// file, or no file at all.
 pub fn spotter_config(model_dir: &str, threshold: f64, keywords: &str) -> KeywordSpotterConfig {
     let file = |name: &str| {
         Some(
@@ -230,16 +240,10 @@ pub fn spotter_config(model_dir: &str, threshold: f64, keywords: &str) -> Keywor
 /// directory, if any is missing. Checked before anything is read, so a partial
 /// model directory is reported the same way whichever file is absent.
 fn missing_model_file(model_dir: &str) -> Option<PathBuf> {
-    [
-        ENCODER_FILE,
-        DECODER_FILE,
-        JOINER_FILE,
-        TOKENS_FILE,
-        TOKENISER_MODEL_FILE,
-    ]
-    .iter()
-    .map(|name| Path::new(model_dir).join(name))
-    .find(|path| !path.is_file())
+    [ENCODER_FILE, DECODER_FILE, JOINER_FILE, TOKENS_FILE]
+        .iter()
+        .map(|name| Path::new(model_dir).join(name))
+        .find(|path| !path.is_file())
 }
 
 /// The sherpa-onnx keyword spotter and its current stream.
@@ -254,13 +258,14 @@ impl SherpaEngine {
     /// Load the model and create the first stream.
     fn create(model_dir: &str, threshold: f64, keywords: &str) -> Result<SherpaEngine, String> {
         // The bindings turn every string into a C string and panic on an
-        // interior NUL, which a phrase or a path from the config line can
-        // carry.
+        // interior NUL, which a keyword line or a path from the config line
+        // can carry. check_keyword_lines() has refused such a line already;
+        // this keeps the call itself safe.
         if model_dir.contains('\0') {
             return Err("the model directory path contains a NUL character".to_string());
         }
         if keywords.contains('\0') {
-            return Err("a phrase contains a NUL character".to_string());
+            return Err("a keyword line contains a NUL character".to_string());
         }
         if let Some(path) = missing_model_file(model_dir) {
             return Err(format!("{} does not exist", path.display()));
@@ -309,13 +314,9 @@ impl KeywordEngine for SherpaEngine {
     }
 }
 
-/// A loaded tokeniser: upper-cased phrase in, pieces out.
-pub type Encoder = Box<dyn Fn(&str) -> Result<Vec<String>, String>>;
-
 /// What preparation loads from the model directory, so a test can stand in
 /// for all of it.
 pub trait PrepareBackend {
-    fn load_tokeniser(&self, model_dir: &str) -> Result<Encoder, String>;
     /// Every token in the model's token table.
     fn load_vocabulary(&self, model_dir: &str) -> Result<HashSet<String>, String>;
     fn create_engine(
@@ -326,15 +327,10 @@ pub trait PrepareBackend {
     ) -> Result<Box<dyn KeywordEngine>, String>;
 }
 
-/// SentencePiece and sherpa-onnx.
+/// The model directory and sherpa-onnx.
 pub struct ModelBackend;
 
 impl PrepareBackend for ModelBackend {
-    fn load_tokeniser(&self, model_dir: &str) -> Result<Encoder, String> {
-        let tokeniser = Tokeniser::load(model_dir)?;
-        Ok(Box::new(move |text| tokeniser.encode_pieces(text)))
-    }
-
     fn load_vocabulary(&self, model_dir: &str) -> Result<HashSet<String>, String> {
         if let Some(path) = missing_model_file(model_dir) {
             return Err(format!("{} does not exist", path.display()));
@@ -365,37 +361,140 @@ fn parse_vocabulary(tokens_txt: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Refuse a phrase the spotter cannot take.
+/// The words of a keyword line, split where the library splits them: on the
+/// characters C's `isspace()` accepts, and nothing else.
+fn words(line: &str) -> impl Iterator<Item = &str> {
+    line.split([' ', '\t', '\n', '\u{0b}', '\u{0c}', '\r'])
+        .filter(|word| !word.is_empty())
+}
+
+/// A word that sets the boost (`:`) or the trigger threshold (`#`) of its line
+/// rather than naming a piece.
+fn is_field(word: &str) -> bool {
+    word.starts_with([':', '#'])
+}
+
+/// Turn a piece list back into plain text.
 ///
-/// The spotter looks every piece of a keyword line up in the model's token
-/// table. The tokeniser returns text the model does not cover as itself, a
-/// digit or an accented letter for instance, and such a piece is not in the
-/// table. The library does not report that as an error: it ends the process
-/// from inside the call that creates the spotter, so nothing is written for
-/// the extension to show. Checking first turns it into an ordinary fatal error
-/// that names the phrase.
-fn check_pieces(spec: &KeywordSpec, vocabulary: &HashSet<String>) -> Result<(), String> {
-    for detail in &spec.details {
-        if let Some(piece) = detail
-            .tokens
-            .split(' ')
-            .find(|piece| !vocabulary.contains(*piece))
-        {
-            return Err(format!(
-                "the phrase {:?} cannot be spotted: {piece:?} is not in the model's vocabulary",
-                detail.phrase
-            ));
+/// A leading boundary marker becomes a space, the pieces are joined, and the
+/// result is trimmed. This is the form the spotter reports a keyword in, and
+/// the form of the phrase map's keys.
+fn decode_pieces<'a>(pieces: impl IntoIterator<Item = &'a str>) -> String {
+    let mut text = String::new();
+    for piece in pieces {
+        match piece.strip_prefix(WORD_BOUNDARY) {
+            Some(rest) => {
+                text.push(' ');
+                text.push_str(rest);
+            }
+            None => text.push_str(piece),
+        }
+    }
+    js_trim(&text).to_string()
+}
+
+/// What the spotter reports on hearing a keyword line: its pieces, decoded.
+fn decoded_line(line: &str) -> String {
+    decode_pieces(words(line).filter(|word| !is_field(word)))
+}
+
+/// Whether `text` is a boost or threshold value the library can read.
+///
+/// The library converts the value with `std::stof`, which throws for text that
+/// does not start with a number and for a number a float cannot hold, and the
+/// exception ends the process. Accepted here: digits with an optional sign,
+/// point, and exponent, whose value is zero or a normal float. Nothing else is,
+/// not even a number followed by other text, which the library would read
+/// while ignoring the rest.
+fn is_readable_number(text: &str) -> bool {
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'+' | b'-' | b'e' | b'E'));
+    plain
+        && text.parse::<f64>().is_ok_and(|value| {
+            let magnitude = value.abs();
+            magnitude == 0.0
+                || (f64::from(f32::MIN_POSITIVE)..=f64::from(f32::MAX)).contains(&magnitude)
+        })
+}
+
+/// Refuse a keyword line the spotter cannot take.
+///
+/// Each word of a line must be a piece in the model's token table or a `:` or
+/// `#` field with a readable number. The library does not report a line that
+/// breaks this as an error. A word it cannot find in the token table, such as
+/// a digit or an accented letter SentencePiece returned as itself, makes it
+/// end the process from inside the call that creates the spotter, so nothing
+/// is written for the extension to show, and a field it cannot read as a
+/// number ends the process the same way. The bindings pass the lines as a C
+/// string, which cannot hold a NUL. A line break would make one entry two
+/// keyword lines, and a line with no pieces names no keyword. Checking every
+/// line first turns each of these into an ordinary fatal error that names the
+/// phrase or the line.
+fn check_keyword_lines(
+    lines: &[String],
+    vocabulary: &HashSet<String>,
+    phrase_map: &PhraseMap,
+) -> Result<(), String> {
+    for line in lines {
+        if line.contains('\0') {
+            return Err(format!("a keyword line contains a NUL character: {line:?}"));
+        }
+        if line.contains('\n') {
+            return Err(format!("a keyword line contains a line break: {line:?}"));
+        }
+        let mut pieces = 0;
+        for word in words(line) {
+            if vocabulary.contains(word) {
+                pieces += 1;
+            } else if is_field(word) {
+                if !is_readable_number(&word[1..]) {
+                    return Err(format!(
+                        "a keyword line has a boost or threshold that is not a number: {word:?} in {line:?}"
+                    ));
+                }
+            } else {
+                let decoded = decoded_line(line);
+                let phrase = phrase_map.get(&decoded).unwrap_or(&decoded);
+                return Err(format!(
+                    "the phrase {phrase:?} cannot be spotted: {word:?} is not in the model's vocabulary"
+                ));
+            }
+        }
+        if pieces == 0 {
+            return Err(format!("a keyword line has no pieces: {line:?}"));
         }
     }
     Ok(())
 }
 
-/// Load the tokeniser, build the keyword lines, and load the model.
+/// The configured phrases in the order their keyword lines first name them,
+/// once each: the order of the phrase map's values, as the extension builds
+/// the map from these lines. A line the map has no phrase for names none.
+fn listening_for(lines: &[String], phrase_map: &PhraseMap) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut phrases = Vec::new();
+    for line in lines {
+        let decoded = decoded_line(line);
+        if seen.contains(&decoded) {
+            continue;
+        }
+        if let Some(phrase) = phrase_map.get(&decoded) {
+            phrases.push(phrase.to_string());
+        }
+        seen.push(decoded);
+    }
+    phrases
+}
+
+/// Check the keyword lines and load the model.
 ///
-/// The order is the Node engine's, and so is where each failure lands: a
-/// tokeniser that cannot load is a startup error, no usable phrase is refused
-/// once the phrases have been tokenised, and a model that cannot load says so.
-/// `progress` carries the debug lines and the phase timings as they happen.
+/// The lines arrive tokenised, so this is the model half of the Node engine's
+/// startup: every line is checked against the model's token table, then the
+/// transducer loads. A line the spotter cannot take, a token table that cannot
+/// be read, and a model that cannot load are all model load failures.
+/// `progress` carries the debug line and the phase timing as they happen.
 ///
 /// Returns `Ok(None)` when `cancelled` said so before the model load, which is
 /// the expensive step: a shutdown that has already been acknowledged should not
@@ -407,36 +506,8 @@ pub fn prepare(
     cancelled: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(PrepareProgress),
 ) -> Result<Option<(Spotter, Prepared)>, PrepareError> {
-    let timed = |phase: &'static str, since: u64, progress: &mut dyn FnMut(PrepareProgress)| {
-        progress(PrepareProgress::Timing {
-            phase,
-            elapsed_ms: now_ms().saturating_sub(since),
-        });
-    };
-
-    let since = now_ms();
-    let encode = backend
-        .load_tokeniser(&request.model_dir)
-        .map_err(PrepareError::Startup)?;
-    timed("bpe-load", since, progress);
-
     if cancelled() {
         return Ok(None);
-    }
-
-    let since = now_ms();
-    let spec = build_keyword_spec(&request.phrases, &*encode, request.threshold)
-        .map_err(PrepareError::Startup)?;
-    timed("tokenise", since, progress);
-
-    for detail in &spec.details {
-        progress(PrepareProgress::Debug(format!(
-            "phrase: {} -> tokens: {} -> decoded: {}",
-            detail.phrase, detail.tokens, detail.decoded
-        )));
-    }
-    if spec.keyword_lines.is_empty() {
-        return Err(PrepareError::NoValidPhrases);
     }
 
     progress(PrepareProgress::Debug(
@@ -446,21 +517,27 @@ pub fn prepare(
     let vocabulary = backend
         .load_vocabulary(&request.model_dir)
         .map_err(PrepareError::ModelLoad)?;
-    check_pieces(&spec, &vocabulary).map_err(PrepareError::ModelLoad)?;
-    let engine = backend
-        .create_engine(&request.model_dir, request.threshold, &spec.keywords())
+    check_keyword_lines(&request.keyword_lines, &vocabulary, &request.phrase_map)
         .map_err(PrepareError::ModelLoad)?;
-    timed("model-load", since, progress);
+    let engine = backend
+        .create_engine(
+            &request.model_dir,
+            request.threshold,
+            &request.keyword_lines.join("\n"),
+        )
+        .map_err(PrepareError::ModelLoad)?;
+    progress(PrepareProgress::Timing {
+        phase: "model-load",
+        elapsed_ms: now_ms().saturating_sub(since),
+    });
 
     let prepared = Prepared {
-        listening_for: spec
-            .phrase_map
-            .phrases()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        listening_for: listening_for(&request.keyword_lines, &request.phrase_map),
     };
-    Ok(Some((Spotter::new(engine, spec.phrase_map), prepared)))
+    Ok(Some((
+        Spotter::new(engine, request.phrase_map.clone()),
+        prepared,
+    )))
 }
 
 /// Run [`prepare`] against the real model and put the spotter in its slot.
@@ -495,6 +572,7 @@ pub fn prepare_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// What a scripted engine was asked to do, in order.
@@ -555,6 +633,14 @@ mod tests {
         }
     }
 
+    fn phrase_map(entries: &[(&str, &str)]) -> PhraseMap {
+        let mut map = PhraseMap::default();
+        for (decoded, phrase) in entries {
+            map.insert(decoded.to_string(), phrase.to_string());
+        }
+        map
+    }
+
     struct Rig {
         spotter: Spotter,
         calls: Arc<Mutex<Vec<Call>>>,
@@ -569,20 +655,9 @@ mod tests {
                 pending: 0,
                 calls: Arc::clone(&calls),
             };
-            let encode = |text: &str| -> Result<Vec<String>, String> {
-                Ok(text
-                    .split(' ')
-                    .map(|word| format!("\u{2581}{word}"))
-                    .collect())
-            };
-            let spec = build_keyword_spec(
-                &["Hey Claude".to_string(), "open chat".to_string()],
-                &encode,
-                0.05,
-            )
-            .expect("spec");
+            let map = phrase_map(&[("HEY CLAUDE", "hey claude"), ("OPEN CHAT", "open chat")]);
             Rig {
-                spotter: Spotter::new(Box::new(engine), spec.phrase_map),
+                spotter: Spotter::new(Box::new(engine), map),
                 calls,
                 reports: Vec::new(),
             }
@@ -672,6 +747,33 @@ mod tests {
             [
                 CaptureReport::Debug("KWS result: {\"keyword\":\" HEY CLAUDE \"}".to_string()),
                 CaptureReport::Detected("hey claude".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn looks_a_hit_up_in_the_phrase_map_the_config_line_carried() {
+        let json = r#"{"keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],
+                       "phraseMap":{"HEY CLAUDE":"hey claude","OPEN MAPS":"open the map"}}"#;
+        let config = Config::from_json(&serde_json::from_str(json).expect("json"));
+        let engine = ScriptedEngine {
+            script: vec!["HEY CLAUDE", "OPEN MAPS"],
+            pending: 0,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut spotter = Spotter::new(Box::new(engine), config.phrase_map);
+        let mut reports = Vec::new();
+        spotter.accept(&[0.0; 1600], &mut |report| reports.push(report));
+        spotter.accept(&[0.0; 1600], &mut |report| reports.push(report));
+        let detected: Vec<CaptureReport> = reports
+            .into_iter()
+            .filter(|report| matches!(report, CaptureReport::Detected(_)))
+            .collect();
+        assert_eq!(
+            detected,
+            [
+                CaptureReport::Detected("hey claude".to_string()),
+                CaptureReport::Detected("open the map".to_string()),
             ]
         );
     }
@@ -861,55 +963,101 @@ mod tests {
             .err()
             .expect("an error");
         assert!(path.contains("NUL"), "{path}");
-        let phrase = SherpaEngine::create("models", 0.05, "\u{2581}HE \0 Y")
+        let line = SherpaEngine::create("models", 0.05, "\u{2581}HE \0 Y")
             .err()
             .expect("an error");
-        assert!(phrase.contains("NUL"), "{phrase}");
+        assert!(line.contains("NUL"), "{line}");
     }
 
-    /// A backend whose loads succeed or fail as told, and which counts them.
+    #[test]
+    fn reads_the_token_table_one_token_per_line() {
+        let vocabulary =
+            parse_vocabulary("<blk> 0\n<unk> 2\r\nS 3\n\u{2581}THE 5\n' 13\n\u{2581} 20\n");
+        for token in ["<blk>", "<unk>", "S", "\u{2581}THE", "'", "\u{2581}"] {
+            assert!(vocabulary.contains(token), "{token}");
+        }
+        assert_eq!(vocabulary.len(), 6);
+        assert!(!vocabulary.contains("3"));
+    }
+
+    #[test]
+    fn decoding_turns_the_boundary_marker_back_into_a_space() {
+        assert_eq!(
+            decode_pieces(["\u{2581}HEY", "\u{2581}CLAUDE"]),
+            "HEY CLAUDE"
+        );
+    }
+
+    #[test]
+    fn decoding_joins_sub_word_pieces_without_a_space() {
+        assert_eq!(decode_pieces(["\u{2581}CL", "AU", "DE"]), "CLAUDE");
+        assert_eq!(decode_pieces(["HE", "Y"]), "HEY");
+    }
+
+    #[test]
+    fn decoding_trims_the_first_boundary_and_handles_no_pieces() {
+        assert_eq!(decode_pieces(["\u{2581}COMPUTER"]), "COMPUTER");
+        assert_eq!(decode_pieces([]), "");
+    }
+
+    #[test]
+    fn decoding_replaces_only_a_leading_boundary_marker() {
+        assert_eq!(decode_pieces(["\u{2581}A\u{2581}B"]), "A\u{2581}B");
+    }
+
+    #[test]
+    fn decoding_trims_the_way_javascript_does() {
+        // The phrase map's keys were decoded by the extension in JavaScript.
+        // U+0085 is white space to Rust and not to JavaScript; U+FEFF is the
+        // other way round.
+        assert_eq!(decode_pieces(["\u{feff}HEY\u{feff}"]), "HEY");
+        assert_eq!(decode_pieces(["\u{85}"]), "\u{85}");
+    }
+
+    #[test]
+    fn decodes_a_keyword_line_without_its_fields() {
+        assert_eq!(
+            decoded_line("\u{2581}O P EN \u{2581} TER M IN AL :3.0 #0.05"),
+            "OPEN TERMINAL"
+        );
+    }
+
+    const HEY_CLAUDE: &str = "\u{2581}HEY \u{2581}CLAUDE :3.0 #0.3";
+    const OPEN_CHAT: &str = "\u{2581}OPEN \u{2581}CHAT :3.0 #0.3";
+
+    /// A backend whose loads succeed or fail as told, and which records the
+    /// engines it was asked for.
     struct FakeBackend {
-        tokeniser: Result<(), String>,
+        vocabulary: Result<Vec<&'static str>, String>,
         engine: Result<(), String>,
-        /// The token table; `None` stands for one that has every piece.
-        vocabulary: Option<Vec<&'static str>>,
         engines_created: Arc<Mutex<Vec<(String, f64, String)>>>,
-        /// Every piece the fake tokeniser has produced.
-        pieces_seen: Arc<Mutex<HashSet<String>>>,
     }
 
     impl FakeBackend {
         fn working() -> FakeBackend {
             FakeBackend {
-                tokeniser: Ok(()),
+                vocabulary: Ok(vec![
+                    "\u{2581}HEY",
+                    "\u{2581}CLAUDE",
+                    "\u{2581}OPEN",
+                    "\u{2581}CHAT",
+                    "\u{2581}ROUTE",
+                ]),
                 engine: Ok(()),
-                vocabulary: None,
                 engines_created: Arc::new(Mutex::new(Vec::new())),
-                pieces_seen: Arc::new(Mutex::new(HashSet::new())),
             }
+        }
+
+        fn engines(&self) -> Vec<(String, f64, String)> {
+            self.engines_created.lock().expect("engines").clone()
         }
     }
 
     impl PrepareBackend for FakeBackend {
-        fn load_tokeniser(&self, _model_dir: &str) -> Result<Encoder, String> {
-            self.tokeniser.clone()?;
-            let seen = Arc::clone(&self.pieces_seen);
-            Ok(Box::new(move |text: &str| {
-                let pieces: Vec<String> = text
-                    .split(' ')
-                    .filter(|word| !word.is_empty())
-                    .map(|word| format!("\u{2581}{word}"))
-                    .collect();
-                seen.lock().expect("pieces").extend(pieces.iter().cloned());
-                Ok(pieces)
-            }))
-        }
-
         fn load_vocabulary(&self, _model_dir: &str) -> Result<HashSet<String>, String> {
-            Ok(match &self.vocabulary {
-                Some(tokens) => tokens.iter().map(|token| token.to_string()).collect(),
-                None => self.pieces_seen.lock().expect("pieces").clone(),
-            })
+            self.vocabulary
+                .clone()
+                .map(|tokens| tokens.into_iter().map(str::to_string).collect())
         }
 
         fn create_engine(
@@ -932,9 +1080,17 @@ mod tests {
         }
     }
 
-    fn request(phrases: &[&str]) -> PrepareRequest {
+    /// A request for these lines, with a phrase map entry for each: its
+    /// decoded pieces, lower-cased.
+    fn request(lines: &[&str]) -> PrepareRequest {
+        let mut map = PhraseMap::default();
+        for line in lines {
+            let decoded = decoded_line(line);
+            map.insert(decoded.clone(), decoded.to_lowercase());
+        }
         PrepareRequest {
-            phrases: phrases.iter().map(|phrase| phrase.to_string()).collect(),
+            keyword_lines: lines.iter().map(|line| line.to_string()).collect(),
+            phrase_map: map,
             threshold: 0.3,
             model_dir: "models".to_string(),
         }
@@ -959,10 +1115,25 @@ mod tests {
         (result, progress)
     }
 
-    #[test]
-    fn prepares_in_the_node_engines_order_and_times_each_phase() {
+    /// The error preparation gives for these lines, and whether the library
+    /// was reached.
+    fn refusal(lines: &[&str]) -> String {
         let backend = FakeBackend::working();
-        let (result, progress) = run(&request(&["hey claude", "open chat"]), &backend, false);
+        let (result, _) = run(&request(lines), &backend, false);
+        assert!(
+            backend.engines().is_empty(),
+            "the library is never handed a line it cannot take"
+        );
+        match result {
+            Err(PrepareError::ModelLoad(detail)) => detail,
+            other => panic!("expected a model load failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loads_the_model_and_times_it() {
+        let backend = FakeBackend::working();
+        let (result, progress) = run(&request(&[HEY_CLAUDE, OPEN_CHAT]), &backend, false);
         assert_eq!(
             result.expect("prepared"),
             Some(Prepared {
@@ -972,22 +1143,6 @@ mod tests {
         assert_eq!(
             progress,
             [
-                PrepareProgress::Timing {
-                    phase: "bpe-load",
-                    elapsed_ms: 7
-                },
-                PrepareProgress::Timing {
-                    phase: "tokenise",
-                    elapsed_ms: 7
-                },
-                PrepareProgress::Debug(
-                    "phrase: hey claude -> tokens: \u{2581}HEY \u{2581}CLAUDE -> decoded: HEY CLAUDE"
-                        .to_string()
-                ),
-                PrepareProgress::Debug(
-                    "phrase: open chat -> tokens: \u{2581}OPEN \u{2581}CHAT -> decoded: OPEN CHAT"
-                        .to_string()
-                ),
                 PrepareProgress::Debug("loading sherpa-onnx KWS model...".to_string()),
                 PrepareProgress::Timing {
                     phase: "model-load",
@@ -1000,79 +1155,54 @@ mod tests {
     #[test]
     fn hands_the_engine_the_model_directory_the_threshold_and_the_keyword_lines() {
         let backend = FakeBackend::working();
-        let (result, _) = run(&request(&["hey claude", "open chat"]), &backend, false);
+        let (result, _) = run(&request(&[HEY_CLAUDE, OPEN_CHAT]), &backend, false);
         assert!(result.is_ok());
-        let created = backend.engines_created.lock().expect("engines").clone();
         assert_eq!(
-            created,
+            backend.engines(),
             [(
                 "models".to_string(),
                 0.3,
-                "\u{2581}HEY \u{2581}CLAUDE :3.0 #0.3\n\u{2581}OPEN \u{2581}CHAT :3.0 #0.3"
-                    .to_string()
+                format!("{HEY_CLAUDE}\n{OPEN_CHAT}")
             )]
         );
     }
 
     #[test]
-    fn refuses_no_usable_phrase_only_after_the_tokeniser_has_run() {
-        let backend = FakeBackend::working();
-        let (result, progress) = run(&request(&["   ", ""]), &backend, false);
-        assert_eq!(result, Err(PrepareError::NoValidPhrases));
-        assert_eq!(
-            progress,
-            [
-                PrepareProgress::Timing {
-                    phase: "bpe-load",
-                    elapsed_ms: 7
-                },
-                PrepareProgress::Timing {
-                    phase: "tokenise",
-                    elapsed_ms: 7
-                },
-            ]
-        );
-        assert!(backend.engines_created.lock().expect("engines").is_empty());
-    }
-
-    #[test]
-    fn a_tokeniser_that_cannot_load_is_a_startup_error_even_with_no_phrases() {
-        let backend = FakeBackend {
-            tokeniser: Err("Failed to read models/bpe.model".to_string()),
-            ..FakeBackend::working()
-        };
-        let (result, progress) = run(&request(&[]), &backend, false);
-        assert_eq!(
-            result,
-            Err(PrepareError::Startup(
-                "Failed to read models/bpe.model".to_string()
-            ))
-        );
-        assert!(progress.is_empty());
-    }
-
-    #[test]
     fn a_model_that_cannot_load_says_so() {
         let backend = FakeBackend {
-            engine: Err("models/tokens.txt does not exist".to_string()),
+            engine: Err("models/encoder.onnx does not exist".to_string()),
             ..FakeBackend::working()
         };
-        let (result, _) = run(&request(&["hey claude"]), &backend, false);
+        let (result, _) = run(&request(&[HEY_CLAUDE]), &backend, false);
+        assert_eq!(
+            result,
+            Err(PrepareError::ModelLoad(
+                "models/encoder.onnx does not exist".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_token_table_that_cannot_be_read_is_a_model_load_failure() {
+        let backend = FakeBackend {
+            vocabulary: Err("models/tokens.txt does not exist".to_string()),
+            ..FakeBackend::working()
+        };
+        let (result, _) = run(&request(&[HEY_CLAUDE]), &backend, false);
         assert_eq!(
             result,
             Err(PrepareError::ModelLoad(
                 "models/tokens.txt does not exist".to_string()
             ))
         );
+        assert!(backend.engines().is_empty());
     }
 
     #[test]
     fn refuses_a_phrase_with_a_piece_the_model_does_not_have_and_names_both() {
-        let backend = FakeBackend {
-            vocabulary: Some(vec!["\u{2581}HEY", "\u{2581}CLAUDE", "\u{2581}ROUTE"]),
-            ..FakeBackend::working()
-        };
-        let (result, progress) = run(&request(&["hey claude", "route 66"]), &backend, false);
+        let route_66 = "\u{2581}ROUTE \u{2581}66 :3.0 #0.3";
+        let backend = FakeBackend::working();
+        let (result, progress) = run(&request(&[HEY_CLAUDE, route_66]), &backend, false);
         assert_eq!(
             result,
             Err(PrepareError::ModelLoad(
@@ -1081,52 +1211,135 @@ mod tests {
             ))
         );
         assert_eq!(
-            progress.last(),
-            Some(&PrepareProgress::Debug(
+            progress,
+            [PrepareProgress::Debug(
                 "loading sherpa-onnx KWS model...".to_string()
+            )]
+        );
+        assert!(backend.engines().is_empty());
+    }
+
+    #[test]
+    fn names_the_decoded_text_when_the_phrase_map_has_no_phrase_for_the_line() {
+        let backend = FakeBackend::working();
+        let mut unmapped = request(&[HEY_CLAUDE]);
+        unmapped
+            .keyword_lines
+            .push("\u{2581}CAF\u{c9} :3.0 #0.3".to_string());
+        let (result, _) = run(&unmapped, &backend, false);
+        assert_eq!(
+            result,
+            Err(PrepareError::ModelLoad(
+                "the phrase \"CAF\u{c9}\" cannot be spotted: \"\u{2581}CAF\u{c9}\" is not in the model's vocabulary"
+                    .to_string()
             ))
         );
-        assert!(
-            backend.engines_created.lock().expect("engines").is_empty(),
-            "the library is never handed a line it would end the process over"
+    }
+
+    #[test]
+    fn refuses_a_keyword_line_with_a_nul_character() {
+        let detail = refusal(&[HEY_CLAUDE, "\u{2581}HEY\0 \u{2581}CLAUDE :3.0 #0.3"]);
+        assert_eq!(
+            detail,
+            "a keyword line contains a NUL character: \"\u{2581}HEY\\0 \u{2581}CLAUDE :3.0 #0.3\""
         );
     }
 
     #[test]
-    fn accepts_phrases_whose_pieces_are_all_in_the_vocabulary() {
-        let backend = FakeBackend {
-            vocabulary: Some(vec!["\u{2581}HEY", "\u{2581}CLAUDE"]),
-            ..FakeBackend::working()
-        };
-        let (result, _) = run(&request(&["hey claude", "Claude"]), &backend, false);
-        assert!(result.is_ok());
-        assert_eq!(backend.engines_created.lock().expect("engines").len(), 1);
+    fn refuses_a_keyword_line_with_a_line_break() {
+        let detail = refusal(&["\u{2581}HEY \u{2581}CLAUDE\n:3.0 #0.3"]);
+        assert!(
+            detail.starts_with("a keyword line contains a line break: "),
+            "{detail}"
+        );
     }
 
     #[test]
-    fn reads_the_token_table_one_token_per_line() {
-        let vocabulary =
-            parse_vocabulary("<blk> 0\n<unk> 2\r\nS 3\n\u{2581}THE 5\n' 13\n\u{2581} 20\n");
-        for token in ["<blk>", "<unk>", "S", "\u{2581}THE", "'", "\u{2581}"] {
-            assert!(vocabulary.contains(token), "{token}");
+    fn refuses_a_boost_or_threshold_the_library_cannot_read() {
+        for field in [
+            ":", "#", ":x", "#abc", ":3.0x", ":0x10", ":inf", "#nan", ":1e999", "#1e-50", ":1e-39",
+            "#--1", "#1..2",
+        ] {
+            let line = format!("\u{2581}HEY \u{2581}CLAUDE {field}");
+            let detail = refusal(&[line.as_str()]);
+            assert_eq!(
+                detail,
+                format!(
+                    "a keyword line has a boost or threshold that is not a number: {field:?} in {line:?}"
+                ),
+                "{field}"
+            );
         }
-        assert_eq!(vocabulary.len(), 6);
-        assert!(!vocabulary.contains("3"));
+    }
+
+    #[test]
+    fn accepts_a_boost_or_threshold_the_library_can_read() {
+        for fields in [
+            ":3.0 #0.05",
+            ":3 #0.9",
+            "#0.123456789",
+            ":1e3 #.5",
+            ":+2.5 #0",
+            ":-1 #0.0",
+            "",
+        ] {
+            let line = format!("\u{2581}HEY \u{2581}CLAUDE {fields}");
+            let backend = FakeBackend::working();
+            let (result, _) = run(&request(&[line.as_str()]), &backend, false);
+            assert!(result.is_ok(), "{fields}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_keyword_line_with_no_pieces() {
+        for line in ["", "   ", ":3.0 #0.3", "\t#0.3"] {
+            let detail = refusal(&[HEY_CLAUDE, line]);
+            assert_eq!(
+                detail,
+                format!("a keyword line has no pieces: {line:?}"),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn splits_a_line_into_words_only_where_the_library_does() {
+        // Tab, vertical tab, form feed, and carriage return separate words as
+        // spaces do. A no-break space does not: it is part of the word.
+        let separated = "\u{2581}HEY\t\u{2581}CLAUDE\u{0b}:3.0\u{0c}#0.3\r";
+        let backend = FakeBackend::working();
+        let (result, _) = run(&request(&[separated]), &backend, false);
+        assert!(result.is_ok(), "{result:?}");
+
+        // The message escapes the no-break space, which would otherwise be
+        // invisible.
+        let joined = "\u{2581}HEY\u{a0}\u{2581}CLAUDE :3.0 #0.3";
+        let detail = refusal(&[joined]);
+        assert!(
+            detail
+                .ends_with("\"\u{2581}HEY\\u{a0}\u{2581}CLAUDE\" is not in the model's vocabulary"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn lists_the_phrases_in_the_order_their_lines_first_name_them() {
+        let mut map = phrase_map(&[("OPEN CHAT", "open chat"), ("HEY CLAUDE", "hey  claude")]);
+        map.insert("NEVER SAID".to_string(), "never said".to_string());
+        let lines: Vec<String> = [HEY_CLAUDE, OPEN_CHAT, HEY_CLAUDE, "\u{2581}HEY :3.0 #0.3"]
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(listening_for(&lines, &map), ["hey  claude", "open chat"]);
     }
 
     #[test]
     fn stops_before_the_model_load_once_shutdown_has_started() {
         let backend = FakeBackend::working();
-        let (result, progress) = run(&request(&["hey claude"]), &backend, true);
+        let (result, progress) = run(&request(&[HEY_CLAUDE]), &backend, true);
         assert_eq!(result, Ok(None));
-        assert_eq!(
-            progress,
-            [PrepareProgress::Timing {
-                phase: "bpe-load",
-                elapsed_ms: 7
-            }]
-        );
-        assert!(backend.engines_created.lock().expect("engines").is_empty());
+        assert!(progress.is_empty());
+        assert!(backend.engines().is_empty());
     }
 
     #[test]
@@ -1138,7 +1351,7 @@ mod tests {
         let backend = FakeBackend::working();
         let clock = || 0u64;
         let prepared = prepare(
-            &request(&["hey claude"]),
+            &request(&[HEY_CLAUDE]),
             &backend,
             &clock,
             &|| released.load(Ordering::SeqCst),

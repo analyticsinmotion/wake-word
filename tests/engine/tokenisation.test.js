@@ -20,10 +20,10 @@ function linePieces(line) {
 
 /**
  * A stand-in for SentencePieceProcessor.encodePieces that splits on spaces,
- * marks each word boundary the way the real BPE model does, and breaks longer
- * words into two pieces. The round trip (encode, then decode the pieces) is
- * what has to agree with the string sherpa-onnx reports on a hit, so the shape
- * of the pieces matters more than the exact vocabulary.
+ * marks each word boundary the way the real SentencePiece model does, and
+ * breaks longer words into two pieces. The round trip (encode, then decode the
+ * pieces) is what has to agree with the string sherpa-onnx reports on a hit,
+ * so the shape of the pieces matters more than the exact vocabulary.
  *
  *   "HEY CLAUDE" -> ["<B>HE", "Y", "<B>CL", "AUDE"]
  */

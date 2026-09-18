@@ -51,8 +51,23 @@ const MODEL_FILES = [
   'decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
   'joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
   'tokens.txt',
-  'bpe.model',
 ];
+
+/**
+ * The keyword lines and phrase map the extension builds for the phrases in
+ * config(), at the threshold config() sends: the model's SentencePiece pieces
+ * for each upper-cased phrase, then the boost and the threshold.
+ */
+const KEYWORD_LINES = [
+  '▁HE Y ▁C LA U DE :3.0 #0.05',
+  '▁O P EN ▁C LA U DE :3.0 #0.05',
+  '▁HE Y ▁CHA T :3.0 #0.05',
+];
+const PHRASE_MAP = {
+  'HEY CLAUDE': 'hey claude',
+  'OPEN CLAUDE': 'open claude',
+  'HEY CHAT': 'hey chat',
+};
 
 /** The keyword spotting model, when WAKE_WORD_MODEL_DIR names a complete one. */
 const MODEL_DIR = (() => {
@@ -87,6 +102,8 @@ function config(overrides = {}) {
     modelDir: MODEL_DIR ?? MISSING_MODEL_DIR,
     debugMode: false,
     audioDevice: '',
+    keywordLines: KEYWORD_LINES,
+    phraseMap: PHRASE_MAP,
     ...overrides,
   });
 }
@@ -349,30 +366,39 @@ const scenarios = [
     exit: 1,
   },
   {
-    name: 'a config with no usable phrase is fatal once the tokeniser has loaded',
-    needs: ['model'],
+    name: 'a config with no keyword lines is fatal',
     async drive(engine) {
-      engine.write(config({ phrases: [{ phrase: 42 }, { phrase: '  ' }] }) + '\n');
+      engine.write(config({ keywordLines: [] }) + '\n');
     },
     lines: ['ERROR:No valid phrases to detect'],
     exit: 1,
   },
   {
-    name: 'a model directory without the tokeniser model is a startup error',
+    name: 'a config without keywordLines is a startup error',
     async drive(engine) {
-      engine.write(config({ modelDir: MISSING_MODEL_DIR }) + '\n');
+      engine.write(config({ keywordLines: undefined }) + '\n');
     },
-    expect: oneLineStartingWith('ERROR:Startup error: Failed to read '),
+    lines: [
+      'ERROR:Startup error: the config has no keywordLines, and the engine does not tokenise phrases itself',
+    ],
+    exit: 1,
+  },
+  {
+    name: 'a config without phraseMap is a startup error',
+    async drive(engine) {
+      engine.write(config({ phraseMap: undefined }) + '\n');
+    },
+    lines: ['ERROR:Startup error: the config has no phraseMap, so no detection could be reported'],
     exit: 1,
   },
   {
     name: 'a model directory without the transducer says which file is missing',
     needs: ['model'],
     async drive(engine) {
-      // The tokeniser model alone: tokenising succeeds and the model load fails.
+      // The token table alone: it is there to read, and the model load fails.
       const partial = mkdtempSync(path.join(os.tmpdir(), 'wake-word-partial-model-'));
       try {
-        copyFileSync(path.join(MODEL_DIR, 'bpe.model'), path.join(partial, 'bpe.model'));
+        copyFileSync(path.join(MODEL_DIR, 'tokens.txt'), path.join(partial, 'tokens.txt'));
         engine.write(config({ modelDir: partial }) + '\n');
         await engine.waitForExit();
       } finally {
@@ -392,11 +418,40 @@ const scenarios = [
     name: 'a phrase the model has no pieces for is refused by name instead of ending the process',
     needs: ['model'],
     async drive(engine) {
-      engine.write(config({ phrases: [{ phrase: 'hey claude' }, { phrase: 'route 66' }] }) + '\n');
+      engine.write(
+        config({
+          keywordLines: [KEYWORD_LINES[0], '▁RO U TE ▁ 66 :3.0 #0.05'],
+          phraseMap: { 'HEY CLAUDE': 'hey claude', 'ROUTE 66': 'route 66' },
+        }) + '\n'
+      );
     },
     lines: [
       'ERROR:Failed to load KWS model: the phrase "route 66" cannot be spotted: ' +
         '"66" is not in the model\'s vocabulary',
+    ],
+    exit: 1,
+  },
+  {
+    name: 'a keyword line with a NUL character is refused instead of ending the process',
+    needs: ['model'],
+    async drive(engine) {
+      engine.write(config({ keywordLines: ['▁HE Y\u0000 ▁C LA U DE :3.0 #0.05'] }) + '\n');
+    },
+    lines: [
+      'ERROR:Failed to load KWS model: a keyword line contains a NUL character: ' +
+        '"▁HE Y\\0 ▁C LA U DE :3.0 #0.05"',
+    ],
+    exit: 1,
+  },
+  {
+    name: 'a boost the library cannot read is refused instead of ending the process',
+    needs: ['model'],
+    async drive(engine) {
+      engine.write(config({ keywordLines: ['▁HE Y ▁C LA U DE :x #0.05'] }) + '\n');
+    },
+    lines: [
+      'ERROR:Failed to load KWS model: a keyword line has a boost or threshold that is not a number: ' +
+        '":x" in "▁HE Y ▁C LA U DE :x #0.05"',
     ],
     exit: 1,
   },
@@ -518,11 +573,6 @@ const scenarios = [
     expect: (lines) =>
       matchShapes(lines, [
         /^DEBUG:wake-word-engine starting, modelDir=.+$/,
-        /^DEBUG:Timing: bpe-load <n>ms$/,
-        /^DEBUG:Timing: tokenise <n>ms$/,
-        /^DEBUG:phrase: hey claude -> tokens: \u2581HE Y \u2581C LA U DE -> decoded: HEY CLAUDE$/,
-        /^DEBUG:phrase: open claude -> tokens: \u2581O P EN \u2581C LA U DE -> decoded: OPEN CLAUDE$/,
-        /^DEBUG:phrase: hey chat -> tokens: \u2581HE Y \u2581CHA T -> decoded: HEY CHAT$/,
         /^DEBUG:loading sherpa-onnx KWS model\.\.\.$/,
         /^DEBUG:Timing: model-load <n>ms$/,
         /^DEBUG:voice activity model=.+, ONNX Runtime=.+$/,
