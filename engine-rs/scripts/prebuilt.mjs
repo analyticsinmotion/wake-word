@@ -3,11 +3,14 @@
  * The sherpa-onnx prebuilt static libraries, checked on the way into the build
  * and again after it.
  *
- * The sherpa-onnx-sys build script downloads one archive per target from the
- * sherpa-onnx release and unpacks it under target/sherpa-onnx-prebuilt/, with
- * no digest check. Pointing SHERPA_ONNX_ARCHIVE_DIR at a directory holding the
- * archive makes it copy that file instead of downloading, so the build links
- * exactly the file this script verified.
+ * The engine links the archives scripts/pinned-inputs.mjs pins: the
+ * sherpa-onnx release built without the text-to-speech components, hosted on
+ * this repository's releases, from where this script downloads them. The
+ * sherpa-onnx-sys build script unpacks one archive per target under
+ * target/sherpa-onnx-prebuilt/, with no digest check, and left to itself it
+ * downloads the official archive from the sherpa-onnx release. Pointing
+ * SHERPA_ONNX_ARCHIVE_DIR at a directory holding the archive makes it copy
+ * that file instead, so the build links exactly the file this script verified.
  *
  *   node engine-rs/scripts/prebuilt.mjs name  --target <target>
  *       Print name=<archive> and sha256=<digest> lines, for a cache key.

@@ -24,9 +24,11 @@ runs:
         path: ${{ runner.temp }}/sherpa-onnx-archives
         key: sherpa-onnx-${{ steps.archive.outputs.name }}-${{ steps.archive.outputs.sha256 }}
 
-    # The build script checks no digest, so the archive is checked here, and
-    # SHERPA_ONNX_ARCHIVE_DIR below makes the build copy this file rather
-    # than download its own.
+    # The archive scripts/pinned-inputs.mjs pins, from this repository's
+    # release. The build script checks no digest, so the archive is checked
+    # here, and SHERPA_ONNX_ARCHIVE_DIR below makes the build copy this file
+    # rather than download its own, the official archive, which carries the
+    # text-to-speech components.
     - name: Fetch and verify the sherpa-onnx archive
       shell: bash
       run: node engine-rs/scripts/prebuilt.mjs fetch --target "${{ inputs.target }}" --dir "$RUNNER_TEMP/sherpa-onnx-archives"

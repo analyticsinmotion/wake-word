@@ -24,7 +24,8 @@ updates:
 
   # The native engine. decibri and sherpa-onnx are pinned exactly and bumped
   # deliberately: a sherpa-onnx bump must move with the engine tree's
-  # sherpa-onnx package, and its prebuilt archives must be pinned in
+  # sherpa-onnx package, and its archives must be built by the Engine archives
+  # workflow, published on a sherpa-onnx-v<version> release, and pinned in
   # engine-rs/scripts/pinned-inputs.mjs, or CI fails the build. The pull
   # request is the notice that a new version exists.
   - package-ecosystem: cargo

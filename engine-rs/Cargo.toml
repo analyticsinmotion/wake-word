@@ -29,11 +29,13 @@ path = "src/main.rs"
 # engine's sherpa-onnx package is built from, so the model files, the keyword
 # line syntax, the boost, and the thresholds behave the same in both engines.
 # The `static` feature links the C library and its own ONNX Runtime into the
-# executable. The crate's build script downloads the prebuilt static libraries
-# for the target from the sherpa-onnx release of the same version and caches
-# them under target/sherpa-onnx-prebuilt; SHERPA_ONNX_ARCHIVE_DIR names a
-# directory holding the archive for an offline build, and SHERPA_ONNX_LIB_DIR
-# an already extracted lib directory. See .cargo/config.toml for the C runtime
+# executable. The crate's build script downloads the official prebuilt static
+# libraries for the target from the sherpa-onnx release of the same version and
+# caches them under target/sherpa-onnx-prebuilt; SHERPA_ONNX_ARCHIVE_DIR names a
+# directory holding the archive instead, and SHERPA_ONNX_LIB_DIR an already
+# extracted lib directory. The release build sets SHERPA_ONNX_ARCHIVE_DIR to
+# the archives scripts/pinned-inputs.mjs pins: the same release built without
+# the text-to-speech components. See .cargo/config.toml for the C runtime
 # those libraries need on Windows.
 #
 # The engine has no tokeniser: the extension tokenises the wake phrases and
