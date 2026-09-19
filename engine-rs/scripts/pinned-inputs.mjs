@@ -16,41 +16,46 @@
  */
 
 /**
- * The prebuilt static libraries the sherpa-onnx-sys build script downloads,
- * one archive per target, from the sherpa-onnx release of the crate's version.
- * The build script checks no digest of its own. `version` must equal the
- * sherpa-onnx-sys version in Cargo.lock; scripts/prebuilt.mjs refuses to run
- * when it does not, so a crate bump cannot build against unverified archives.
+ * The static libraries the sherpa-onnx-sys build script links, one archive per
+ * target: the sherpa-onnx release of the crate's version built without the
+ * text-to-speech components (.github/workflows/engine-archives.yml), under the
+ * names the build script expects, and hosted on this repository's
+ * sherpa-onnx-v<version> release. Left to itself, the build script downloads
+ * the official archives, which include those components, and checks no
+ * digest; SHERPA_ONNX_ARCHIVE_DIR makes it take these instead (see
+ * scripts/prebuilt.mjs). `version` must equal the sherpa-onnx-sys version in
+ * Cargo.lock; scripts/prebuilt.mjs refuses to run when it does not, so a crate
+ * bump cannot build against unverified archives.
  */
 export const SHERPA_ONNX = {
   version: '1.13.8',
   archives: {
     'win32-x64': {
       name: 'sherpa-onnx-v1.13.8-win-x64-static-MT-Release-lib.tar.bz2',
-      bytes: 123206268,
-      sha256: '56ffcf3c454c1f14f7bc9887286cc8143e7e542dc632804e1c447d5f8d534eaf',
+      bytes: 120105505,
+      sha256: 'e902a9861b39bdfb42ec646ecb5e80e8d1702dccac4eb015189280b65a3db19e',
     },
     'darwin-arm64': {
       name: 'sherpa-onnx-v1.13.8-osx-arm64-static-lib.tar.bz2',
-      bytes: 20965936,
-      sha256: '9091bf160dc7fdacedbc906b212badf53c2993f4e5277a0e03998e96c31d60da',
+      bytes: 19712083,
+      sha256: 'd586f502cbffb6d50675e035f4e823cd001b52958f5b1e6ff7d16b83d368a6d3',
     },
     'linux-x64': {
       name: 'sherpa-onnx-v1.13.8-linux-x64-static-lib.tar.bz2',
-      bytes: 22952328,
-      sha256: 'e1fdc5b67530e15741ef897fa5ffff297056f3bf0c6d829a27af9225a4c4b5a6',
+      bytes: 21666983,
+      sha256: '328cff8b420d3e560df3e4f465c544c10562ca15b3f515b2b1fa28813a0f2acf',
     },
     'linux-arm64': {
       name: 'sherpa-onnx-v1.13.8-linux-aarch64-static-lib.tar.bz2',
-      bytes: 21325380,
-      sha256: '77983e3cf29aa60f2e531d249dbd01d15596530550c8db2e9e02fc6a655da6bb',
+      bytes: 20134985,
+      sha256: '64050f0b33f15f63d4e80e6852b2972535f9a550eaa08ab00ac869eea916ab05',
     },
   },
 };
 
-/** Where the build script downloads each archive from. */
+/** Where scripts/prebuilt.mjs downloads each archive from. */
 export function sherpaOnnxArchiveUrl(name) {
-  return `https://github.com/k2-fsa/sherpa-onnx/releases/download/v${SHERPA_ONNX.version}/${name}`;
+  return `https://github.com/analyticsinmotion/wake-word/releases/download/sherpa-onnx-v${SHERPA_ONNX.version}/${name}`;
 }
 
 /**

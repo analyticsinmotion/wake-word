@@ -157,8 +157,10 @@ The artifacts are the archives themselves, not zipped. To publish them,
 attach them to a release in this repository whose tag does not start with `v`,
 such as `sherpa-onnx-v1.13.8`: `release.yml` builds and publishes the extension
 for tags that do. The engine builds against the archives
-`engine-rs/scripts/pinned-inputs.mjs` pins; using these means pinning each
-one's size and SHA-256 there and pointing the download URL at the release.
+`engine-rs/scripts/pinned-inputs.mjs` pins by size and SHA-256, which
+`engine-rs/scripts/prebuilt.mjs` downloads from the `sherpa-onnx-v<version>`
+release; replacing an archive means uploading it there and pinning its new
+size and digest.
 
 ## Running it locally
 
@@ -182,7 +184,9 @@ directory, then run `verify.mjs archive` as the workflow does.
 To build the engine against a local archive, point `SHERPA_ONNX_ARCHIVE_DIR` at
 the directory holding it and use an empty `CARGO_TARGET_DIR`: the build script
 reuses an already unpacked `target/sherpa-onnx-prebuilt/` copy without looking
-at the archive. `prebuilt.mjs` rejects an archive whose digest is not pinned.
+at the archive, and a target directory that has built `sherpa-onnx-sys` keeps
+the libraries it copied into that crate's build output. `prebuilt.mjs` rejects
+an archive whose digest is not pinned.
 
 ## A new sherpa-onnx release
 

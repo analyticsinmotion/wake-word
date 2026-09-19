@@ -141,7 +141,7 @@ Building on Linux needs the ALSA development package (`libasound2-dev` on
 Debian and Ubuntu), which the audio backend links against.
 
 The first build for a target downloads sherpa-onnx's prebuilt static libraries
-for it: the `sherpa-onnx-sys` build script fetches
+for it: the `sherpa-onnx-sys` build script fetches the official
 `sherpa-onnx-v1.13.8-<target>-static-lib.tar.bz2` from the sherpa-onnx release
 of the same version and unpacks it under `target/sherpa-onnx-prebuilt/`, where
 later builds find it. The Windows x64 archive is 123 MB and unpacks to about
@@ -149,9 +149,28 @@ later builds find it. The Windows x64 archive is 123 MB and unpacks to about
 change where the libraries come from:
 
 - `SHERPA_ONNX_ARCHIVE_DIR`: a directory that already holds the archive, for a
-  build with no network access;
+  build with no network access or against another archive of the same name;
 - `SHERPA_ONNX_LIB_DIR`: an already unpacked `lib` directory, which skips the
   archive altogether.
+
+The release build links different archives: the same sherpa-onnx release built
+without the text-to-speech components, pinned in `scripts/pinned-inputs.mjs`
+(see [Release builds](#release-builds)). To build against those locally:
+
+```bash
+# from the repository root
+node engine-rs/scripts/prebuilt.mjs fetch --target win32-x64 --dir <dir>   # or darwin-arm64, linux-x64, linux-arm64
+cd engine-rs
+SHERPA_ONNX_ARCHIVE_DIR=<dir> cargo build --release
+```
+
+A target directory keeps linking the libraries its last `sherpa-onnx-sys`
+build used. The build script runs again only when `SHERPA_ONNX_ARCHIVE_DIR` or
+`SHERPA_ONNX_LIB_DIR` changes, and the libraries are copied into that crate's
+build output, so deleting `target/sherpa-onnx-prebuilt/` alone does not change
+what the next build links; nor does a new `SHERPA_ONNX_ARCHIVE_DIR` while the
+unpacked copy is there. To switch archives, delete that directory and run
+`cargo clean -p sherpa-onnx-sys`, or build with an empty `CARGO_TARGET_DIR`.
 
 Two builds that share a target directory, such as a terminal build and an
 editor's background check, can both start the download and one then fails with
@@ -178,21 +197,28 @@ used; a mismatch fails the build.
 | `linux-x64` | `ubuntu-latest` | inside `quay.io/pypa/manylinux_2_28_x86_64` |
 | `linux-arm64` | `ubuntu-24.04-arm` | inside `quay.io/pypa/manylinux_2_28_aarch64` |
 
-**The sherpa-onnx libraries.** `scripts/prebuilt.mjs fetch` downloads the
-target's archive, or takes it from the workflow cache, and checks it.
-`SHERPA_ONNX_ARCHIVE_DIR` makes the build script copy that file instead of
-downloading its own, and `scripts/prebuilt.mjs check` then checks the copy the
-build script unpacked, because the build script uses an unpacked directory
-without looking at the archive. `prebuilt.mjs` refuses to run when
-`Cargo.lock` resolves a sherpa-onnx-sys version that has no pinned archives.
+**The sherpa-onnx libraries.** The release build links sherpa-onnx 1.13.8
+built without the text-to-speech components, which the engine never calls: one
+archive per target, under the official archive's name and layout, built by
+`.github/workflows/engine-archives.yml` (see `archives/README.md`) and hosted
+on this repository's `sherpa-onnx-v1.13.8` release. `scripts/prebuilt.mjs
+fetch` downloads the target's archive from there, or takes it from the
+workflow cache, and checks it. `SHERPA_ONNX_ARCHIVE_DIR` makes the build
+script copy that file instead of downloading the official one, and
+`scripts/prebuilt.mjs check` then checks the copy the build script unpacked,
+because the build script uses an unpacked directory without looking at the
+archive. `prebuilt.mjs` refuses to run when `Cargo.lock` resolves a
+sherpa-onnx-sys version that has no pinned archives.
 
 **The Linux floor.** The Linux binary is built against glibc 2.28 and GCC 8's
 libstdc++ (GLIBCXX 3.4.25), the same floor the editor has on Linux, so it runs
 on every distribution the editor supports. A binary linked on the runner would
 take the runner's newer symbol versions instead. The sherpa-onnx libraries are
-compiled by GCC 11 against an older glibc; the image's compiler links the
-libstdc++ symbols newer than GCC 8 that they use into the binary. The runtime
-needs `libasound.so.2`, the ALSA library, which desktop distributions install.
+compiled in the same image family, by GCC 11 against glibc 2.28, and the ONNX
+Runtime they carry by GCC 11 against an older glibc; the image's compiler
+links the libstdc++ symbols newer than GCC 8 that they use into the binary.
+The runtime needs `libasound.so.2`, the ALSA library, which desktop
+distributions install.
 
 **The runtime files.** `scripts/stage.mjs` copies the binary into `bin/` at
 the repository root, which `.vscodeignore` ships, and adds the files it loads
