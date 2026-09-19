@@ -6,6 +6,10 @@ on:
 
 jobs:
   release:
+    # The extension's own releases are tagged vX.Y.Z. A release under any
+    # other tag, one that hosts the speech model or the engine archives, must
+    # not build, upload, or publish the extension.
+    if: startsWith(github.event.release.tag_name, 'v')
     strategy:
       fail-fast: false
       matrix:

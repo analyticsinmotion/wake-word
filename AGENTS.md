@@ -72,6 +72,8 @@ wake-word/
     scripts/prebuilt.mjs        # Fetches and checks the sherpa-onnx archive before the build, and the unpacked copy after it
     scripts/stage.mjs           # Puts the binary, ONNX Runtime, the Silero model and their notices into bin/; signs on macOS
     scripts/download.mjs        # Downloading and digest checks shared by those scripts
+    archives/build.sh           # Builds the sherpa-onnx libraries without text-to-speech for one target and adds the placeholder libraries
+    archives/verify.mjs         # Checks an archive built that way against the official one; archives/objects.mjs reads the libraries
   bin/                 # Staged by engine-rs/scripts/stage.mjs for packaging; gitignored, shipped in the .vsix
   tests/
     unit/              # TypeScript tests for the extension host code
@@ -94,6 +96,7 @@ wake-word/
     workflows/
       ci.yml           # CI: lint, compile, test with the model, engine deps, binary prune, engine self-test, native engine, .vsix package and check, drive script
       release.yml      # CI: native engine, build and check .vsix, drive script, publish to Marketplace and Open VSX
+      engine-archives.yml  # Manual: the sherpa-onnx archives without text-to-speech for the four targets, checked and uploaded
 ```
 
 `extension.ts` owns all VS Code API interactions. `sherpaEngine.ts` implements `ISpeechEngine` on every platform. `audio-engine.js` runs under system Node.js (not Electron) so native audio addons load correctly. Keep this separation clean.
@@ -152,6 +155,8 @@ The engine cancels a pending crash-backoff retry in `stop()`, `pause()`, and `st
 
 Keyword spotting in the Rust engine is the `sherpa-onnx` crate, pinned `=1.13.8` to match the Node engine's `sherpa-onnx` package and bumped with it, with the `static` feature: the crate's build script downloads prebuilt static libraries for the target into `engine-rs/target/sherpa-onnx-prebuilt/`, and they carry their own ONNX Runtime, which is linked into the executable and is separate from the one decibri loads for the VAD. On Windows those libraries use the static C runtime, so `engine-rs/.cargo/config.toml` sets `+crt-static`; build from inside `engine-rs/` or that file is not read. `spotter_config()` in `spotter.rs` mirrors the `createKws()` call field for field and a unit test pins every value, `modeling_unit` and `bpe_vocab` included, although the keyword spotter uses neither: it creates a spotter with `bpe_vocab` naming an empty file or no file, so the engine does not require `bpe.model`. The engine has no tokeniser. It takes `keywordLines` and `phraseMap` from the config line, refuses a config without either (`Startup error:`) or with no lines (`No valid phrases to detect`) before anything loads, and passes the lines in memory. Before the model loads, `check_keyword_lines()` checks every line the way the library parses it: each word, split where C's `isspace()` splits, must be a token in `tokens.txt` or a `:` or `#` field whose number `std::stof` can read. The library does not report a bad line as an error: it ends the process on an unknown token (exit -1, with the reason only on stderr), and a field it cannot read throws a C++ exception across the FFI boundary that aborts the process. A NUL cannot pass the bindings' C string, a line break would make one entry two lines, and a line with no pieces names no keyword. The engine refuses each of these as `Failed to load KWS model:`, naming the phrase or the line. The extension already leaves unspottable phrases out; the check is there for any line that arrives anyway. The stream is reset after a detection and at the end of each speech segment, and replaced on `pause`.
 
+**Archives without text-to-speech.** The official sherpa-onnx archives also carry the text-to-speech components, which the engine never calls. `.github/workflows/engine-archives.yml`, run by hand with an upstream release tag, builds the same libraries for the four targets with `SHERPA_ONNX_ENABLE_TTS=OFF` (`engine-rs/archives/build.sh`), under the official archives' names and `<name>/lib` layout so that the `sherpa-onnx-sys` build script uses them unmodified, and uploads each one after `engine-rs/archives/verify.mjs` has checked it against the official archive for the same release and target. The build script links `espeak-ng`, `piper_phonemize` and `ucd` by name and a build without text-to-speech does not produce them, so each archive carries them as libraries holding one empty object file; the link list has no whole-archive modifier, so nothing is linked from them. Otherwise the build matches the official archives: the static C runtime on Windows, a universal build thinned to arm64 for macOS 11.0, and Linux inside the engine's `manylinux_2_28` image. The engine builds against whichever archives `pinned-inputs.mjs` pins. `engine-rs/archives/README.md` says how to run it and what it checks.
+
 On Windows the native library opens the model files through APIs limited to 260-character paths. A model directory whose encoder path is longer is refused with `transducer encoder: '<path>' does not exist` on stderr, although the engine's own check finds the file; the Node engine reads the model through Node.js and has no such limit.
 
 Two timing details decide whether a phrase said on its own is detected, and both are pinned by tests because they are easy to break. The spotter decodes in 320 ms steps counted from the first sample it is given, and reports a keyword only once a step has covered the phrase's end; audio still undecoded when the segment ends is cut off by the reset. So (1) the silence holdoff in `hysteresis.rs` runs from the arrival of the first quiet chunk, its end, not its start: decibri's Node.js microphone starts its 300 ms timer after delivering that chunk, and on a live microphone the fourth quiet chunk always arrives before the timer fires, so four quiet chunks reach the spotter before the reset. Counting from the chunk's start ends every segment 100 ms sooner and loses a large share of isolated phrases. (2) The lead-in handed to the spotter when speech starts is five chunks counting the chunk that trips the detector, so the ring holds four; one chunk more or less moves every decode step. With both as they are, the Rust engine opens and closes its gate on the same chunks as the Node engine and hands its spotter the same samples.
@@ -183,7 +188,7 @@ Use semantic versioning bumps. Commit changelog updates as `docs(changelog): upd
 - `main` branch is what's published to the Marketplace. Keep it release-ready.
 - Develop on feature branches, merge to `main` for releases.
 - Commit message format: `type(scope): description` (e.g. `fix(engine): settle an awaited pause when the child exits`).
-- Tag releases as `vX.Y.Z`. Creating a GitHub release triggers the CI workflow.
+- Tag releases as `vX.Y.Z`. Publishing a GitHub release with such a tag runs `release.yml`, which builds, checks, and publishes the extension. A release whose tag does not start with `v`, such as the speech model's `model-v1` or one that hosts engine archives, runs nothing.
 
 ## Testing
 
@@ -306,6 +311,7 @@ Both workflows build the native engine on each target's own runner through `.git
 - The self-test exits 0 when ONNX Runtime or the Silero model is missing. Check what it reports, as `verify-vsix.mjs` does, never only its exit code.
 - The runtime files set floors of their own: the macOS ONNX Runtime needs macOS 14.0, and the Windows one imports the Visual C++ runtime (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`), which CI runners have and a fresh Windows install may not. The Node engine loads the same files.
 - CI has no microphone: the drive script runs with `--no-microphone`, which skips the scenarios that open one.
+- `engine-archives.yml` builds each target where the engine is built, Linux in the same `manylinux_2_28` image, so its archives keep the engine's floors. `LINK_LIST` and `PLACEHOLDERS` in `engine-rs/archives/verify.mjs`, and `PLACEHOLDERS` in `build.sh`, follow the `sherpa-onnx-sys` build script's link list: check them whenever sherpa-onnx is bumped.
 
 **NEVER** ship a model download without a verified digest. The tarball is fetched over redirects to a CDN and loaded straight into the keyword spotter.
 
