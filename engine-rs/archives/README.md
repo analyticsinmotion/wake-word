@@ -17,10 +17,23 @@ One archive per target, uploaded as a workflow artifact:
 
 | Target | Runner | Archive |
 | --- | --- | --- |
-| win-x64 | `windows-latest` | `sherpa-onnx-<tag>-win-x64-static-MT-Release-lib.tar.bz2` |
-| osx-arm64 | `macos-latest` | `sherpa-onnx-<tag>-osx-arm64-static-lib.tar.bz2` |
-| linux-x64 | `ubuntu-latest` | `sherpa-onnx-<tag>-linux-x64-static-lib.tar.bz2` |
+| win-x64 | `windows-2022` | `sherpa-onnx-<tag>-win-x64-static-MT-Release-lib.tar.bz2` |
+| osx-arm64 | `macos-26` | `sherpa-onnx-<tag>-osx-arm64-static-lib.tar.bz2` |
+| linux-x64 | `ubuntu-24.04` | `sherpa-onnx-<tag>-linux-x64-static-lib.tar.bz2` |
 | linux-aarch64 | `ubuntu-24.04-arm` | `sherpa-onnx-<tag>-linux-aarch64-static-lib.tar.bz2` |
+
+A static library links only with a toolchain at least as new as the one that
+compiled it, so each runner, and on Linux the container image, is pinned
+rather than named by a moving label:
+
+- **Windows:** Visual Studio 2022 (MSVC 14.44), the toolset the official
+  archives are compiled with. Objects from the Visual Studio 2026 toolset call
+  standard library helpers that the 14.44 runtime library does not define.
+- **macOS:** macOS 26 with its default Xcode, the SDK the official archives
+  are compiled with.
+- **Linux:** a dated `manylinux_2_28` image, pinned by digest, whose GCC 14
+  toolset sets the oldest compiler that can link the archive: GCC 13.3 links
+  it, GCC 12 does not.
 
 Each holds `<name>/lib/` and the static libraries, as the official archive
 does. `espeak-ng`, `piper_phonemize` and `ucd` are in the build script's link
@@ -40,8 +53,8 @@ libraries with the compiler and archiver CMake used.
 - **macOS:** a universal build thinned to arm64 with `lipo`, as upstream
   builds its archives, for macOS 11.0, the engine's deployment target.
 - **Linux:** inside `quay.io/pypa/manylinux_2_28_x86_64` or `_aarch64`, the
-  image the engine's release build uses, so nothing needs a newer glibc than
-  2.28.
+  image family the engine's release build uses, so nothing needs a newer glibc
+  than 2.28.
 
 ONNX Runtime is the build upstream's CMake downloads and checks against its own
 pinned SHA-256.
@@ -77,8 +90,15 @@ Run it from the repository's **Actions** tab, or with the GitHub CLI:
 ```bash
 gh workflow run engine-archives.yml -f tag=v1.13.8            # the default branch's copy
 gh workflow run engine-archives.yml --ref <branch> -f tag=v1.13.8
-gh run download <run-id>                                      # the four archives
+gh api repos/{owner}/{repo}/actions/runs/<run-id>/artifacts \
+  --jq '.artifacts[] | "\(.id) \(.name)"' |
+  while read -r id name; do
+    gh api "repos/{owner}/{repo}/actions/artifacts/$id/zip" > "$name"
+  done                                                        # the four archives
 ```
+
+`gh run download` expects zipped artifacts and cannot unpack these, so the
+archives are fetched through the API, which returns each file as uploaded.
 
 GitHub starts a manually triggered workflow only once the workflow file is on
 the default branch; after that, `--ref` runs another branch's copy.

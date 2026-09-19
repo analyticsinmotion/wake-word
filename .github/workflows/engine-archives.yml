@@ -26,24 +26,46 @@ defaults:
 jobs:
   archive:
     name: ${{ matrix.target }}
+    # A static library links only with a toolchain at least as new as the one
+    # that compiled it, because newer compilers emit calls to runtime helpers
+    # that older runtime libraries do not define. Every image below is named
+    # by a fixed label, so the toolchain, and with it the oldest toolchain
+    # that can link the archive, changes only when this file does.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          # Visual Studio 2022, MSVC 14.44, the toolset the official archives
+          # are compiled with. The MSVC 14.5x toolset of Visual Studio 2026,
+          # which windows-latest and windows-2025 carry, emits calls to
+          # vectorised standard library helpers (__std_max_element_8i,
+          # __std_rotate and others) that the 14.44 libcpmt.lib does not
+          # define, so a 14.44 linker cannot link its output.
+          - os: windows-2022
             target: win-x64
             variant: win-x64-static-MT-Release
-          - os: macos-latest
+          # macOS 26 with its default Xcode, the image and SDK (macOS 26.5)
+          # the official archives are compiled with.
+          - os: macos-26
             target: osx-arm64
             variant: osx-arm64-static
-          - os: ubuntu-latest
+          # The Linux legs compile inside the container image below, which
+          # sets the toolchain; the runner only hosts it. The image is pinned
+          # by date tag and digest. Objects compiled by its GCC 14 toolset
+          # reference runtime functions that GCC 12 and earlier do not
+          # provide, so a later image with a newer toolset would raise the
+          # compiler needed to link the archive. The engine links in the
+          # current manylinux_2_28 image, whose toolset is never older.
+          - os: ubuntu-24.04
             target: linux-x64
             variant: linux-x64-static
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.09.14-1@sha256:531d7aa844bbb0c131d4ab011d3db741c4abc8d498cd5ccc86121046f62303b4
           # GitHub's public ARM runner label is ubuntu-24.04-arm, not a
           # variant of ubuntu-latest, which is x64.
           - os: ubuntu-24.04-arm
             target: linux-aarch64
             variant: linux-aarch64-static
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.09.14-1@sha256:bbb43f784ce78a454a9e3351b862a12e7ad5c30972e8aeba092da678918bbba9
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -97,14 +119,15 @@ jobs:
         if: runner.os != 'Linux'
         run: bash engine-rs/archives/build.sh --source "$ROOT/src" --work "$ROOT/work" --stage "$ROOT/stage" --stem "$STEM"
 
-      # Inside the manylinux_2_28 image the engine is built in, so the
-      # libraries are compiled against glibc 2.28 by the compiler that later
-      # links them into the engine. A build on the runner would compile against
-      # the runner's newer glibc and libstdc++ headers.
+      # Inside a manylinux_2_28 image, the image family the engine is built
+      # in, so the libraries are compiled against glibc 2.28 by a toolset no
+      # newer than the one that later links them into the engine. A build on
+      # the runner would compile against the runner's newer glibc and
+      # libstdc++ headers.
       - name: Build (Linux)
         if: runner.os == 'Linux'
         env:
-          IMAGE: quay.io/pypa/manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          IMAGE: ${{ matrix.image }}
         run: |
           docker pull --quiet "$IMAGE"
           echo "image: $(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")" >> "$ROOT/built-with.txt"
