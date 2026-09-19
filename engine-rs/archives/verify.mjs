@@ -34,9 +34,14 @@
  *     or referenced: neither a name matching EXCLUDED_NAME nor any name the
  *     official archive's copies of the PLACEHOLDERS define that none of its
  *     other libraries define;
+ *   - the libraries in LINK_LIST need no name from the toolchain that links
+ *     them that the official archive's do not (see externalNames());
  *   - Windows: no member asks for the dynamic or the debug C runtime, and the
  *     C++ members declare the static release runtime the engine links;
- *   - macOS: no member requires a newer macOS than MACOS_DEPLOYMENT_TARGET.
+ *   - macOS: no member requires a newer macOS than MACOS_DEPLOYMENT_TARGET;
+ *   - Linux: every library is compiled for the std::string ABI of the ONNX
+ *     Runtime the archive carries (see CXX11_ABI_NAME), and by a compiler
+ *     generation that the official archive's copy of the library records.
  *
  * It also reports the archive's size and SHA-256 beside the official one's.
  * Exits 1 when any check fails.
@@ -181,6 +186,80 @@ export function inspectLibrary(file) {
   return { index: archive.index, variant: archive.variant, members, bytes: statSync(file).size };
 }
 
+/**
+ * The names the libraries in LINK_LIST reference and none of them defines:
+ * what the toolchain and system libraries that link the engine must provide.
+ * A name the official archive's libraries do not need fails the check, for
+ * either of two reasons:
+ *
+ *   - A static library links only with a toolchain at least as new as the one
+ *     that compiled it, because a newer compiler emits calls to runtime and
+ *     standard library helpers that older runtime libraries do not define.
+ *   - On Linux, libraries compiled with a different std::string ABI
+ *     (_GLIBCXX_USE_CXX11_ABI) from the ONNX Runtime the archive carries
+ *     reference the other ABI's standard library members. Their template
+ *     internals with the same names and different layouts then meet in one
+ *     link, and the executable links but corrupts memory at run time.
+ */
+function externalNames(libraries) {
+  const defined = new Set();
+  const referenced = new Set();
+  for (const [library, contents] of libraries) {
+    if (!LINK_LIST.includes(library)) continue;
+    for (const member of contents.members) {
+      for (const symbol of member.symbols) (symbol.defined ? defined : referenced).add(symbol.name);
+    }
+  }
+  return new Set([...referenced].filter((name) => !defined.has(name)));
+}
+
+/**
+ * libstdc++ has two ABIs for std::string, and _GLIBCXX_USE_CXX11_ABI selects
+ * one when an object is compiled. A name of the C++11 ABI carries the
+ * std::__cxx11 namespace (St7__cxx11) or the cxx11 ABI tag (B5cxx11). A
+ * member function of the earlier ABI's std::string or std::basic_string is
+ * named through the Ss or Sb substitution, which the C++11 ABI's names never
+ * use. "cxx11" alone is no marker: a mangled name runs an identifier into
+ * the length of the next one, so __gnu_cxx::__enable_if contains it
+ * (9__gnu_cxx11__enable_if) under either ABI.
+ */
+const CXX11_ABI_NAME = /St7__cxx11|B5cxx11/;
+const PRE_CXX11_ABI_NAME = /^_ZNK?S[sb]/;
+
+/** How many of a library's members name each std::string ABI. */
+function stringAbi(library) {
+  const names = (member, pattern) => member.symbols.some((s) => pattern.test(s.name));
+  return {
+    cxx11: library.members.filter((m) => names(m, CXX11_ABI_NAME)).length,
+    preCxx11: library.members.filter((m) => names(m, PRE_CXX11_ABI_NAME)).length,
+  };
+}
+
+/**
+ * The compiler generations a library's members record in .comment, such as
+ * "GCC 11" for "GCC: (GNU) 11.2.1 20220127 (Red Hat 11.2.1-9)". A string of
+ * another form stands for itself.
+ */
+function compilerGenerations(library) {
+  const generations = new Set();
+  for (const member of library.members) {
+    for (const comment of member.comments ?? []) {
+      const gcc = /^GCC: \([^)]*\) (\d+)\./.exec(comment);
+      generations.add(gcc ? `GCC ${gcc[1]}` : comment);
+    }
+  }
+  return generations;
+}
+
+/** Each .comment string of the members, with the number that record it. */
+function compilerCounts(members) {
+  const counts = new Map();
+  for (const member of members) {
+    for (const comment of member.comments ?? []) counts.set(comment, (counts.get(comment) ?? 0) + 1);
+  }
+  return [...counts].map(([comment, count]) => `${comment} (${count})`).join('; ') || 'none';
+}
+
 // ── Checks ───────────────────────────────────────────────────────────────
 
 function option(name) {
@@ -206,6 +285,11 @@ class Report {
   check(condition, message, detail = '') {
     if (condition) this.ok(message);
     else this.fail(detail ? `${message}: ${detail}` : message);
+  }
+  /** A line of the report that is a fact about the archive, not a check. */
+  note(message) {
+    if (!this.quiet) console.log(`      ${message}`);
+    this.lines.push(`- ${message}`);
   }
 }
 
@@ -418,6 +502,19 @@ async function archiveCommand() {
     excluded.size === 0 ? 'the official archive defines no such names, so there is nothing to compare' : sample(byName.map((s) => `${s} in ${seen.get(s)}`))
   );
 
+  report.lines.push('', '#### What the linking toolchain must provide');
+  const needed = externalNames(libraries);
+  const officialNeeded = externalNames(referenceLibraries);
+  const newNames = [...needed].filter((name) => !officialNeeded.has(name)).sort();
+  if (newNames.length) {
+    console.log(`\nNames the linking toolchain must provide that the official archive does not need:\n  ${newNames.join('\n  ')}\n`);
+  }
+  report.check(
+    newNames.length === 0,
+    `the linked libraries leave no name to the linking toolchain that the official archive's do not (${needed.size} names, official ${officialNeeded.size})`,
+    `${newNames.length} name(s): ${sample(newNames, 10)}`
+  );
+
   const allMembers = [...libraries.values()].flatMap((l) => l.members);
   if (platform.format === 'coff') {
     report.lines.push('', '#### C runtime');
@@ -440,8 +537,54 @@ async function archiveCommand() {
     );
   }
   if (platform.format === 'elf') {
-    const compilers = new Set(allMembers.flatMap((m) => m.comments ?? []));
-    console.log(`\nCompilers recorded in .comment: ${[...compilers].join('; ') || 'none'}`);
+    report.lines.push('', '#### Compiler and C++ standard library ABI');
+    // The ONNX Runtime is upstream's prebuilt one, so its std::string ABI is
+    // the one every library compiled for the archive has to share: libraries
+    // of both ABIs link into one executable and corrupt memory at run time.
+    const runtimeFile = libraryFile(platform, 'onnxruntime');
+    const runtime = stringAbi(libraries.get('onnxruntime'));
+    const runtimeAbi = runtime.cxx11 > 0 === runtime.preCxx11 > 0 ? null : runtime.cxx11 > 0 ? 'C++11' : 'pre-C++11';
+    report.check(
+      runtimeAbi !== null,
+      `${runtimeFile} names one std::string ABI${runtimeAbi ? `, the ${runtimeAbi} one` : ''}`,
+      `${runtime.cxx11} member(s) name the C++11 ABI and ${runtime.preCxx11} the pre-C++11 one`
+    );
+    if (runtimeAbi !== null) {
+      const otherAbi = [...libraries]
+        .map(([library, contents]) => ({ library, members: stringAbi(contents)[runtimeAbi === 'C++11' ? 'preCxx11' : 'cxx11'] }))
+        .filter((l) => l.members > 0);
+      report.check(
+        otherAbi.length === 0,
+        `every library is compiled for the ${runtimeAbi} std::string ABI, as ${runtimeFile} is`,
+        `compiled for the ${runtimeAbi === 'C++11' ? 'pre-C++11' : 'C++11'} ABI: ${sample(otherAbi.map((l) => `${libraryFile(platform, l.library)} (${l.members} member(s))`))}`
+      );
+    }
+    // Another compiler generation generates different floating-point code for
+    // the libraries that compute the features and decode the model's output,
+    // which changes what the keyword spotter detects, and it need not leave a
+    // name behind for the linking toolchain check to find.
+    const generations = new Set();
+    const otherCompiler = [];
+    for (const [library, contents] of libraries) {
+      const official = referenceLibraries.get(library);
+      if (!official || PLACEHOLDERS.includes(library)) continue;
+      const allowed = compilerGenerations(official);
+      // Nothing to compare with when the official copy records no compiler.
+      if (allowed.size === 0) continue;
+      const recorded = compilerGenerations(contents);
+      for (const generation of recorded) generations.add(generation);
+      const unknown = [...recorded].filter((generation) => !allowed.has(generation));
+      if (unknown.length) {
+        otherCompiler.push(`${libraryFile(platform, library)} (${unknown.join(', ')}; official ${[...allowed].join(', ')})`);
+      }
+    }
+    report.check(
+      otherCompiler.length === 0,
+      `every library records a compiler generation that the official archive's copy of it records (${[...generations].sort().join(', ') || 'none recorded'})`,
+      sample(otherCompiler)
+    );
+    report.note(`compilers this archive's members record: ${compilerCounts(allMembers)}`);
+    report.note(`compilers the official archive's members record: ${compilerCounts([...referenceLibraries.values()].flatMap((l) => l.members))}`);
   }
 
   const sizes = {

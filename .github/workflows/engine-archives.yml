@@ -29,8 +29,9 @@ jobs:
     # A static library links only with a toolchain at least as new as the one
     # that compiled it, because newer compilers emit calls to runtime helpers
     # that older runtime libraries do not define. Every image below is named
-    # by a fixed label, so the toolchain, and with it the oldest toolchain
-    # that can link the archive, changes only when this file does.
+    # by a fixed label, and build.sh fixes the version of the Linux compiler
+    # it installs, so the toolchain, and with it the oldest toolchain that can
+    # link the archive, changes only when one of the two files does.
     strategy:
       fail-fast: false
       matrix:
@@ -49,13 +50,14 @@ jobs:
           - os: macos-26
             target: osx-arm64
             variant: osx-arm64-static
-          # The Linux legs compile inside the container image below, which
-          # sets the toolchain; the runner only hosts it. The image is pinned
-          # by date tag and digest. Objects compiled by its GCC 14 toolset
-          # reference runtime functions that GCC 12 and earlier do not
-          # provide, so a later image with a newer toolset would raise the
-          # compiler needed to link the archive. The engine links in the
-          # current manylinux_2_28 image, whose toolset is never older.
+          # The Linux legs compile inside the container image below; the
+          # runner only hosts it. The image is pinned by date tag and digest.
+          # It supplies glibc 2.28 and the AlmaLinux 8 package repositories,
+          # from which build.sh installs the GCC 11 toolset at a fixed
+          # version. That toolset compiles the libraries, not the image's
+          # default one: GCC 11 is the compiler generation of the official
+          # archives and of the ONNX Runtime the archive carries, so the
+          # archive links wherever the official one does.
           - os: ubuntu-24.04
             target: linux-x64
             variant: linux-x64-static
@@ -120,10 +122,13 @@ jobs:
         run: bash engine-rs/archives/build.sh --source "$ROOT/src" --work "$ROOT/work" --stage "$ROOT/stage" --stem "$STEM"
 
       # Inside a manylinux_2_28 image, the image family the engine is built
-      # in, so the libraries are compiled against glibc 2.28 by a toolset no
-      # newer than the one that later links them into the engine. A build on
-      # the runner would compile against the runner's newer glibc and
-      # libstdc++ headers.
+      # in, so the libraries are compiled against glibc 2.28. A build on the
+      # runner would compile against the runner's newer glibc and libstdc++
+      # headers. build.sh installs the GCC 11 toolset in the container and
+      # compiles with it, for the std::string ABI of the ONNX Runtime that
+      # the architecture's archive carries; its comments give the reason for
+      # each. The install needs the container's default root user and the
+      # network.
       - name: Build (Linux)
         if: runner.os == 'Linux'
         env:

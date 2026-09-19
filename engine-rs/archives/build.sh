@@ -10,7 +10,8 @@
 # the top-level directory inside the archive.
 #
 # Runs on the Windows runner (Git Bash, Visual Studio generator), on the macOS
-# runner, and inside a manylinux_2_28 container for Linux.
+# runner, and inside a manylinux_2_28 container for Linux, where it installs
+# the GCC toolset named below with dnf, as root, unless it is already there.
 #
 # The build script of sherpa-onnx-sys links a fixed list of libraries, three of
 # which (espeak-ng, piper_phonemize, ucd) exist only when text-to-speech is
@@ -24,6 +25,13 @@ set -euo pipefail
 # Built by the text-to-speech stack only; supplied as empty libraries. The
 # same three as PLACEHOLDERS in verify.mjs, which checks them.
 PLACEHOLDERS=(espeak-ng piper_phonemize ucd)
+
+# The GCC toolset that compiles the Linux libraries, and the version of its
+# compiler packages that is installed. It is GCC 11, the compiler generation of
+# the ONNX Runtime the archive carries; the Linux options below say why. The
+# version is fixed so that the compiler changes only when this file does.
+LINUX_TOOLSET=gcc-toolset-11
+LINUX_TOOLSET_VERSION=11.2.1-9.2.el8_6.alma.1
 
 usage() {
   echo "usage: build.sh --source <dir> --work <dir> --stage <dir> --stem <name>" >&2
@@ -107,11 +115,92 @@ case "$os" in
     # object may require a newer macOS than that.
     cmake_args+=(-D 'CMAKE_OSX_ARCHITECTURES=arm64;x86_64' -D CMAKE_OSX_DEPLOYMENT_TARGET=11.0)
     ;;
+  linux)
+    # The archive carries upstream's prebuilt ONNX Runtime, and every library
+    # compiled here is linked into one executable with it. So they are
+    # compiled the way that ONNX Runtime was: by GCC 11, and for the same
+    # libstdc++ ABI.
+    #
+    # GCC 11 compiled the ONNX Runtime and the official archives (11.2.1 for
+    # x86-64, 11.4.0 for AArch64), and the image's default toolset is newer.
+    # The toolset is 11.2.1 on both architectures: the image's repositories
+    # offer no other GCC 11.
+    #
+    # Objects from a newer GCC reference runtime functions that the shared
+    # libstdc++ of GCC 11 and 12 does not export (__cxa_call_terminate,
+    # std::ios_base_library_init()), so a toolchain that links the official
+    # archive may not link them. A newer GCC also generates different
+    # floating-point code for these libraries, which compute the features and
+    # decode the model's output, and the keyword spotter then no longer
+    # detects as it does when built against the official archive.
+    toolset_root=/opt/rh/$LINUX_TOOLSET/root
+    if [ ! -x "$toolset_root/usr/bin/g++" ]; then
+      if ! command -v dnf > /dev/null; then
+        echo "error: $LINUX_TOOLSET is not installed and there is no dnf to install it with; run this inside the manylinux_2_28 image" >&2
+        exit 1
+      fi
+      echo "== Install $LINUX_TOOLSET $LINUX_TOOLSET_VERSION"
+      # From the two AlmaLinux repositories that hold the toolset and what it
+      # depends on, so the other repositories the image configures are not
+      # contacted. A version that is no longer offered fails the build rather
+      # than being replaced by another.
+      dnf install --assumeyes --quiet --repo appstream --repo baseos \
+        "$LINUX_TOOLSET-gcc-$LINUX_TOOLSET_VERSION" "$LINUX_TOOLSET-gcc-c++-$LINUX_TOOLSET_VERSION"
+    fi
+    # GCC runs the assembler it finds on PATH, where the image puts its default
+    # toolset first. The toolset's own script puts the toolset first instead,
+    # so the compiler, the assembler and the archiver all come from it. CC and
+    # CXX name the compilers as well, so that CMake's choice does not depend
+    # on a search order.
+    # shellcheck source=/dev/null
+    source "/opt/rh/$LINUX_TOOLSET/enable"
+    export CC="$toolset_root/usr/bin/gcc" CXX="$toolset_root/usr/bin/g++"
+    linux_cxx_flags=''
+    case "$(uname -m)" in
+      x86_64)
+        # Upstream's x86-64 ONNX Runtime is compiled for the libstdc++ ABI that
+        # preceded C++11, in which std::string is std::basic_string<char>; the
+        # toolset's default is the C++11 ABI, in which it is
+        # std::__cxx11::basic_string<char>. libstdc++ class templates that
+        # hold a std::string, such as std::__detail::_Scanner<char>, have the
+        # same mangled names under both ABIs and a different layout, and the
+        # linker keeps one definition of each name. Libraries of the two ABIs
+        # therefore link into one executable without a message, and the heap
+        # is corrupted when ONNX Runtime runs the definition compiled for the
+        # other layout, which it does whenever a model is loaded.
+        linux_cxx_flags=-D_GLIBCXX_USE_CXX11_ABI=0
+        cmake_args+=(-D "CMAKE_CXX_FLAGS=$linux_cxx_flags")
+        ;;
+      aarch64)
+        # Upstream's AArch64 ONNX Runtime is compiled for the C++11 ABI, the
+        # toolset's default. The macro above must stay unset here: it would
+        # cause on AArch64 the mismatch it prevents on x86-64.
+        ;;
+      *)
+        echo "error: no ONNX Runtime ABI is known for $(uname -m)" >&2
+        exit 1
+        ;;
+    esac
+    ;;
 esac
 
 echo "== Configure ($os, $jobs jobs)"
 cmake --version
 cmake -S "$source_dir" -B "$build_dir" "${cmake_args[@]}"
+
+if [ "$os" = linux ]; then
+  # CMake's record of the compilers it configured the build with. A compiler
+  # other than the toolset's stops the build here, before anything is
+  # compiled: its libraries would build and link just as the right ones do.
+  for language in C CXX; do
+    recorded=$(sed -n "s/^set(CMAKE_${language}_COMPILER_VERSION \"\([^\"]*\)\").*/\1/p" \
+      "$build_dir"/CMakeFiles/*/"CMake${language}Compiler.cmake")
+    if [ "$recorded" != "${LINUX_TOOLSET_VERSION%%-*}" ]; then
+      echo "error: CMake configured a $language compiler of version '$recorded', not ${LINUX_TOOLSET_VERSION%%-*} from $LINUX_TOOLSET" >&2
+      exit 1
+    fi
+  done
+fi
 
 echo "== Build"
 cmake --build "$build_dir" --config Release --parallel "$jobs"
@@ -202,7 +291,11 @@ done
 {
   echo "cmake: $(cmake --version | head -n 1)"
   echo "compiler: $(cmake_value CMAKE_C_COMPILER_ID) $(cmake_value CMAKE_C_COMPILER_VERSION)"
-  if [ "$os" = linux ]; then echo "libc: $(ldd --version 2>&1 | head -n 1)"; fi
+  if [ "$os" = linux ]; then
+    echo "libc: $(ldd --version 2>&1 | head -n 1)"
+    echo "c++ compiler: $("$CXX" --version | sed -n 1p); $(as --version | sed -n 1p)"
+    echo "c++ flags added: ${linux_cxx_flags:-none}"
+  fi
   if [ "$os" = macos ]; then echo "sdk: macOS $(xcrun --show-sdk-version), deployment target 11.0"; fi
 } > "$work_dir/toolchain.txt"
 cat "$work_dir/toolchain.txt"
