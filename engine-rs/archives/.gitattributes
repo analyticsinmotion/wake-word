@@ -1,0 +1,4 @@
+# Shell scripts stay LF in every checkout, a Windows one included: bash on
+# Linux and macOS, the Linux build container among them, reads a CR as part of
+# the line.
+*.sh text eol=lf

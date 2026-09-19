@@ -1,0 +1,162 @@
+name: Engine archives
+
+# Builds the sherpa-onnx static library archives the engine links, for each
+# package target, with the text-to-speech components left out. Each archive
+# has the name and layout of the official archive for the same release and
+# target, so the sherpa-onnx-sys build script consumes it unmodified, and is
+# checked against that official archive before it is uploaded. Nothing here
+# changes what the engine builds against; that is pinned in
+# engine-rs/scripts/pinned-inputs.mjs. See engine-rs/archives/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: upstream release tag to build
+        required: true
+        default: v1.13.8
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  archive:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win-x64
+            variant: win-x64-static-MT-Release
+          - os: macos-latest
+            target: osx-arm64
+            variant: osx-arm64-static
+          - os: ubuntu-latest
+            target: linux-x64
+            variant: linux-x64-static
+          # GitHub's public ARM runner label is ubuntu-24.04-arm, not a
+          # variant of ubuntu-latest, which is x64.
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+            variant: linux-aarch64-static
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+
+    env:
+      TAG: ${{ inputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # The archive takes the name the sherpa-onnx-sys build script of the same
+      # version downloads. Everything is built under the runner's temporary
+      # directory, named by a POSIX path: GNU tar on Windows reads a name with
+      # a drive letter as host:path.
+      - name: Name the archive
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The tag must look like v1.13.8, not '$TAG'"
+            exit 1
+          fi
+          root=$RUNNER_TEMP/archive
+          if [ "$RUNNER_OS" = Windows ]; then root=$(cygpath -u "$RUNNER_TEMP")/archive; fi
+          stem="sherpa-onnx-$TAG-$VARIANT-lib"
+          {
+            echo "ROOT=$root"
+            echo "STEM=$stem"
+            echo "ARCHIVE=$stem.tar.bz2"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$root"
+          echo "runner: ${ImageOS:-unknown} ${ImageVersion:-}" > "$root/built-with.txt"
+
+      - name: Fetch sherpa-onnx at the tag
+        run: |
+          git clone --quiet --depth 1 --branch "$TAG" https://github.com/k2-fsa/sherpa-onnx.git "$ROOT/src"
+          version=$(sed -n 's/^set(SHERPA_ONNX_VERSION "\([^"]*\)").*/\1/p' "$ROOT/src/CMakeLists.txt")
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::CMakeLists.txt at $TAG sets version '$version'"
+            exit 1
+          fi
+          echo "source: sherpa-onnx $TAG, commit $(git -C "$ROOT/src" rev-parse HEAD)" >> "$ROOT/built-with.txt"
+
+      # The Visual Studio generator with the static C runtime on Windows; a
+      # universal build thinned to arm64, for macOS 11.0, on macOS.
+      - name: Build (Windows, macOS)
+        if: runner.os != 'Linux'
+        run: bash engine-rs/archives/build.sh --source "$ROOT/src" --work "$ROOT/work" --stage "$ROOT/stage" --stem "$STEM"
+
+      # Inside the manylinux_2_28 image the engine is built in, so the
+      # libraries are compiled against glibc 2.28 by the compiler that later
+      # links them into the engine. A build on the runner would compile against
+      # the runner's newer glibc and libstdc++ headers.
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        env:
+          IMAGE: quay.io/pypa/manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+        run: |
+          docker pull --quiet "$IMAGE"
+          echo "image: $(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")" >> "$ROOT/built-with.txt"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/repo:ro" \
+            --volume "$ROOT:/archive" \
+            "$IMAGE" \
+            bash /repo/engine-rs/archives/build.sh --source /archive/src --work /archive/work --stage /archive/stage --stem "$STEM"
+
+      - name: Check the placeholder libraries
+        run: node engine-rs/archives/verify.mjs placeholders --lib-dir "$ROOT/stage/$STEM/lib"
+
+      # Packed as the official archives are, with tar and bzip2.
+      - name: Pack the archive
+        run: |
+          cat "$ROOT/work/toolchain.txt" >> "$ROOT/built-with.txt"
+          mkdir -p "$ROOT/out"
+          cd "$ROOT/stage"
+          tar -cjf "../out/$ARCHIVE" "$STEM"
+          ls -l "../out/$ARCHIVE"
+
+      # The official archive for the same release and target, which the checks
+      # compare against. It is not part of the output.
+      - name: Fetch the official archive
+        run: |
+          mkdir -p "$ROOT/reference/unpacked"
+          cd "$ROOT/reference"
+          curl --fail --location --silent --show-error --retry 3 --output "$ARCHIVE" \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/$TAG/$ARCHIVE"
+          tar -xjf "$ARCHIVE" -C unpacked
+
+      # The checks read the packed archive unpacked again, so they cover the
+      # bytes that are uploaded. The job summary gets the archive's size and
+      # SHA-256 beside the official one's, and every check's result.
+      - name: Verify the archive
+        run: |
+          mkdir -p "$ROOT/check"
+          (cd "$ROOT/check" && tar -xjf "../out/$ARCHIVE")
+          node engine-rs/archives/verify.mjs archive \
+            --archive "$ROOT/out/$ARCHIVE" \
+            --unpacked "$ROOT/check" \
+            --reference "$ROOT/reference/$ARCHIVE" \
+            --reference-unpacked "$ROOT/reference/unpacked" \
+            --built-with "$ROOT/built-with.txt" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # The file itself, not zipped, so the artifact is the archive whose
+      # SHA-256 the job summary shows. An action takes the runner's own path
+      # form, hence runner.temp rather than ROOT.
+      - name: Upload the archive
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/archive/out/${{ env.ARCHIVE }}
+          archive: false
+          if-no-files-found: error
