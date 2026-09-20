@@ -805,7 +805,7 @@ mod tests {
         }
     }
 
-    const CONFIG: &str = r#"{"phrases":[{"phrase":"hey claude","label":"Claude"}],"threshold":0.05,"modelDir":"/models","debugMode":false,"audioDevice":"","keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
+    const CONFIG: &str = r#"{"threshold":0.05,"modelDir":"/models","debugMode":false,"audioDevice":"","keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
     const DEBUG_CONFIG: &str = r#"{"modelDir":"/models","debugMode":true,"keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
 
     /// A config line with one keyword line and its phrase map entry, plus
@@ -1449,7 +1449,7 @@ mod tests {
     #[test]
     fn refuses_a_config_without_keyword_lines_before_preparing() {
         for json in [
-            r#"{"phrases":[{"phrase":"hey claude"}],"modelDir":"/models","phraseMap":{"HEY CLAUDE":"hey claude"}}"#,
+            r#"{"modelDir":"/models","phraseMap":{"HEY CLAUDE":"hey claude"}}"#,
             r#"{"keywordLines":"▁HE Y :3.0 #0.05","phraseMap":{"HEY":"hey"}}"#,
         ] {
             let mut harness = Harness::new();
@@ -1534,8 +1534,7 @@ mod tests {
     fn hands_preparation_the_keyword_lines_the_phrase_map_the_threshold_and_the_model_directory() {
         let mut harness = Harness::new();
         harness.line(
-            r#"{"phrases":[{"phrase":["Hey Claude","open claude"]}],
-                "keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3","▁O P EN ▁C LA U DE :3.0 #0.3"],
+            r#"{"keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3","▁O P EN ▁C LA U DE :3.0 #0.3"],
                 "phraseMap":{"HEY CLAUDE":"hey claude","OPEN CLAUDE":"open claude"},
                 "threshold":0.3,"modelDir":"/models/kws"}"#,
         );

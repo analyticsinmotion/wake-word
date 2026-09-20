@@ -56,9 +56,10 @@ const MODEL_FILES = [
 ];
 
 /**
- * The keyword lines and phrase map the extension builds for the phrases in
- * config(), at the threshold config() sends: the model's SentencePiece pieces
- * for each upper-cased phrase, then the boost and the threshold.
+ * The keyword lines and phrase map the extension builds for "hey claude",
+ * "open claude" and "hey chat" at the threshold config() sends: the model's
+ * SentencePiece pieces for each upper-cased phrase, then the boost and the
+ * threshold.
  */
 const KEYWORD_LINES = [
   '▁HE Y ▁C LA U DE :3.0 #0.05',
@@ -96,10 +97,6 @@ function resolveBinary() {
 
 function config(overrides = {}) {
   return JSON.stringify({
-    phrases: [
-      { phrase: ['hey claude', 'open claude'], label: 'Claude' },
-      { phrase: 'hey chat', label: 'Chat' },
-    ],
     threshold: 0.05,
     modelDir: MODEL_DIR ?? MISSING_MODEL_DIR,
     debugMode: false,

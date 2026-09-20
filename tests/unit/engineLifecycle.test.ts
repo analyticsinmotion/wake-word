@@ -8,9 +8,9 @@ import { MockChildProcess } from "../mocks/childProcess";
  *
  * These are the paths that were only ever checked by hand: start, stop,
  * pause, resume, the crash and retry backoff, the retry-timer cancellation
- * that stop() and pause() must perform (the D2 fix), the pause and resume
- * commands that keep one child alive across handoffs, and the PAUSED and
- * RELEASED handshakes with their timeouts. `spawn` is replaced with a factory for
+ * that stop() and pause() must perform, the pause and resume commands that
+ * keep one child alive across handoffs, and the PAUSED and RELEASED
+ * handshakes with their timeouts. `spawn` is replaced with a factory for
  * MockChildProcess, `fs` says the model is already downloaded, the tokeniser
  * splits phrases into one piece per word against a token table without
  * digits, and the timers are faked so a ten second backoff costs nothing.
@@ -327,11 +327,12 @@ describe("start", () => {
     const proc = latest();
     expect(proc.stdinLines).toHaveLength(1);
     const config = configLine(proc);
-    // Only phrase and label cross the boundary: the child never sees a
-    // command ID or a cooldown.
-    expect(config.phrases).toEqual([
-      { phrase: "hey claude", label: "Claude" },
-      { phrase: ["hey computer", "open terminal"], label: "Terminal" },
+    // Only the keyword lines and the phrase map cross the boundary: the
+    // child never sees a command ID or a cooldown.
+    expect(config.keywordLines).toEqual([
+      "▁HEY ▁CLAUDE :3.0 #0.3",
+      "▁HEY ▁COMPUTER :3.0 #0.3",
+      "▁OPEN ▁TERMINAL :3.0 #0.3",
     ]);
     expect(config.threshold).toBe(0.3);
     expect(config.modelDir).toMatch(/sherpa-onnx/);
@@ -460,12 +461,6 @@ describe("tokenising the phrases", () => {
       "▁OPEN ▁MAPS :3.0 #0.05",
     ]);
     expect(config.phraseMap).toEqual({ "HEY CLAUDE": "hey claude", "OPEN MAPS": "open maps" });
-    // Left out of the phrases as well, so a child that tokenises for itself
-    // listens for the same set.
-    expect(config.phrases).toEqual([
-      { phrase: "hey claude", label: "Claude" },
-      { phrase: ["open maps"], label: "Roads" },
-    ]);
   });
 
   it("reports no valid phrases without spawning when every phrase is skipped", async () => {
@@ -1398,7 +1393,7 @@ describe("start while paused", () => {
     expect(old.killed).toBe(true);
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
     const config = configLine(latest());
-    expect(config.phrases).toContainEqual({ phrase: "search files", label: "Search" });
+    expect(config.keywordLines).toContain("▁SEARCH ▁FILES :3.0 #0.5");
     expect(config.threshold).toBe(0.5);
     expect(engine.isPaused).toBe(true);
 
@@ -1556,7 +1551,7 @@ describe("crash and retry", () => {
   });
 });
 
-// ── the D2 fix: nothing may restart the microphone after stop() ──
+// ── nothing may restart the microphone after stop() ──
 
 describe("stop during crash backoff", () => {
   it("cancels the pending retry so nothing reopens the microphone", async () => {

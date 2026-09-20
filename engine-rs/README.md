@@ -418,7 +418,6 @@ The first line is a JSON config object:
 
 ```json
 {
-  "phrases": [{ "phrase": "hey claude", "label": "Claude" }],
   "threshold": 0.05,
   "modelDir": "<path>",
   "debugMode": false,
@@ -440,13 +439,12 @@ a phrase whose pieces are not all in the model's token table, with a warning,
 so one bad route does not take the engine down; the engine's own check, above,
 catches any such line that arrives anyway.
 
-`phrases` is there for engines that tokenise for themselves; this one does not
-read it. `threshold` is clamped to 0.01 to 0.9, defaulting to 0.05, and passed
-as the spotter-wide threshold; each line carries its own. `modelDir` is the
-keyword spotting model directory described above. `audioDevice` is a device
-index when it is nothing but digits, otherwise a case-insensitive name
-substring; empty means the system default. `vadModelPath` and `ortLibraryPath`
-are described above; the extension does not send them.
+`threshold` is clamped to 0.01 to 0.9, defaulting to 0.05, and passed as the
+spotter-wide threshold; each line carries its own. `modelDir` is the keyword
+spotting model directory described above. `audioDevice` is a device index when
+it is nothing but digits, otherwise a case-insensitive name substring; empty
+means the system default. `vadModelPath` and `ortLibraryPath` are described
+above; the extension does not send them.
 
 Every line after the config is a command:
 

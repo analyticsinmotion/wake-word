@@ -16,7 +16,7 @@ import * as path from "path";
 import * as https from "https";
 import { pipeline } from "stream/promises";
 import * as vscode from "vscode";
-import { buildKeywordSpec, configPhrases, keywordTexts, skippedPhraseWarning } from "./keywords";
+import { buildKeywordSpec, keywordTexts, skippedPhraseWarning } from "./keywords";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 import { extractTarGz } from "./tarExtract";
 import { Tokenised, readVocabulary, tokenise } from "./tokeniser";
@@ -251,10 +251,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     });
 
     // Send config as JSON line then leave stdin open (child reads more commands).
-    // `phrases` leaves out what the keyword lines leave out, so a child that
-    // tokenises for itself listens for the same phrases.
     const config = {
-      phrases: configPhrases(phrases, new Set(spec.skipped.map((s) => s.phrase))),
       threshold: safeThreshold,
       modelDir,
       debugMode,

@@ -1,4 +1,3 @@
-import { WakePhrase } from "./speechEngineInterface";
 import { clampThreshold } from "./wakeWordCore";
 
 /**
@@ -214,44 +213,4 @@ export function parseVocabulary(tokensTxt: string): Set<string> {
     }
   }
   return vocabulary;
-}
-
-/** A route as the engine's config line carries it. */
-export interface ConfigPhrase {
-  phrase: unknown;
-  label: string;
-}
-
-/**
- * The routes' phrases and labels for the config line, without the phrases in
- * `refused`. The keyword lines already leave those out; taking them out of
- * `phrases` too means an engine that builds its own lines from `phrases`
- * listens for the same set. A route with no phrase left is dropped, and a
- * route with nothing refused is passed on as configured.
- */
-export function configPhrases(
-  routes: readonly WakePhrase[],
-  refused: ReadonlySet<string>
-): ConfigPhrase[] {
-  const out: ConfigPhrase[] = [];
-  for (const route of routes) {
-    const phrase: unknown = route.phrase;
-    if (typeof phrase === "string") {
-      if (!refused.has(phrase)) {
-        out.push({ phrase, label: route.label });
-      }
-      continue;
-    }
-    if (Array.isArray(phrase)) {
-      const kept = phrase.filter((p: unknown) => typeof p !== "string" || !refused.has(p));
-      if (kept.length === phrase.length) {
-        out.push({ phrase, label: route.label });
-      } else if (kept.length > 0) {
-        out.push({ phrase: kept, label: route.label });
-      }
-      continue;
-    }
-    out.push({ phrase, label: route.label });
-  }
-  return out;
 }

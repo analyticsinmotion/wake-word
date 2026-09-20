@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { releaseThenFire, retiredEngineNotice, RETIRED_ENGINE_NOTICE } from "../../src/wakeWordCore";
+import { releaseThenFire } from "../../src/wakeWordCore";
 
 /**
  * The order of a handoff: the microphone is released first, and the route's
@@ -115,27 +115,5 @@ describe("releaseThenFire", () => {
       }
     );
     await expect(handoff).resolves.toEqual({ kind: "failed", error });
-  });
-});
-
-describe("retiredEngineNotice", () => {
-  it("explains the retirement to a user who chose the windows engine", () => {
-    expect(retiredEngineNotice("windows")).toBe(RETIRED_ENGINE_NOTICE);
-    expect(RETIRED_ENGINE_NOTICE).toBe(
-      "The 'windows' engine has been retired. Wake Word now uses the sherpa-onnx " +
-        "engine on all platforms. You can remove wakeWord.engine from your settings."
-    );
-  });
-
-  it("says nothing for values that already describe what runs", () => {
-    expect(retiredEngineNotice("auto")).toBeNull();
-    expect(retiredEngineNotice("sherpa")).toBeNull();
-  });
-
-  it("says nothing when the setting is absent or not a string", () => {
-    expect(retiredEngineNotice(undefined)).toBeNull();
-    expect(retiredEngineNotice(null)).toBeNull();
-    expect(retiredEngineNotice(1)).toBeNull();
-    expect(retiredEngineNotice("Windows")).toBeNull();
   });
 });

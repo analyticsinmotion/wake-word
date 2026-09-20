@@ -122,28 +122,6 @@ export function shouldDebounce(
   return now - lastDetectionTime < windowMs;
 }
 
-// -- Retired settings ---------------------------------------------------
-
-/**
- * Logged when settings.json still carries `wakeWord.engine: "windows"`.
- *
- * 0.13.0 removed the setting along with the engine it selected. VS Code
- * ignores a setting nothing contributes, so the stale value does no harm,
- * but a user who chose that engine deliberately should be told where it went.
- */
-export const RETIRED_ENGINE_NOTICE =
-  "The 'windows' engine has been retired. Wake Word now uses the sherpa-onnx " +
-  "engine on all platforms. You can remove wakeWord.engine from your settings.";
-
-/**
- * The notice for a leftover `wakeWord.engine` value, or null when there is
- * nothing to say. Only `windows` gets one: `auto` and `sherpa` already
- * describe what runs now.
- */
-export function retiredEngineNotice(value: unknown): string | null {
-  return value === "windows" ? RETIRED_ENGINE_NOTICE : null;
-}
-
 // -- stdout protocol ----------------------------------------------------
 
 export type EngineEvent =

@@ -3,8 +3,7 @@
 //! The shape, as `src/sherpaEngine.ts` writes it:
 //!
 //! ```json
-//! { "phrases": [{ "phrase": "hey claude", "label": "Claude" }],
-//!   "threshold": 0.05, "modelDir": "<path>",
+//! { "threshold": 0.05, "modelDir": "<path>",
 //!   "debugMode": false, "audioDevice": "",
 //!   "keywordLines": ["▁HE Y ▁C LA U DE :3.0 #0.05"],
 //!   "phraseMap": { "HEY CLAUDE": "hey claude" } }
@@ -14,8 +13,7 @@
 //! per phrase, SentencePiece pieces followed by the boost and the trigger
 //! threshold, and `phraseMap` maps the decoded text of each line's pieces,
 //! which is what the spotter reports on a hit, to the phrase as configured,
-//! lower-cased. The engine needs both and has no tokeniser, so it does not
-//! read `phrases`, which is there for engines that tokenise for themselves.
+//! lower-cased. The engine has no tokeniser and needs both.
 //!
 //! Two more optional fields, `vadModelPath` and `ortLibraryPath`, locate the
 //! Silero model and the ONNX Runtime library; the extension does not send
@@ -257,7 +255,7 @@ mod tests {
     #[test]
     fn parses_the_config_the_extension_sends_on_start() {
         let parsed = config(
-            r#"{"phrases":[{"phrase":"hey claude","label":"Claude"}],"threshold":0.3,
+            r#"{"threshold":0.3,
                 "modelDir":"C:\\Users\\me\\models","debugMode":true,"audioDevice":"",
                 "keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3"],
                 "phraseMap":{"HEY CLAUDE":"hey claude"}}"#,

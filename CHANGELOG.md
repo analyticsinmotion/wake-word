@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `wakeWord.nodePath` setting, the Node.js lookup behind it, and the
   "Could not find Node.js" error. An entry left in settings.json has no
   effect and can be removed.
+- The status bar item naming the speech engine. One engine has run on
+  every platform since 0.13.0, so it always read the same thing. The
+  listening status item is unchanged, and **Wake Word: Show
+  Diagnostics** is still in the command palette.
+- The startup notice for a `wakeWord.engine` entry left in
+  settings.json. The setting has had no effect since 0.13.0.
 
 ## [0.13.2] - 2026-09-16
 

@@ -293,7 +293,7 @@ Changing it restarts the engine. If the value matches no device, or more than on
 - **Wake Word: Reset Microphone Consent** -- clear consent and re-prompt
 - **Wake Word: Open Settings** -- open the Settings editor filtered to Wake Word (also linked from the status bar tooltip)
 - **Wake Word: Calibrate** -- listen for 15 seconds and log what is heard without firing any route (see [Calibrating](#calibrating))
-- **Wake Word: Show Diagnostics** -- write the versions, platform, speech engine self-test, model, audio device, settings, routes, phrase warnings, and engine state to the output channel, with an option to copy them for a bug report. Your home directory is replaced with `~`, and no audio is included. Also opened by clicking the engine indicator in the status bar
+- **Wake Word: Show Diagnostics** -- write the versions, platform, speech engine self-test, model, audio device, settings, routes, phrase warnings, and engine state to the output channel, with an option to copy them for a bug report. Your home directory is replaced with `~`, and no audio is included
 
 ## Common command IDs
 
