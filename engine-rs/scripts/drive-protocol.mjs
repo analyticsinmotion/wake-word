@@ -28,7 +28,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -415,6 +415,43 @@ const scenarios = [
       return ok ? null : `line was ${lines[0]}`;
     },
     exit: 1,
+  },
+  {
+    // On Windows the library refuses a path of 260 characters or more unless
+    // the engine hands it over in the verbatim form. The pause lands during
+    // the model load, so the second line is printed only once the model has
+    // loaded, and no microphone is opened.
+    name: 'a model directory whose file paths exceed 260 characters loads',
+    needs: ['model'],
+    async drive(engine) {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'wake-word-long-model-'));
+      let long = root;
+      while (long.length < 300) {
+        long = path.join(long, 'd'.repeat(40));
+      }
+      try {
+        mkdirSync(long, { recursive: true });
+        for (const file of MODEL_FILES) {
+          copyFileSync(path.join(MODEL_DIR, file), path.join(long, file));
+        }
+        engine.write(config({ modelDir: long, debugMode: true }) + '\npause\n');
+        await engine.waitFor('PAUSED');
+        await engine.waitFor(
+          'DEBUG:models loaded; paused before the microphone opened, waiting for resume'
+        );
+        engine.write('stop\n');
+        await engine.waitForExit();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    expect: (lines) => {
+      const protocolLines = lines.filter((line) => !line.startsWith('DEBUG:'));
+      return protocolLines.join('|') === 'PAUSED|RELEASED'
+        ? null
+        : `expected PAUSED, RELEASED, got ${JSON.stringify(lines)}`;
+    },
+    exit: 0,
   },
   {
     name: 'a phrase the model has no pieces for is refused by name instead of ending the process',

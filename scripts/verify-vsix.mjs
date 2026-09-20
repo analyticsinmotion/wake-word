@@ -19,7 +19,9 @@
  *     the pinned files, with their license notices;
  *   - Windows: the binary imports no C runtime DLL, because it links the
  *     static runtime the sherpa-onnx libraries are built against, and does not
- *     import ONNX Runtime, which it loads by path;
+ *     import ONNX Runtime, which it loads by path; no Visual C++ runtime
+ *     library is packaged, and the ones the packaged libraries import are the
+ *     ones the installation notes require;
  *   - Linux: neither the binary nor ONNX Runtime needs a newer glibc or
  *     libstdc++ than LINUX_FLOOR, and the binary exports no ONNX Runtime
  *     symbol for the loaded library to bind to;
@@ -57,6 +59,28 @@ import {
  * that glibc so that it runs on every distribution the editor runs on.
  */
 export const LINUX_FLOOR = { GLIBC: '2.28', GLIBCXX: '3.4.25', CXXABI: '1.3.11', GCC: '7.0.0' };
+
+/**
+ * A Visual C++ runtime library, by file name. These are not part of Windows:
+ * a library that imports one loads only where the redistributable has been
+ * installed, unless the file is beside the executable.
+ */
+export const VC_RUNTIME_LIBRARY = /^(vcruntime|msvcp|concrt|vccorlib|vcomp|vcamp)\d+[a-z0-9_]*\.dll$/i;
+
+/**
+ * The Visual C++ runtime libraries the packaged Windows files import, lower
+ * case and sorted. The extension does not ship them: the installation notes
+ * name the Microsoft Visual C++ Redistributable as a requirement on Windows,
+ * and this list is what that requirement has to cover. An ONNX Runtime bump
+ * that changes it fails the package check here rather than on a machine
+ * without the redistributable, where no check of ours runs.
+ */
+export const WINDOWS_VC_RUNTIME = [
+  'msvcp140.dll',
+  'msvcp140_1.dll',
+  'vcruntime140.dll',
+  'vcruntime140_1.dll',
+];
 
 /** The oldest macOS the engine runs on, set by the ONNX Runtime build it ships. */
 export const MACOS_FLOOR = '14.0';
@@ -362,6 +386,39 @@ function main() {
       ortInfo = binaryInfo(content);
       checkArchitecture(report, ort.to, ortInfo, expected);
     }
+  }
+
+  // The Visual C++ runtime on Windows. It is not part of Windows and is not
+  // packaged: the installation notes name the redistributable as a
+  // requirement instead. Two things keep that requirement true. A copy in
+  // this directory would be loaded in preference to the installed one and
+  // would never be serviced, so none may be packaged; and the requirement
+  // describes what the packaged libraries import, so a change to that fails
+  // here rather than on a machine without the redistributable.
+  if (target.startsWith('win32-')) {
+    const shipped = [...entries.keys()]
+      .filter((name) => name.startsWith(`extension/${PACKAGE_DIR}/`))
+      .map((name) => name.slice(name.lastIndexOf('/') + 1))
+      .filter((name) => VC_RUNTIME_LIBRARY.test(name));
+    report.check(
+      shipped.length === 0,
+      'no Visual C++ runtime library is packaged',
+      `packaged: ${shipped.join(', ')}`
+    );
+    const imported = [
+      ...new Set(
+        [engine, ortInfo]
+          .filter((info) => info?.format === 'PE')
+          .flatMap((info) => info.imports)
+          .filter((library) => VC_RUNTIME_LIBRARY.test(library))
+          .map((library) => library.toLowerCase())
+      ),
+    ].sort();
+    report.check(
+      imported.join(' ') === WINDOWS_VC_RUNTIME.join(' '),
+      `the packaged files import the Visual C++ runtime the installation notes require (${imported.join(', ')})`,
+      `expected ${WINDOWS_VC_RUNTIME.join(', ')}`
+    );
   }
 
   // Platform checks on the binaries as packaged.

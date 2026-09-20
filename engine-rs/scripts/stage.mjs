@@ -34,13 +34,7 @@ import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
 import { checkBuffer, checkIntegrity, downloadBuffer } from './download.mjs';
-import {
-  engineFileName,
-  npmTarballUrl,
-  PACKAGE_DIR,
-  RUNTIME_FILES,
-  TARGETS,
-} from './pinned-inputs.mjs';
+import { engineFileName, npmTarballUrl, PACKAGE_DIR, RUNTIME_FILES, TARGETS } from './pinned-inputs.mjs';
 
 const ENGINE_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const REPO_DIR = path.dirname(ENGINE_DIR);

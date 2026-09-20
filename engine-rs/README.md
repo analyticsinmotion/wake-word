@@ -3,10 +3,12 @@
 A Rust implementation of `engine/audio-engine.js`: the child process the Wake
 Word extension talks to over stdin and stdout.
 
-**The extension does not run this binary.** `engine/audio-engine.js` under
-system Node.js is the engine that runs. Nothing in `src/` spawns this binary.
+**The extension runs this binary.** `SherpaEngine` in `src/sherpaEngine.ts`
+spawns `bin/wake-word-engine` from the installed extension, with no arguments.
 Each platform `.vsix` carries it, built in CI, in `bin/` with the files it
 loads at run time; see [Release builds](#release-builds).
+`engine/audio-engine.js` under system Node.js is still packaged, and
+`ENGINE_KIND` in `src/sherpaEngine.ts` selects it instead.
 
 ## What it does
 
@@ -237,10 +239,35 @@ and `libonnxruntime.so` does not list it as a dependency, so it is not
 shipped.
 
 Each ONNX Runtime build sets a floor of its own. The macOS library needs
-macOS 14.0. The Windows library links the dynamic Visual C++ runtime
-(`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`), which is not part
-of Windows itself; the engine binary links the static runtime and needs none
-of it.
+macOS 14.0. The Windows library links the dynamic Visual C++ runtime, which is
+not part of Windows itself; the engine binary links the static runtime and
+needs none of it.
+
+**The Visual C++ runtime (Windows).** `onnxruntime.dll` imports
+`msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll` and `vcruntime140_1.dll`,
+and those import only each other and Windows' own libraries. They are not part
+of Windows and are not packaged: the Microsoft Visual C++ Redistributable is a
+requirement on Windows, stated in the extension's installation notes. Windows
+resolves a library's imports from the directory of the running executable
+before anywhere else, so a copy in `bin/` would be loaded in preference to the
+installed one and would only ever change when this repository re-pinned it;
+`verify-vsix.mjs` fails a package that carries one. It also pins the list above
+against the imports of the packaged files, so an ONNX Runtime bump that needs
+another library fails the package check and the installation notes are
+revisited with the pin. The `api-ms-win-crt-*` imports are the Universal C
+Runtime, which is part of Windows 10 and later, and the engine binary itself
+links the C runtime statically and imports none of this.
+
+**Model paths on Windows.** The sherpa-onnx library opens the model files
+through C runtime calls that refuse a path of 260 characters or more, and it
+reports such a file as one that does not exist. The limit is on the whole file
+path, so a long account name or a redirected profile is enough to reach it.
+`library_model_dir()` in `src/spotter.rs` canonicalises the model directory
+before it goes into the spotter configuration, which on Windows gives the
+verbatim form, starting `\\?\`, that is exempt from the limit. The engine's own
+messages keep the path as the extension sent it. The drive script loads the
+model from a directory whose file paths are over 300 characters, on every
+platform.
 
 On macOS, `stage.mjs` signs the binary ad hoc after copying it, because Apple
 silicon runs no unsigned code and stripping can leave the linker's signature
@@ -253,10 +280,11 @@ repository root reads the `.vsix` and fails unless:
 - `bin/` holds the engine for the target's architecture, stored executable on
   macOS and Linux, and the pinned runtime files and notices;
 - on Windows the engine imports no C runtime DLL and does not import ONNX
-  Runtime; on Linux neither the engine nor ONNX Runtime needs anything newer
-  than glibc 2.28 or GLIBCXX 3.4.25, and the engine exports no ONNX Runtime
-  symbol; on macOS neither needs anything newer than macOS 14.0, and both pass
-  `codesign --verify` once unpacked;
+  Runtime, no Visual C++ runtime library is packaged, and the ones the packaged
+  files import are `WINDOWS_VC_RUNTIME`; on Linux neither the engine nor ONNX
+  Runtime needs anything newer than glibc 2.28 or GLIBCXX 3.4.25, and the
+  engine exports no ONNX Runtime symbol; on macOS neither needs anything newer
+  than macOS 14.0, and both pass `codesign --verify` once unpacked;
 - the engine's self-test, run from the unpacked package with no environment
   variables pointing elsewhere, reports `OK`, the pinned sherpa-onnx version,
   and ONNX Runtime and the Silero model as loaded from beside the binary. The

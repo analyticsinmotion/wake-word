@@ -71,6 +71,12 @@ export function sherpaOnnxArchiveUrl(name) {
  * provider is built into libonnxruntime.so, which does not list it as a
  * dependency, so it is not shipped.
  *
+ * The Windows library imports the Microsoft Visual C++ runtime, which is not
+ * part of Windows and is not packaged with the extension; the installation
+ * notes name the redistributable as a requirement, and
+ * scripts/verify-vsix.mjs pins the libraries it imports so that a bump which
+ * changes them is noticed.
+ *
  * `tarball` is the registry's integrity value for the package, checked before
  * the package is unpacked. Each file is then checked against its own digest,
  * and scripts/verify-vsix.mjs checks the packaged copies against the same
