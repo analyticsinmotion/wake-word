@@ -13,8 +13,8 @@ export const DETECTION_DEBOUNCE_MS = 3000;
 
 /**
  * Bounds enforced on `wakeWord.confidenceThreshold`, and its default. The
- * value becomes every keyword line's trigger threshold in the engine, and
- * clampKeywordThreshold() in engine/lib/control.js repeats these numbers.
+ * value becomes every keyword line's trigger threshold in the engine, whose
+ * config.rs repeats these numbers, and the package.json schema states them.
  */
 export const MIN_THRESHOLD = 0.01;
 export const MAX_THRESHOLD = 0.9;
@@ -710,28 +710,12 @@ export function formatPhraseChecksSummary(count: number): string {
 
 // -- Diagnostics --------------------------------------------------------
 
-/** The oldest Node.js major version the engine process is supported on. */
-export const MIN_ENGINE_NODE_MAJOR = 22;
-
-/**
- * A note for a `node --version` string older than MIN_ENGINE_NODE_MAJOR, or
- * nothing. Anything that does not parse as a version, such as the reason the
- * probe could not run, gets no note.
- */
-export function nodeVersionNote(version: string): string {
-  const match = /^v?(\d+)\./.exec(version.trim());
-  if (!match || Number(match[1]) >= MIN_ENGINE_NODE_MAJOR) {
-    return "";
-  }
-  return ` (Wake Word requires ${MIN_ENGINE_NODE_MAJOR} or later)`;
-}
-
 /**
  * Replace the user's home directory with `~` wherever it appears in `text`.
  *
  * Diagnostics are meant to be pasted into an issue, and paths under the home
- * directory (the model's global storage, a Node.js installed per user) carry
- * the account name. Only whole path segments match, so `/home/ann` does not
+ * directory (the model's global storage, the installed extension) carry the
+ * account name. Only whole path segments match, so `/home/ann` does not
  * eat the start of `/home/anna`. A root or drive-only home would match every
  * path and is left alone.
  */
@@ -754,13 +738,10 @@ export interface DiagnosticsInput {
   editorName: string;
   vscodeVersion: string;
   hostNodeVersion: string;
-  engineNodePath: string;
-  /** `node --version` from the engine's executable, or why it could not run. */
-  engineNodeVersion: string;
-  /** The packaged engine binary, when the report covers it. */
-  engineBinaryPath?: string;
+  /** The packaged engine binary the extension spawns. */
+  engineBinaryPath: string;
   /** What the binary's self-test reported, or why it could not run. */
-  engineBinaryStatus?: string;
+  engineBinaryStatus: string;
   /** What the extension is doing, in words. */
   state: string;
   isListening: boolean;
@@ -802,11 +783,8 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     `Platform: ${input.platform} ${input.arch} (${input.osRelease})`,
     `VS Code: ${input.vscodeVersion} (${input.editorName})`,
     `Node.js (extension host): ${input.hostNodeVersion}`,
-    `Node.js (engine): ${input.engineNodePath} (${input.engineNodeVersion})${nodeVersionNote(input.engineNodeVersion)}`,
     "Engine: sherpa-onnx",
-    ...(input.engineBinaryPath === undefined
-      ? []
-      : [`Engine binary: ${input.engineBinaryPath} (${input.engineBinaryStatus ?? "not checked"})`]),
+    `Engine binary: ${input.engineBinaryPath} (${input.engineBinaryStatus})`,
     `State: ${input.state}`,
     `Listening: ${input.isListening}`,
     `Paused: ${input.isPaused}`,

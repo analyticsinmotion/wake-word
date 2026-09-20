@@ -5,11 +5,9 @@ import {
   MODEL_NAME,
   MODEL_SHA256,
   SherpaEngine,
-  findSystemNode,
   modelStatus,
   nativeEnginePath,
   probeNativeEngine,
-  probeNodeVersion,
 } from "./sherpaEngine";
 import {
   CALIBRATION_DURATION_MS,
@@ -123,12 +121,12 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
 
 /**
  * Build the speech engine. Every platform runs the sherpa-onnx engine:
- * decibri for capture and a keyword spotter, in a child process under
- * system Node.js.
+ * decibri for capture and a keyword spotter, in the packaged engine's child
+ * process.
  */
 function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
   const config = vscode.workspace.getConfiguration("wakeWord");
-  return new SherpaEngine(context, config.get<string>("nodePath", ""), readAudioDevice(config));
+  return new SherpaEngine(context, readAudioDevice(config));
 }
 
 /**
@@ -269,11 +267,9 @@ export function activate(context: vscode.ExtensionContext) {
   // Re-init when settings change
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      // The engine is built with the node path and the microphone, so a
-      // change to either needs a new one.
-      const engineChanged =
-        e.affectsConfiguration("wakeWord.nodePath") ||
-        e.affectsConfiguration("wakeWord.audioDevice");
+      // The engine is built with the microphone it listens on, so a change
+      // to that setting needs a new one.
+      const engineChanged = e.affectsConfiguration("wakeWord.audioDevice");
 
       if (engineChanged) {
         // A calibration run cannot outlive its engine. Settled here it
@@ -1072,13 +1068,11 @@ function describeState(): string {
 /**
  * Write a diagnostics report to the output channel and offer to show it or
  * copy it for an issue. Local only: it reads settings, state, and files the
- * extension owns, and runs `node --version`. No audio, no network, and the
- * home directory is redacted from every line.
+ * extension owns, and runs the engine's self-test. No audio, no network, and
+ * the home directory is redacted from every line.
  */
 async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("wakeWord");
-  const nodePath = findSystemNode(config.get<string>("nodePath", ""));
-  const engineNodeVersion = await probeNodeVersion(nodePath);
   const engineBinaryPath = nativeEnginePath(context.extensionPath);
   const engineBinaryStatus = await probeNativeEngine(engineBinaryPath);
   const routes = buildRoutes(config);
@@ -1092,8 +1086,6 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     editorName: vscode.env.appName,
     vscodeVersion: vscode.version,
     hostNodeVersion: process.version,
-    engineNodePath: nodePath,
-    engineNodeVersion,
     engineBinaryPath,
     engineBinaryStatus,
     state: describeState(),

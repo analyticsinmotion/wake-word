@@ -1,33 +1,25 @@
 version: 2
 updates:
-  # The root holds the build and publish toolchain, and sentencepiece-js, the
-  # one package there that ships in the .vsix. The engine tree ships in the
-  # .vsix whole.
-  #
-  # sentencepiece-js is in both, and its two pins must match:
-  # tests/unit/tokeniser.test.ts fails when they differ. The group bumps both
-  # in one pull request. Every other dependency is updated per directory.
+  # The build and publish toolchain, and sentencepiece-js, the one package
+  # that ships in the .vsix. sentencepiece-js is pinned exactly, because the
+  # pieces it produces are what the keyword lines are built from:
+  # tests/unit/tokeniser.test.ts checks them against a pinned table.
   - package-ecosystem: npm
-    directories: ["/", "/engine"]
+    directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    groups:
-      sentencepiece-js:
-        patterns: ["sentencepiece-js"]
-        group-by: dependency-name
     ignore:
       - dependency-name: "@types/vscode"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
 
-  # The native engine. decibri and sherpa-onnx are pinned exactly and bumped
-  # deliberately: a sherpa-onnx bump must move with the engine tree's
-  # sherpa-onnx package, and its archives must be built by the Engine archives
-  # workflow, published on a sherpa-onnx-v<version> release, and pinned in
-  # engine-rs/scripts/pinned-inputs.mjs, or CI fails the build. The pull
-  # request is the notice that a new version exists.
+  # The engine. decibri and sherpa-onnx are pinned exactly and bumped
+  # deliberately: a sherpa-onnx bump needs its archives built by the Engine
+  # archives workflow, published on a sherpa-onnx-v<version> release, and
+  # pinned in engine-rs/scripts/pinned-inputs.mjs, or CI fails the build. The
+  # pull request is the notice that a new version exists.
   - package-ecosystem: cargo
     directory: "/engine-rs"
     schedule:

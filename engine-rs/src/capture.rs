@@ -17,13 +17,10 @@
 //! Scoring before gating is what puts the chunk that trips the detector on the
 //! right side of the gate: it is delivered with the speech it starts, after
 //! the pre-roll that precedes it. That chunk is the last 100 ms of the 500 ms
-//! lead-in, so the ring holds the four chunks before it. The Node engine hands
-//! its spotter the same five chunks: decibri's Node.js microphone emits a chunk
-//! before scoring it, so that engine's five-chunk ring already holds the
-//! tripping chunk when speech is declared. The keyword spotter decodes in steps
-//! of 320 ms counted from the first sample it is given, so one chunk more or
-//! less of lead-in moves every step and changes which phrases complete before
-//! a segment ends.
+//! lead-in, so the ring holds the four chunks before it. The keyword spotter
+//! decodes in steps of 320 ms counted from the first sample it is given, so one
+//! chunk more or less of lead-in moves every step and changes which phrases
+//! complete before a segment ends. A test pins the count.
 //!
 //! Nothing here writes to stdout. Everything a microphone has to say goes back
 //! to the event loop as an `Event::Capture` tagged with that microphone's id,
@@ -299,8 +296,8 @@ pub fn run_capture(
         }
         match transition {
             Some(Transition::Speech) => {
-                // Counted the way the Node engine counts it: the chunks held
-                // back, and the chunk that tripped the detector.
+                // The chunks held back, and the chunk that tripped the
+                // detector.
                 report(CaptureReport::Debug(format!(
                     "VAD: speech ({} pre-roll chunks)",
                     gate.preroll_len() + 1
@@ -764,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn opens_the_microphone_with_the_node_engines_options() {
+    fn opens_the_microphone_with_the_conditioning_chain_the_spotter_expects() {
         let config = microphone_config(&AudioDevice::Default);
         assert_eq!(config.sample_rate, 16_000);
         assert_eq!(config.channels, 1);

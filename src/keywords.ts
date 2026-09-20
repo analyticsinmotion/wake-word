@@ -5,9 +5,9 @@ import { clampThreshold } from "./wakeWordCore";
  * Keyword lines for the sherpa-onnx keyword spotter, and the way back from
  * what it reports to the phrase the user configured.
  *
- * Port of engine/lib/keywords.js. The spotter does not take plain text: each
- * phrase reaches it as the SentencePiece pieces for the upper-cased phrase,
- * followed by two fields the spotter parses off the end of the line:
+ * The spotter does not take plain text: each phrase reaches it as the
+ * SentencePiece pieces for the upper-cased phrase, followed by two fields the
+ * spotter parses off the end of the line:
  *
  *   ▁HE Y ▁C LA U DE :3.0 #0.05
  *

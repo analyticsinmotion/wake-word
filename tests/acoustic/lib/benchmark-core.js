@@ -3,9 +3,8 @@
 /**
  * Pure logic for the acoustic benchmark: WAV parsing, fixture naming, the
  * FRR, FAR, and latency arithmetic, and the report. Nothing here loads a
- * model or touches the engine's dependencies, so it is unit tested under
- * vitest the same way engine/lib is. run-benchmark.js is the part that
- * drives sherpa-onnx.
+ * model or a native package, so it is unit tested under vitest.
+ * run-benchmark.js is the part that drives sherpa-onnx.
  */
 
 const path = require('path');

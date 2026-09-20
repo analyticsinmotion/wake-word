@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.13.2",
+  "version": "0.14.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -151,11 +151,6 @@
           "type": "boolean",
           "default": false,
           "description": "Require the wake phrase to be detected twice within 5 seconds before triggering. Reduces false positives in noisy environments."
-        },
-        "wakeWord.nodePath": {
-          "type": "string",
-          "default": "",
-          "description": "Path to the Node.js executable (22 or later). Leave empty to auto-detect. Set this if Wake Word cannot find Node.js (common with nvm or fnm)."
         },
         "wakeWord.audioDevice": {
           "type": "string",

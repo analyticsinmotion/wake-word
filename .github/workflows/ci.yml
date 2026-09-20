@@ -70,43 +70,6 @@ jobs:
         env:
           WAKE_WORD_MODEL_DIR: ${{ steps.model.outputs.model-dir }}
 
-      # The engine tree ships to users, and a broken engine dependency has
-      # shipped a dead release before (v0.5.0).
-      - name: Install engine dependencies
-        run: cd engine && npm install
-
-      # npm installs only the @decibri platform package whose os/cpu fields
-      # match the runner, so this directory normally holds one package already.
-      # This step turns that into a guarantee: any other platform's binary is
-      # removed, and the build fails unless exactly one package matching the
-      # target remains. The smoke test and the .vsix below then see the tree
-      # that ships.
-      - name: Prune non-target engine binaries
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          cd engine/node_modules/@decibri
-          kept=0
-          for dir in */; do
-            case "$dir" in
-              *"$TARGET"*) kept=$((kept + 1)) ;;
-              *) echo "Removing $dir"; rm -rf "$dir" ;;
-            esac
-          done
-          echo "Remaining @decibri packages:"
-          ls -la
-          if [ "$kept" -ne 1 ]; then
-            echo "::error::Expected exactly one @decibri package matching $TARGET, found $kept"
-            exit 1
-          fi
-
-      # Loads decibri, sherpa-onnx, and sentencepiece-js on this platform and
-      # exits. Catches MODULE_NOT_FOUND and native ABI mismatches, neither of
-      # which the source tree shows: v0.4.0 shipped exactly that failure.
-      - name: Smoke test engine
-        run: node engine/audio-engine.js --self-test
-
       # The native engine, built on this runner for this target, staged into
       # bin/ with ONNX Runtime and the Silero model. See the action for the
       # per-platform details.

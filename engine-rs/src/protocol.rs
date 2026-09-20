@@ -1,11 +1,9 @@
 //! The wire protocol: chunk-safe stdin line splitting, control-line parsing,
 //! and the stdout line vocabulary.
 //!
-//! Port of `drainLines()` and `parseControlLine()` in `engine/lib/control.js`
-//! and of the `out()` / `debug()` / `fatal()` helpers in
-//! `engine/audio-engine.js`. The extension parses the stdout side in
-//! `parseEngineLine()` / `createLineReader()` in `src/wakeWordCore.ts`, so the
-//! vocabulary here is fixed by what that reader accepts.
+//! The extension parses the stdout side in `parseEngineLine()` /
+//! `createLineReader()` in `src/wakeWordCore.ts`, so the vocabulary here is
+//! fixed by what that reader accepts.
 //!
 //! | stdout line | when |
 //! |---|---|
@@ -45,9 +43,9 @@ impl LineSplitter {
 
     /// Add a chunk and return every complete line it finished.
     ///
-    /// A `\r` is left on the line: `parse_control_line()` trims it, the same
-    /// way the Node engine does, so a parent writing CRLF is handled without
-    /// the splitter having to know about it.
+    /// A `\r` is left on the line: `parse_control_line()` trims it, so a
+    /// parent writing CRLF is handled without the splitter having to know
+    /// about it.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         self.rest.extend_from_slice(chunk);
 
@@ -104,9 +102,9 @@ pub fn parse_control_line(line: &str) -> ControlLine {
 ///
 /// It differs from Rust's `str::trim()` in two characters. JavaScript strips
 /// U+FEFF, the byte order mark, and Rust does not; Rust strips U+0085, the C1
-/// next-line control, and JavaScript does not. The Node engine trims control
-/// lines, phrases, and decoded keywords with it, so the same input has to give
-/// the same text here.
+/// next-line control, and JavaScript does not. The extension trims phrases
+/// and route labels with it, so the same input has to give the same text
+/// here.
 pub fn js_trim(text: &str) -> &str {
     text.trim_matches(|character: char| {
         character == '\u{feff}' || (character.is_whitespace() && character != '\u{85}')
@@ -209,11 +207,9 @@ impl Reporter {
 
 /// Flush stdout and exit.
 ///
-/// The Node engine needs `exitWhenFlushed()` because `process.stdout` is an
-/// asynchronous pipe on POSIX and exiting straight after a write truncates it.
-/// A Rust `write_all` to a pipe is a blocking syscall, so the bytes are in the
-/// pipe once it returns; what remains is making sure nothing is still sitting
-/// in the line buffer, which is what this flush is for. `RELEASED`, `ERROR:`
+/// A `write_all` to a pipe is a blocking syscall, so the bytes are in the pipe
+/// once it returns; what remains is making sure nothing is still sitting in the
+/// line buffer, which is what this flush is for. `RELEASED`, `ERROR:`
 /// and the self-test lines are all read by something on the other end of that
 /// pipe, so none of them may be lost.
 pub fn flush_and_exit(code: i32) -> ! {

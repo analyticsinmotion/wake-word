@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { modelPath } from '../../engine/lib/model-path.js';
+import { modelPath } from './lib/model-path.js';
 
 /**
- * D14. sherpa-onnx is an Emscripten build: a path that does not start with '/'
+ * sherpa-onnx is an Emscripten build: a path that does not start with '/'
  * is resolved against the WASM working directory, so a Windows absolute path
  * with backslashes is never found. createKws() then returns a handle that dies
  * with "null function or function signature mismatch" on first use, which is
@@ -53,7 +53,7 @@ describe('modelPath', () => {
     );
   });
 
-  it('covers every model file the engine opens', () => {
+  it('covers every model file the benchmark opens', () => {
     const files = [
       'encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
       'decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',

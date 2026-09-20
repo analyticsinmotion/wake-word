@@ -9,36 +9,57 @@
  *   node tests/acoustic/run-benchmark.js [--model-dir <path>] [--threshold <n>]
  *                                        [--phrases <a,b,c>] [--fixtures <dir>] [--verbose]
  *
- * The spotter and its keyword list are built exactly as engine/audio-engine.js
- * builds them, using the engine's own dependencies and lib modules, so the
- * numbers describe the model and threshold that ship. What is not here is
- * the microphone path: no decibri, no VAD gate, no DC removal, high-pass,
- * or AGC. Audio goes straight from the file into the spotter in 100 ms
- * chunks, so this measures the spotter alone.
+ * The keyword list is built by the extension's own buildKeywordSpec(), at the
+ * same threshold and boost, against the same sherpa-onnx release the engine
+ * links, so the numbers describe the model and threshold that ship. What is
+ * not here is the microphone path: no decibri, no VAD gate, no DC removal,
+ * high-pass, or AGC. Audio goes straight from the file into the spotter in
+ * 100 ms chunks, so this measures the spotter alone.
+ *
+ * It needs two things the extension does not install: the compiled extension
+ * (npm run compile) and the sherpa-onnx package, which the engine links as a
+ * C library rather than loading from npm. See README.md alongside.
  */
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const core = require('./lib/benchmark-core');
+const { modelPath } = require('./lib/model-path');
 
-const engineDir = path.join(__dirname, '..', '..', 'engine');
+const repoDir = path.join(__dirname, '..', '..');
 
-/** Load one of the engine's dependencies, with a message that says how to fix a missing tree. */
-function requireEngineDependency(name) {
+/** The sherpa-onnx version the engine links, from its manifest. */
+function pinnedSherpaVersion() {
+  const cargo = fs.readFileSync(path.join(repoDir, 'engine-rs', 'Cargo.toml'), 'utf8');
+  const match = /^sherpa-onnx\s*=.*?version\s*=\s*"=?([\d.]+)"/m.exec(cargo);
+  return match ? match[1] : '';
+}
+
+/** Load the keyword spotter package, with a message that says how to install it. */
+function requireSherpaOnnx() {
   try {
-    return require(path.join(engineDir, 'node_modules', name));
+    return require('sherpa-onnx');
   } catch (err) {
+    const version = pinnedSherpaVersion();
     throw new Error(
-      `Cannot load ${name} from engine/node_modules (${err.message}). ` +
-        'Run "cd engine && npm install" first.'
+      `Cannot load sherpa-onnx (${err.message}). Install the version the engine links ` +
+        `first: npm install --no-save sherpa-onnx@${version}`
     );
   }
 }
 
-const { modelPath } = require(path.join(engineDir, 'lib', 'model-path'));
-const { buildKeywordSpec } = require(path.join(engineDir, 'lib', 'keywords'));
-const { clampKeywordThreshold } = require(path.join(engineDir, 'lib', 'control'));
+/** Load the extension's compiled keyword builder, or say how to build it. */
+function requireCompiled(name) {
+  try {
+    return require(path.join(repoDir, 'dist', name));
+  } catch (err) {
+    throw new Error(`Cannot load dist/${name} (${err.message}). Run "npm run compile" first.`);
+  }
+}
+
+const { buildKeywordSpec } = requireCompiled('keywords');
+const { clampThreshold } = requireCompiled('wakeWordCore');
 
 function listWavs(dir) {
   if (!fs.existsSync(dir)) {
@@ -93,13 +114,13 @@ function readFixture(file) {
 }
 
 /**
- * Build the keyword spotter the way audio-engine.js does: tokenise each
- * phrase with sentencepiece, hand the token lines to sherpa-onnx, and keep
- * the decoded-to-spoken map so a hit can be named.
+ * Build the keyword spotter the way the extension does: tokenise each phrase
+ * with SentencePiece, hand the token lines to sherpa-onnx, and keep the
+ * decoded-to-spoken map so a hit can be named.
  */
 async function createSpotter(modelDir, keywords, threshold) {
-  const { SentencePieceProcessor } = requireEngineDependency('sentencepiece-js');
-  const sherpa = requireEngineDependency('sherpa-onnx');
+  const { SentencePieceProcessor } = require('sentencepiece-js');
+  const sherpa = requireSherpaOnnx();
 
   const sp = new SentencePieceProcessor();
   await sp.load(modelPath(modelDir, 'bpe.model'));
@@ -240,7 +261,7 @@ async function main() {
     positives.map((p) => p.expected),
     opts.phrases
   );
-  const threshold = clampKeywordThreshold(opts.threshold === null ? 0.05 : opts.threshold);
+  const threshold = clampThreshold(opts.threshold === null ? 0.05 : opts.threshold);
 
   console.log(`Loading ${path.basename(modelDir)}...`);
   const spotter = await createSpotter(modelDir, keywords, threshold);

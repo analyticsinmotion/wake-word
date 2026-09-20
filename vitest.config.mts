@@ -22,7 +22,7 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.ts", "tests/**/*.test.js"],
     coverage: {
-      include: ["src/**/*.ts", "engine/lib/**/*.js"],
+      include: ["src/**/*.ts"],
     },
   },
 });

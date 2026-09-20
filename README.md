@@ -84,7 +84,7 @@ Say a wake phrase and the right AI assistant opens -- no clicking required.
 
 Say **"Hey Claude"** and Claude opens. Say **"Hey Chat"** and the chat panel opens. Say **"Hey Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
 
-**Zero config. No API keys. No accounts.** The only prerequisite is Node.js 22 or later. Install and go.
+**Zero config. No API keys. No accounts. Nothing to install alongside it.** Install and go.
 
 All audio processing happens locally on your machine. Nothing is recorded or transmitted.
 
@@ -96,7 +96,7 @@ https://github.com/user-attachments/assets/fb007095-5c4c-4927-aaa6-fa76550d7cb2
 2. When your editor opens, the extension starts listening on your microphone
 3. Audio is processed locally -- through voice activity detection and keyword spotting -- and matched against your configured wake phrases
 4. If a phrase is detected, the extension **releases the mic**, waits for the speech engine to confirm it is closed, and then fires the mapped command
-5. The target assistant (Claude, Copilot, etc.) takes over the microphone with no contention
+5. The assistant the route opens takes over the microphone with no contention
 6. Wake word listening resumes after a configurable cooldown, or, for routes set to manual handoff, when you click the status bar
 
 ## Installation
@@ -119,11 +119,9 @@ code --install-extension analytics-in-motion.wake-word
 
 ### Prerequisites
 
-Wake Word needs **Node.js 22 or later** (LTS) on every platform: Windows 10/11, macOS, and Linux. The speech engine runs as a child process under it. Download it from [nodejs.org](https://nodejs.org/).
+The speech engine is packaged with the extension, so there is no runtime to install. A local speech model (~17MB) is downloaded on first use and cached. [Platform Support](#platform-support) lists what each platform needs.
 
-A local speech model (~17MB) is downloaded on first use and cached. If Node.js is installed via nvm, fnm, or another version manager and is not on your editor's PATH, set `wakeWord.nodePath` to the full path of your `node` executable.
-
-**Upgrading on Windows from 0.12 or earlier:** Windows used to run the built-in System.Speech engine, which needed no Node.js. That engine has been retired, and Windows now runs the same engine as macOS and Linux. Install Node.js 22 or later if you do not have it. A `wakeWord.engine` entry left in your settings has no effect and can be removed.
+**Windows needs the Microsoft Visual C++ Redistributable (x64)**, which most machines already have. Without it, listening fails to start and the status bar shows `Wake: Error`: install `VC_redist.x64.exe` from [Microsoft's latest supported downloads page](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) and enable listening again.
 
 ## First Run Consent
 
@@ -269,7 +267,6 @@ The lock lives in the extension's global storage, which windows of the same edit
 | `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, resume on regain |
 | `wakeWord.confidenceThreshold` | `0.05` | Trigger threshold (0.01 to 0.9) for wake phrase detection. Lower detects more easily, higher gives fewer false positives |
 | `wakeWord.confirmationMode` | `false` | Require the wake phrase twice within 5 seconds before triggering. Reduces false positives in noisy environments. |
-| `wakeWord.nodePath` | `""` | Path to Node.js executable. Leave empty to auto-detect. Set this if the engine cannot find Node.js (common with nvm or fnm). |
 | `wakeWord.audioDevice` | `""` | Microphone to use: a case-insensitive substring of the device name (e.g. `"USB"`) or a device index. Empty for the system default. |
 
 ### Choosing a microphone
@@ -296,7 +293,7 @@ Changing it restarts the engine. If the value matches no device, or more than on
 - **Wake Word: Reset Microphone Consent** -- clear consent and re-prompt
 - **Wake Word: Open Settings** -- open the Settings editor filtered to Wake Word (also linked from the status bar tooltip)
 - **Wake Word: Calibrate** -- listen for 15 seconds and log what is heard without firing any route (see [Calibrating](#calibrating))
-- **Wake Word: Show Diagnostics** -- write the versions, platform, Node.js, model, audio device, settings, routes, phrase warnings, and engine state to the output channel, with an option to copy them for a bug report. Your home directory is replaced with `~`, and no audio is included. Also opened by clicking the engine indicator in the status bar
+- **Wake Word: Show Diagnostics** -- write the versions, platform, speech engine self-test, model, audio device, settings, routes, phrase warnings, and engine state to the output channel, with an option to copy them for a bug report. Your home directory is replaced with `~`, and no audio is included. Also opened by clicking the engine indicator in the status bar
 
 ## Common command IDs
 
@@ -304,7 +301,7 @@ Useful values for the `command` field in your routes. Command IDs listed are for
 
 | Assistant / Feature | Command ID |
 | --- | --- |
-| GitHub Copilot Chat | `workbench.action.chat.open` |
+| The editor's chat panel | `workbench.action.chat.open` |
 | Claude Code | `claude-vscode.focus` |
 | VS Code Speech dictation | `workbench.action.editorDictation.start` |
 | Command Palette | `workbench.action.showCommands` |
@@ -315,7 +312,7 @@ Useful values for the `command` field in your routes. Command IDs listed are for
 
 ## How It Works (Technical)
 
-The extension runs one speech engine on every platform. It spawns `audio-engine.js` as a background child process under **system Node.js** (not Electron). The child uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting. Running under system Node.js is required because Electron's Node.js runtime cannot load native audio addons. A local speech model (~17MB) is downloaded to VS Code's global storage on first use, checked against a pinned SHA-256 digest, and cached. The process is started once and kept across handoffs: a handoff closes only the microphone, and the model stays loaded for the resume.
+The extension runs one speech engine on every platform: a native program in the extension's `bin/` folder, started as a background child process. It uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting, and finds the inference runtime and the voice activity model beside itself, so nothing has to be installed. A local speech model (~17MB) is downloaded to VS Code's global storage on first use, checked against a pinned SHA-256 digest, and cached. The process is started once and kept across handoffs: a handoff closes only the microphone, and the model stays loaded for the resume.
 
 The engine talks to the extension over stdout: `READY`, `DETECTED:<phrase>`, `PAUSED`, `RELEASED`, `ERROR:<message>`, and `DEBUG:<info>`. It takes `pause`, `resume`, and `stop` commands on stdin, and answers `PAUSED` once it has closed the microphone for a handoff, `READY` once it has reopened it, and `RELEASED` once it has closed it for good.
 
@@ -331,7 +328,7 @@ Captured audio passes through voice activity detection (Silero VAD) before it re
 6. The route's command fires
 7. After the cooldown, or when you resume a manual route, the engine reopens the microphone
 
-Zero runtime npm dependencies in the extension host. All native dependencies are isolated in the `engine/` child process.
+The extension host has one runtime npm dependency, `sentencepiece-js`: SentencePiece compiled to WebAssembly, which turns each wake phrase into the speech model's word pieces. It runs in a worker thread of its own. All native code is isolated in the engine child process.
 
 ## Troubleshooting
 
@@ -346,7 +343,8 @@ Zero runtime npm dependencies in the extension host. All native dependencies are
 | "Failed to start audio engine" | Ensure your microphone is connected and not in use by another application. Check your system sound settings. |
 | Status bar shows "Wake: Error" | Click the status bar item to retry. Check the Output panel for details. If the error persists, try **Wake Word: Reset Microphone Consent** and re-enable. |
 | Extension keeps restarting | The engine retries up to 3 times on crash with increasing delays. If it fails after 3 retries, check that your audio device is working. |
-| "Could not find Node.js" | Install Node.js 22 or later from [nodejs.org](https://nodejs.org/). If it is already installed, set `wakeWord.nodePath` to the full path of your `node` executable (e.g. `/opt/homebrew/bin/node` or `C:\Program Files\nodejs\node.exe`). Common when using nvm or fnm. |
+| Listening fails to start on Windows and the log says "Failed to start voice activity detection" | Install the **Microsoft Visual C++ Redistributable (x64)**, then enable listening again. **Wake Word: Show Diagnostics** shows the same failure on its `Engine binary:` line, which tells it apart from a microphone problem. |
+| "The speech engine is missing from this installation" | The extension was installed for another platform, or the install is incomplete. Reinstall Wake Word from the Marketplace. |
 | Microphone access denied (Windows) | Open Settings → Privacy & security → Microphone and turn on **Microphone access** and **Let desktop apps access your microphone**. |
 | Microphone access denied (macOS) | Open System Settings → Privacy & Security → Microphone and enable access for VS Code (or your editor). |
 | Model download fails | Check your internet connection. The model is ~17MB downloaded from GitHub. If behind a proxy, ensure HTTPS traffic to `github.com` is allowed. |
@@ -361,11 +359,11 @@ All speech recognition runs locally on your machine. No audio data ever leaves y
 
 ## Platform Support
 
-| Platform | Status | Engine |
-| --- | --- | --- |
-| Windows 10/11 | Supported | sherpa-onnx (requires Node.js 22 or later) |
-| macOS | Supported | sherpa-onnx (requires Node.js 22 or later) |
-| Linux | Supported | sherpa-onnx (requires Node.js 22 or later) |
+| Platform | Status | Engine | Needs |
+| --- | --- | --- | --- |
+| Windows 10/11 (x64) | Supported | sherpa-onnx | Visual C++ Redistributable |
+| macOS 14+ (Apple silicon) | Supported | sherpa-onnx | nothing |
+| Linux (x64, ARM64) | Supported | sherpa-onnx | glibc 2.28+, ALSA |
 
 ## Compatibility
 
