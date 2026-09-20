@@ -243,22 +243,20 @@ macOS 14.0. The Windows library links the dynamic Visual C++ runtime, which is
 not part of Windows itself; the engine binary links the static runtime and
 needs none of it.
 
-**The Visual C++ runtime libraries (Windows).** `onnxruntime.dll` imports
+**The Visual C++ runtime (Windows).** `onnxruntime.dll` imports
 `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll` and `vcruntime140_1.dll`,
-and those import only each other and Windows' own libraries. `stage.mjs` puts
-all four in `bin/`, with `VC-RUNTIME-NOTICES.md` from `notices/`. Windows
+and those import only each other and Windows' own libraries. They are not part
+of Windows and are not packaged: the Microsoft Visual C++ Redistributable is a
+requirement on Windows, stated in the extension's installation notes. Windows
 resolves a library's imports from the directory of the running executable
-before it looks anywhere else, so these copies are the ones loaded and the
-Visual C++ Redistributable does not have to be installed. They come from
-Microsoft's redistributable installer, at a URL that names one build of it:
-`stage.mjs` checks the installer against its pinned digest, unpacks the
-cabinets attached to it with Windows' `expand.exe` without running it, and
-checks each library against its own pinned digest. That step needs Windows, so
-`--target win32-x64` is staged on Windows. The libraries must be at least as
-new as the toolset that built `onnxruntime.dll` (14.44): check the linker
-version in its header when the ONNX Runtime pin changes, and the pinned
-installer with it. The `api-ms-win-crt-*` imports are the Universal C Runtime,
-which is part of Windows 10 and later.
+before anywhere else, so a copy in `bin/` would be loaded in preference to the
+installed one and would only ever change when this repository re-pinned it;
+`verify-vsix.mjs` fails a package that carries one. It also pins the list above
+against the imports of the packaged files, so an ONNX Runtime bump that needs
+another library fails the package check and the installation notes are
+revisited with the pin. The `api-ms-win-crt-*` imports are the Universal C
+Runtime, which is part of Windows 10 and later, and the engine binary itself
+links the C runtime statically and imports none of this.
 
 **Model paths on Windows.** The sherpa-onnx library opens the model files
 through C runtime calls that refuse a path of 260 characters or more, and it
@@ -282,10 +280,11 @@ repository root reads the `.vsix` and fails unless:
 - `bin/` holds the engine for the target's architecture, stored executable on
   macOS and Linux, and the pinned runtime files and notices;
 - on Windows the engine imports no C runtime DLL and does not import ONNX
-  Runtime; on Linux neither the engine nor ONNX Runtime needs anything newer
-  than glibc 2.28 or GLIBCXX 3.4.25, and the engine exports no ONNX Runtime
-  symbol; on macOS neither needs anything newer than macOS 14.0, and both pass
-  `codesign --verify` once unpacked;
+  Runtime, no Visual C++ runtime library is packaged, and the ones the packaged
+  files import are `WINDOWS_VC_RUNTIME`; on Linux neither the engine nor ONNX
+  Runtime needs anything newer than glibc 2.28 or GLIBCXX 3.4.25, and the
+  engine exports no ONNX Runtime symbol; on macOS neither needs anything newer
+  than macOS 14.0, and both pass `codesign --verify` once unpacked;
 - the engine's self-test, run from the unpacked package with no environment
   variables pointing elsewhere, reports `OK`, the pinned sherpa-onnx version,
   and ONNX Runtime and the Silero model as loaded from beside the binary. The

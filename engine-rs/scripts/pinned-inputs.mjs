@@ -71,6 +71,12 @@ export function sherpaOnnxArchiveUrl(name) {
  * provider is built into libonnxruntime.so, which does not list it as a
  * dependency, so it is not shipped.
  *
+ * The Windows library imports the Microsoft Visual C++ runtime, which is not
+ * part of Windows and is not packaged with the extension; the installation
+ * notes name the redistributable as a requirement, and
+ * scripts/verify-vsix.mjs pins the libraries it imports so that a bump which
+ * changes them is noticed.
+ *
  * `tarball` is the registry's integrity value for the package, checked before
  * the package is unpacked. Each file is then checked against its own digest,
  * and scripts/verify-vsix.mjs checks the packaged copies against the same
@@ -148,67 +154,6 @@ export const RUNTIME_FILES = {
     to: 'ONNXRUNTIME-NOTICES.md',
     bytes: 328269,
     sha256: '5fb6fbffeddb974bb2306a801452adaa831d5cf0c6be9fe954aaf9424af17345',
-  },
-};
-
-/**
- * The Microsoft Visual C++ runtime libraries that ship beside the binary on
- * Windows, by target.
- *
- * The engine itself links the C runtime statically, but the ONNX Runtime
- * library it loads imports these four, and a Windows installation does not
- * include them. Windows looks for a library's imports in the directory of the
- * running executable before anywhere else, so copies beside the binary are
- * the ones loaded and nothing has to be installed. The list is the closure of
- * what onnxruntime.dll imports (msvcp140.dll, msvcp140_1.dll,
- * vcruntime140.dll, vcruntime140_1.dll) and what those import in turn;
- * scripts/verify-vsix.mjs reads the imports of every packaged library and
- * fails when one names a Visual C++ runtime library that is not packaged. The
- * api-ms-win-crt-* imports are the Universal C Runtime, which is part of
- * Windows 10 and later. The libraries must be at least as new as the toolset
- * that built onnxruntime.dll, which its header records as 14.44.
- *
- * They come from Microsoft's Visual C++ Redistributable installer, at a URL
- * that names one build of it. scripts/stage.mjs checks the installer against
- * `installer`, unpacks it without running it, and checks each library
- * against its own digest. `from` is the library's name inside the installer's
- * cabinet. `notices` is the tracked file that ships with them.
- */
-export const C_RUNTIME = {
-  'win32-x64': {
-    version: '14.44.35211.0',
-    installer: {
-      url: 'https://download.visualstudio.microsoft.com/download/pr/bd1c8d9d-ba95-4eee-bc6e-df1fcc876373/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe',
-      bytes: 25635768,
-      sha256: 'cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b',
-    },
-    files: [
-      {
-        from: 'msvcp140.dll_amd64',
-        to: 'msvcp140.dll',
-        bytes: 557728,
-        sha256: '0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9',
-      },
-      {
-        from: 'msvcp140_1.dll_amd64',
-        to: 'msvcp140_1.dll',
-        bytes: 35952,
-        sha256: 'bfad5aef4c63a669e3c140655cdfdf395b6c979b400a447bd5dcb65ed8826c3d',
-      },
-      {
-        from: 'vcruntime140.dll_amd64',
-        to: 'vcruntime140.dll',
-        bytes: 124544,
-        sha256: 'd5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066',
-      },
-      {
-        from: 'vcruntime140_1.dll_amd64',
-        to: 'vcruntime140_1.dll',
-        bytes: 49792,
-        sha256: '1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f',
-      },
-    ],
-    notices: { from: 'notices/VC-RUNTIME-NOTICES.md', to: 'VC-RUNTIME-NOTICES.md' },
   },
 };
 

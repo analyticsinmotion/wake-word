@@ -19,10 +19,9 @@
  *     the pinned files, with their license notices;
  *   - Windows: the binary imports no C runtime DLL, because it links the
  *     static runtime the sherpa-onnx libraries are built against, and does not
- *     import ONNX Runtime, which it loads by path; the Visual C++ runtime
- *     libraries are beside it, byte for byte the pinned files, with their
- *     notice, and every such library that anything in the directory imports
- *     is among them, so none has to be installed;
+ *     import ONNX Runtime, which it loads by path; no Visual C++ runtime
+ *     library is packaged, and the ones the packaged libraries import are the
+ *     ones the installation notes require;
  *   - Linux: neither the binary nor ONNX Runtime needs a newer glibc or
  *     libstdc++ than LINUX_FLOOR, and the binary exports no ONNX Runtime
  *     symbol for the loaded library to bind to;
@@ -47,7 +46,6 @@ import { fileURLToPath } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
 
 import {
-  C_RUNTIME,
   engineFileName,
   PACKAGE_DIR,
   RUNTIME_FILES,
@@ -69,10 +67,23 @@ export const LINUX_FLOOR = { GLIBC: '2.28', GLIBCXX: '3.4.25', CXXABI: '1.3.11',
  */
 export const VC_RUNTIME_LIBRARY = /^(vcruntime|msvcp|concrt|vccorlib|vcomp|vcamp)\d+[a-z0-9_]*\.dll$/i;
 
+/**
+ * The Visual C++ runtime libraries the packaged Windows files import, lower
+ * case and sorted. The extension does not ship them: the installation notes
+ * name the Microsoft Visual C++ Redistributable as a requirement on Windows,
+ * and this list is what that requirement has to cover. An ONNX Runtime bump
+ * that changes it fails the package check here rather than on a machine
+ * without the redistributable, where no check of ours runs.
+ */
+export const WINDOWS_VC_RUNTIME = [
+  'msvcp140.dll',
+  'msvcp140_1.dll',
+  'vcruntime140.dll',
+  'vcruntime140_1.dll',
+];
+
 /** The oldest macOS the engine runs on, set by the ONNX Runtime build it ships. */
 export const MACOS_FLOOR = '14.0';
-
-const REPO_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const EXPECTED = {
   'win32-x64': { format: 'PE', machine: 0x8664, platform: 'windows-x86_64' },
@@ -377,52 +388,37 @@ function main() {
     }
   }
 
-  // The Visual C++ runtime libraries, byte for byte, and their notice as it
-  // is in this repository.
-  const cRuntime = C_RUNTIME[target];
-  const libraries = new Map();
-  if (ortInfo?.format === 'PE') libraries.set(ort.to, ortInfo);
-  if (cRuntime) {
-    for (const file of cRuntime.files) {
-      const entry = entries.get(packaged(file.to));
-      if (!entry) {
-        report.fail(`${packaged(file.to)} is packaged`);
-        continue;
-      }
-      const content = zipRead(zip, entry);
-      const digest = createHash('sha256').update(content).digest('hex');
-      report.check(
-        digest === file.sha256,
-        `${packaged(file.to)} is the pinned file (${file.bytes} bytes)`,
-        `SHA-256 ${digest}, expected ${file.sha256}`
-      );
-      const info = binaryInfo(content);
-      checkArchitecture(report, file.to, info, expected);
-      libraries.set(file.to, info);
-    }
-    const noticeEntry = entries.get(packaged(cRuntime.notices.to));
-    const tracked = readFileSync(path.join(REPO_DIR, 'engine-rs', ...cRuntime.notices.from.split('/')));
+  // The Visual C++ runtime on Windows. It is not part of Windows and is not
+  // packaged: the installation notes name the redistributable as a
+  // requirement instead. Two things keep that requirement true. A copy in
+  // this directory would be loaded in preference to the installed one and
+  // would never be serviced, so none may be packaged; and the requirement
+  // describes what the packaged libraries import, so a change to that fails
+  // here rather than on a machine without the redistributable.
+  if (target.startsWith('win32-')) {
+    const shipped = [...entries.keys()]
+      .filter((name) => name.startsWith(`extension/${PACKAGE_DIR}/`))
+      .map((name) => name.slice(name.lastIndexOf('/') + 1))
+      .filter((name) => VC_RUNTIME_LIBRARY.test(name));
     report.check(
-      Boolean(noticeEntry) && zipRead(zip, noticeEntry).equals(tracked),
-      `${packaged(cRuntime.notices.to)} is packaged as tracked`
+      shipped.length === 0,
+      'no Visual C++ runtime library is packaged',
+      `packaged: ${shipped.join(', ')}`
     );
-  }
-
-  // What the packaged libraries import, against what is packaged. Windows
-  // resolves an import from the executable's directory first, so a Visual C++
-  // runtime library that is there is the one loaded, and one that is not has
-  // to be installed on the user's machine.
-  if (libraries.size > 0) {
-    const present = new Set([...libraries.keys()].map((name) => name.toLowerCase()));
-    for (const [name, info] of libraries) {
-      const needed = info.imports.filter((library) => VC_RUNTIME_LIBRARY.test(library));
-      const absent = needed.filter((library) => !present.has(library.toLowerCase()));
-      report.check(
-        absent.length === 0,
-        `every Visual C++ runtime library ${name} imports is packaged (${needed.join(', ') || 'none'})`,
-        `not packaged: ${absent.join(', ')}`
-      );
-    }
+    const imported = [
+      ...new Set(
+        [engine, ortInfo]
+          .filter((info) => info?.format === 'PE')
+          .flatMap((info) => info.imports)
+          .filter((library) => VC_RUNTIME_LIBRARY.test(library))
+          .map((library) => library.toLowerCase())
+      ),
+    ].sort();
+    report.check(
+      imported.join(' ') === WINDOWS_VC_RUNTIME.join(' '),
+      `the packaged files import the Visual C++ runtime the installation notes require (${imported.join(', ')})`,
+      `expected ${WINDOWS_VC_RUNTIME.join(', ')}`
+    );
   }
 
   // Platform checks on the binaries as packaged.
