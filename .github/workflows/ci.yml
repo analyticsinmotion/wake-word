@@ -137,3 +137,12 @@ jobs:
           WAKE_WORD_MODEL_DIR: ${{ steps.model.outputs.model-dir }}
           EXE: ${{ startsWith(matrix.target, 'win32') && 'wake-word-engine.exe' || 'wake-word-engine' }}
         run: node engine-rs/scripts/drive-protocol.mjs --bin "$RUNNER_TEMP/vsix/extension/bin/$EXE" --no-microphone
+
+      # The verified package, downloadable from the run, so a build can be
+      # installed on a machine that does not build it.
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v7
+        with:
+          name: wake-word-${{ matrix.target }}
+          path: wake-word-${{ matrix.target }}-ci.vsix
+          if-no-files-found: error
