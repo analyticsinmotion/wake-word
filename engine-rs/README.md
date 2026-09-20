@@ -3,10 +3,12 @@
 A Rust implementation of `engine/audio-engine.js`: the child process the Wake
 Word extension talks to over stdin and stdout.
 
-**The extension does not run this binary.** `engine/audio-engine.js` under
-system Node.js is the engine that runs. Nothing in `src/` spawns this binary.
+**The extension runs this binary.** `SherpaEngine` in `src/sherpaEngine.ts`
+spawns `bin/wake-word-engine` from the installed extension, with no arguments.
 Each platform `.vsix` carries it, built in CI, in `bin/` with the files it
 loads at run time; see [Release builds](#release-builds).
+`engine/audio-engine.js` under system Node.js is still packaged, and
+`ENGINE_KIND` in `src/sherpaEngine.ts` selects it instead.
 
 ## What it does
 
@@ -237,10 +239,37 @@ and `libonnxruntime.so` does not list it as a dependency, so it is not
 shipped.
 
 Each ONNX Runtime build sets a floor of its own. The macOS library needs
-macOS 14.0. The Windows library links the dynamic Visual C++ runtime
-(`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`), which is not part
-of Windows itself; the engine binary links the static runtime and needs none
-of it.
+macOS 14.0. The Windows library links the dynamic Visual C++ runtime, which is
+not part of Windows itself; the engine binary links the static runtime and
+needs none of it.
+
+**The Visual C++ runtime libraries (Windows).** `onnxruntime.dll` imports
+`msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll` and `vcruntime140_1.dll`,
+and those import only each other and Windows' own libraries. `stage.mjs` puts
+all four in `bin/`, with `VC-RUNTIME-NOTICES.md` from `notices/`. Windows
+resolves a library's imports from the directory of the running executable
+before it looks anywhere else, so these copies are the ones loaded and the
+Visual C++ Redistributable does not have to be installed. They come from
+Microsoft's redistributable installer, at a URL that names one build of it:
+`stage.mjs` checks the installer against its pinned digest, unpacks the
+cabinets attached to it with Windows' `expand.exe` without running it, and
+checks each library against its own pinned digest. That step needs Windows, so
+`--target win32-x64` is staged on Windows. The libraries must be at least as
+new as the toolset that built `onnxruntime.dll` (14.44): check the linker
+version in its header when the ONNX Runtime pin changes, and the pinned
+installer with it. The `api-ms-win-crt-*` imports are the Universal C Runtime,
+which is part of Windows 10 and later.
+
+**Model paths on Windows.** The sherpa-onnx library opens the model files
+through C runtime calls that refuse a path of 260 characters or more, and it
+reports such a file as one that does not exist. The limit is on the whole file
+path, so a long account name or a redirected profile is enough to reach it.
+`library_model_dir()` in `src/spotter.rs` canonicalises the model directory
+before it goes into the spotter configuration, which on Windows gives the
+verbatim form, starting `\\?\`, that is exempt from the limit. The engine's own
+messages keep the path as the extension sent it. The drive script loads the
+model from a directory whose file paths are over 300 characters, on every
+platform.
 
 On macOS, `stage.mjs` signs the binary ad hoc after copying it, because Apple
 silicon runs no unsigned code and stripping can leave the linker's signature

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as path from "path";
 import type * as vscode from "vscode";
 import { MockChildProcess } from "../mocks/childProcess";
 
@@ -24,6 +25,8 @@ const mocks = vi.hoisted(() => ({
   execSync: vi.fn(),
   existsSync: vi.fn(),
   readFileSync: vi.fn(),
+  accessSync: vi.fn(),
+  chmodSync: vi.fn(),
   tokenise: vi.fn(),
   readVocabulary: vi.fn(),
 }));
@@ -36,6 +39,9 @@ vi.mock("child_process", () => ({
 vi.mock("fs", () => ({
   existsSync: mocks.existsSync,
   readFileSync: mocks.readFileSync,
+  accessSync: mocks.accessSync,
+  chmodSync: mocks.chmodSync,
+  constants: { X_OK: 1 },
   mkdirSync: vi.fn(),
   createWriteStream: vi.fn(),
   writeFileSync: vi.fn(),
@@ -47,7 +53,14 @@ vi.mock("../../src/tokeniser", () => ({
   readVocabulary: mocks.readVocabulary,
 }));
 
-import { SherpaEngine, clearNodePathCache } from "../../src/sherpaEngine";
+import {
+  EngineKind,
+  SherpaEngine,
+  clearNodePathCache,
+  engineLaunch,
+  nativeEnginePath,
+  prepareNativeEngine,
+} from "../../src/sherpaEngine";
 import { WakePhrase } from "../../src/speechEngineInterface";
 import { releaseThenFire } from "../../src/wakeWordCore";
 
@@ -133,11 +146,11 @@ function capture(engine: SherpaEngine): Captured {
   return c;
 }
 
-function makeEngine(audioDevice = ""): { engine: SherpaEngine; events: Captured } {
+function makeEngine(audioDevice = "", kind?: EngineKind): { engine: SherpaEngine; events: Captured } {
   const context = {
     globalStorageUri: { fsPath: "/fake/storage" },
   } as unknown as vscode.ExtensionContext;
-  const engine = new SherpaEngine(context, NODE, audioDevice);
+  const engine = new SherpaEngine(context, NODE, audioDevice, kind);
   return { engine, events: capture(engine) };
 }
 
@@ -190,6 +203,8 @@ beforeEach(() => {
   // The model is already on disk: every file exists and the version matches.
   mocks.existsSync.mockReset();
   mocks.existsSync.mockReturnValue(true);
+  mocks.accessSync.mockReset();
+  mocks.chmodSync.mockReset();
   mocks.readFileSync.mockReset();
   mocks.readFileSync.mockReturnValue("1");
   mocks.tokenise.mockReset();
@@ -206,11 +221,136 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+// ── the engine binary ───────────────────────────────────────
+
+describe("the engine binary", () => {
+  it("is bin/wake-word-engine in the extension, with .exe on Windows", () => {
+    expect(nativeEnginePath("/ext", "linux")).toBe(path.join("/ext", "bin", "wake-word-engine"));
+    expect(nativeEnginePath("/ext", "darwin")).toBe(path.join("/ext", "bin", "wake-word-engine"));
+    expect(nativeEnginePath("/ext", "win32")).toBe(path.join("/ext", "bin", "wake-word-engine.exe"));
+  });
+
+  it("is launched with no arguments, and the node engine as a script under Node.js", () => {
+    expect(engineLaunch("native", "/ext")).toEqual({
+      kind: "native",
+      command: nativeEnginePath("/ext"),
+      args: [],
+    });
+    expect(engineLaunch("node", "/ext", NODE)).toEqual({
+      kind: "node",
+      command: NODE,
+      args: [path.join("/ext", "engine", "audio-engine.js")],
+    });
+  });
+
+  it("is left alone when it is already executable", () => {
+    expect(prepareNativeEngine("/ext/bin/wake-word-engine", "linux")).toBeNull();
+    expect(mocks.accessSync).toHaveBeenCalledWith("/ext/bin/wake-word-engine", 1);
+    expect(mocks.chmodSync).not.toHaveBeenCalled();
+  });
+
+  it("is made executable on macOS and Linux when the mode was lost", () => {
+    for (const platform of ["linux", "darwin"] as const) {
+      mocks.accessSync.mockImplementationOnce(() => {
+        throw new Error("EACCES");
+      });
+      expect(prepareNativeEngine("/ext/bin/wake-word-engine", platform)).toBeNull();
+    }
+    expect(mocks.chmodSync).toHaveBeenCalledTimes(2);
+    expect(mocks.chmodSync).toHaveBeenCalledWith("/ext/bin/wake-word-engine", 0o755);
+  });
+
+  it("has no mode to set on Windows", () => {
+    expect(prepareNativeEngine("C:\\ext\\bin\\wake-word-engine.exe", "win32")).toBeNull();
+    expect(mocks.accessSync).not.toHaveBeenCalled();
+    expect(mocks.chmodSync).not.toHaveBeenCalled();
+  });
+
+  it("names the path when it cannot be made executable", () => {
+    mocks.accessSync.mockImplementation(() => {
+      throw new Error("EACCES");
+    });
+    mocks.chmodSync.mockImplementation(() => {
+      throw new Error("EPERM: operation not permitted");
+    });
+    expect(prepareNativeEngine("/ext/bin/wake-word-engine", "linux")).toBe(
+      "The speech engine at /ext/bin/wake-word-engine is not executable and could not be made executable: " +
+        "EPERM: operation not permitted"
+    );
+  });
+
+  it("names the path when it does not exist", () => {
+    mocks.existsSync.mockReturnValue(false);
+    expect(prepareNativeEngine("/ext/bin/wake-word-engine", "linux")).toMatch(
+      /^The speech engine is missing from this installation: \/ext\/bin\/wake-word-engine does not exist\./
+    );
+  });
+
+  it("stops a start that cannot make it executable, naming the path", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try {
+      mocks.accessSync.mockImplementation(() => {
+        throw new Error("EACCES");
+      });
+      mocks.chmodSync.mockImplementation(() => {
+        throw new Error("EROFS: read-only file system");
+      });
+      const { engine, events } = makeEngine("", "native");
+      await engine.start(ROUTES, 0.3, false);
+      expect(mocks.spawn).not.toHaveBeenCalled();
+      expect(events.errors[0].message).toMatch(/wake-word-engine is not executable .* EROFS/);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+});
+
 // ── start ───────────────────────────────────────────────────
 
 describe("start", () => {
+  it("spawns the packaged engine binary, with no arguments", async () => {
+    const { engine, events } = makeEngine("", "native");
+    await engine.start(ROUTES, 0.3, false);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    const [command, args, options] = mocks.spawn.mock.calls[0];
+    expect(command).toMatch(/[\\/]bin[\\/]wake-word-engine(\.exe)?$/);
+    expect(command).toBe(nativeEnginePath(path.dirname(path.dirname(command))));
+    expect(args).toEqual([]);
+    expect(options).toEqual({ stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    // No Node.js is looked for, and the config line is the one either engine takes.
+    expect(mocks.execSync).not.toHaveBeenCalled();
+    expect(configLine(latest()).keywordLines).toHaveLength(3);
+    expect(events.debug).toContain(`Spawning: ${command}`);
+  });
+
+  it("reports a missing engine binary by its path, without spawning", async () => {
+    mocks.existsSync.mockImplementation((p: string) => !/wake-word-engine(\.exe)?$/.test(p));
+    const { engine, events } = makeEngine("", "native");
+    await engine.start(ROUTES, 0.3, false);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(events.errors).toHaveLength(1);
+    expect(events.errors[0].message).toMatch(
+      /^The speech engine is missing from this installation: .*[\\/]bin[\\/]wake-word-engine(\.exe)? does not exist\./
+    );
+    expect(events.errors[0].message).not.toMatch(/Node\.js/);
+  });
+
+  it("reports an engine binary that fails to spawn by its path, not as a missing Node.js", async () => {
+    const { engine, events } = makeEngine("", "native");
+    await engine.start(ROUTES, 0.3, false);
+    const [command] = mocks.spawn.mock.calls[0];
+    latest().simulateError(new Error(`spawn ${command} ENOENT`));
+    expect(events.errors).toHaveLength(1);
+    expect(events.errors[0].message).toBe(
+      `Failed to start the speech engine at ${command}: spawn ${command} ENOENT`
+    );
+    expect(events.errors[0].message).not.toMatch(/nodePath/);
+    expect(engine.isListening).toBe(false);
+  });
+
   it("spawns the engine script under the configured node executable", async () => {
-    const { engine } = makeEngine();
+    const { engine } = makeEngine("", "node");
     await engine.start(ROUTES, 0.3, false);
     expect(mocks.spawn).toHaveBeenCalledTimes(1);
     const [command, args, options] = mocks.spawn.mock.calls[0];
@@ -317,7 +457,7 @@ describe("start", () => {
   });
 
   it("reports a missing node executable as a nodePath problem", async () => {
-    const { engine, events } = makeEngine();
+    const { engine, events } = makeEngine("", "node");
     await engine.start(ROUTES, 0.3, false);
     latest().simulateError(new Error("spawn /fake/bin/node ENOENT"));
     expect(events.errors).toHaveLength(1);
@@ -332,7 +472,7 @@ describe("start", () => {
     const context = {
       globalStorageUri: { fsPath: "/fake/storage" },
     } as unknown as vscode.ExtensionContext;
-    const engine = new SherpaEngine(context);
+    const engine = new SherpaEngine(context, "", "", "node");
     const events = capture(engine);
     mocks.execSync.mockReturnValue("/usr/bin/node\n");
 
@@ -347,7 +487,7 @@ describe("start", () => {
   });
 
   it("reports any other spawn failure with its message", async () => {
-    const { engine, events } = makeEngine();
+    const { engine, events } = makeEngine("", "node");
     await engine.start(ROUTES, 0.3, false);
     latest().simulateError(new Error("EACCES"));
     expect(events.errors[0].message).toBe("Failed to start audio engine: EACCES");

@@ -7,6 +7,8 @@ import {
   SherpaEngine,
   findSystemNode,
   modelStatus,
+  nativeEnginePath,
+  probeNativeEngine,
   probeNodeVersion,
 } from "./sherpaEngine";
 import {
@@ -1077,6 +1079,8 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("wakeWord");
   const nodePath = findSystemNode(config.get<string>("nodePath", ""));
   const engineNodeVersion = await probeNodeVersion(nodePath);
+  const engineBinaryPath = nativeEnginePath(context.extensionPath);
+  const engineBinaryStatus = await probeNativeEngine(engineBinaryPath);
   const routes = buildRoutes(config);
   const model = modelStatus(context.globalStorageUri.fsPath);
 
@@ -1090,6 +1094,8 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     hostNodeVersion: process.version,
     engineNodePath: nodePath,
     engineNodeVersion,
+    engineBinaryPath,
+    engineBinaryStatus,
     state: describeState(),
     isListening: speechEngine.isListening,
     isPaused: speechEngine.isPaused,

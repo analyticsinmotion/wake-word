@@ -19,7 +19,10 @@
  *     the pinned files, with their license notices;
  *   - Windows: the binary imports no C runtime DLL, because it links the
  *     static runtime the sherpa-onnx libraries are built against, and does not
- *     import ONNX Runtime, which it loads by path;
+ *     import ONNX Runtime, which it loads by path; the Visual C++ runtime
+ *     libraries are beside it, byte for byte the pinned files, with their
+ *     notice, and every such library that anything in the directory imports
+ *     is among them, so none has to be installed;
  *   - Linux: neither the binary nor ONNX Runtime needs a newer glibc or
  *     libstdc++ than LINUX_FLOOR, and the binary exports no ONNX Runtime
  *     symbol for the loaded library to bind to;
@@ -44,6 +47,7 @@ import { fileURLToPath } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
 
 import {
+  C_RUNTIME,
   engineFileName,
   PACKAGE_DIR,
   RUNTIME_FILES,
@@ -58,8 +62,17 @@ import {
  */
 export const LINUX_FLOOR = { GLIBC: '2.28', GLIBCXX: '3.4.25', CXXABI: '1.3.11', GCC: '7.0.0' };
 
+/**
+ * A Visual C++ runtime library, by file name. These are not part of Windows:
+ * a library that imports one loads only where the redistributable has been
+ * installed, unless the file is beside the executable.
+ */
+export const VC_RUNTIME_LIBRARY = /^(vcruntime|msvcp|concrt|vccorlib|vcomp|vcamp)\d+[a-z0-9_]*\.dll$/i;
+
 /** The oldest macOS the engine runs on, set by the ONNX Runtime build it ships. */
 export const MACOS_FLOOR = '14.0';
+
+const REPO_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const EXPECTED = {
   'win32-x64': { format: 'PE', machine: 0x8664, platform: 'windows-x86_64' },
@@ -361,6 +374,54 @@ function main() {
     if (file === ort) {
       ortInfo = binaryInfo(content);
       checkArchitecture(report, ort.to, ortInfo, expected);
+    }
+  }
+
+  // The Visual C++ runtime libraries, byte for byte, and their notice as it
+  // is in this repository.
+  const cRuntime = C_RUNTIME[target];
+  const libraries = new Map();
+  if (ortInfo?.format === 'PE') libraries.set(ort.to, ortInfo);
+  if (cRuntime) {
+    for (const file of cRuntime.files) {
+      const entry = entries.get(packaged(file.to));
+      if (!entry) {
+        report.fail(`${packaged(file.to)} is packaged`);
+        continue;
+      }
+      const content = zipRead(zip, entry);
+      const digest = createHash('sha256').update(content).digest('hex');
+      report.check(
+        digest === file.sha256,
+        `${packaged(file.to)} is the pinned file (${file.bytes} bytes)`,
+        `SHA-256 ${digest}, expected ${file.sha256}`
+      );
+      const info = binaryInfo(content);
+      checkArchitecture(report, file.to, info, expected);
+      libraries.set(file.to, info);
+    }
+    const noticeEntry = entries.get(packaged(cRuntime.notices.to));
+    const tracked = readFileSync(path.join(REPO_DIR, 'engine-rs', ...cRuntime.notices.from.split('/')));
+    report.check(
+      Boolean(noticeEntry) && zipRead(zip, noticeEntry).equals(tracked),
+      `${packaged(cRuntime.notices.to)} is packaged as tracked`
+    );
+  }
+
+  // What the packaged libraries import, against what is packaged. Windows
+  // resolves an import from the executable's directory first, so a Visual C++
+  // runtime library that is there is the one loaded, and one that is not has
+  // to be installed on the user's machine.
+  if (libraries.size > 0) {
+    const present = new Set([...libraries.keys()].map((name) => name.toLowerCase()));
+    for (const [name, info] of libraries) {
+      const needed = info.imports.filter((library) => VC_RUNTIME_LIBRARY.test(library));
+      const absent = needed.filter((library) => !present.has(library.toLowerCase()));
+      report.check(
+        absent.length === 0,
+        `every Visual C++ runtime library ${name} imports is packaged (${needed.join(', ') || 'none'})`,
+        `not packaged: ${absent.join(', ')}`
+      );
     }
   }
 

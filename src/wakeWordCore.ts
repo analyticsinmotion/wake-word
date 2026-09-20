@@ -757,6 +757,10 @@ export interface DiagnosticsInput {
   engineNodePath: string;
   /** `node --version` from the engine's executable, or why it could not run. */
   engineNodeVersion: string;
+  /** The packaged engine binary, when the report covers it. */
+  engineBinaryPath?: string;
+  /** What the binary's self-test reported, or why it could not run. */
+  engineBinaryStatus?: string;
   /** What the extension is doing, in words. */
   state: string;
   isListening: boolean;
@@ -800,6 +804,9 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     `Node.js (extension host): ${input.hostNodeVersion}`,
     `Node.js (engine): ${input.engineNodePath} (${input.engineNodeVersion})${nodeVersionNote(input.engineNodeVersion)}`,
     "Engine: sherpa-onnx",
+    ...(input.engineBinaryPath === undefined
+      ? []
+      : [`Engine binary: ${input.engineBinaryPath} (${input.engineBinaryStatus ?? "not checked"})`]),
     `State: ${input.state}`,
     `Listening: ${input.isListening}`,
     `Paused: ${input.isPaused}`,

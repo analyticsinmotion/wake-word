@@ -126,6 +126,26 @@ describe("formatDiagnostics", () => {
     expect(lines).toContain("Node.js (engine): node (could not run: spawn node ENOENT)");
   });
 
+  it("reports the engine binary and its self-test, with the home directory redacted", () => {
+    const lines = formatDiagnostics(
+      input({
+        homeDir: "/home/ann",
+        engineBinaryPath: "/home/ann/.vscode/extensions/wake-word/bin/wake-word-engine",
+        engineBinaryStatus:
+          "self-test OK, sherpa-onnx=1.13.8, ort=/home/ann/.vscode/extensions/wake-word/bin/libonnxruntime.so",
+      })
+    );
+    const at = lines.indexOf("Engine: sherpa-onnx");
+    expect(lines[at + 1]).toBe(
+      "Engine binary: ~/.vscode/extensions/wake-word/bin/wake-word-engine " +
+        "(self-test OK, sherpa-onnx=1.13.8, ort=~/.vscode/extensions/wake-word/bin/libonnxruntime.so)"
+    );
+  });
+
+  it("leaves the engine binary line out when it is not given one", () => {
+    expect(formatDiagnostics(input()).some((line) => line.startsWith("Engine binary:"))).toBe(false);
+  });
+
   it("reports the settings it is given", () => {
     const lines = formatDiagnostics(
       input({ threshold: 0.5, cooldownSeconds: 45, confirmationMode: true, pauseOnFocusLoss: false, enableOnStartup: false })

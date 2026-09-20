@@ -246,6 +246,31 @@ fn missing_model_file(model_dir: &str) -> Option<PathBuf> {
         .find(|path| !path.is_file())
 }
 
+/// The model directory in the form the library is given.
+///
+/// On Windows the library opens the model files through C runtime calls that
+/// refuse a path of 260 characters or more, and it reports such a file as one
+/// that does not exist. A path in the verbatim form, which starts `\\?\`, is
+/// exempt from that limit, and canonicalising a path produces that form. The
+/// verbatim form also skips the normalisation that would turn a forward slash
+/// into a separator, which canonicalising has already done. A directory that
+/// cannot be canonicalised is passed as it is, so whatever is wrong with it is
+/// reported by the load itself.
+///
+/// Everywhere else the path is passed as it is: there is no such limit, and a
+/// canonical path would differ only in resolved links.
+fn library_model_dir(model_dir: &str) -> String {
+    if cfg!(windows) {
+        if let Ok(canonical) = std::fs::canonicalize(model_dir) {
+            // A path the bindings cannot take as UTF-8 is left alone too.
+            if let Some(canonical) = canonical.to_str() {
+                return canonical.to_string();
+            }
+        }
+    }
+    model_dir.to_string()
+}
+
 /// The sherpa-onnx keyword spotter and its current stream.
 struct SherpaEngine {
     // Declared before the spotter so that it is dropped first: a stream must
@@ -271,7 +296,7 @@ impl SherpaEngine {
             return Err(format!("{} does not exist", path.display()));
         }
 
-        let config = spotter_config(model_dir, threshold, keywords);
+        let config = spotter_config(&library_model_dir(model_dir), threshold, keywords);
         // The library reports what it objected to on stderr, which the
         // extension forwards to its log.
         let spotter = KeywordSpotter::create(&config)
@@ -955,6 +980,42 @@ mod tests {
             .expect_err("an error");
         assert!(error.contains("encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"));
         assert!(error.ends_with("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn a_model_directory_that_cannot_be_canonicalised_is_passed_as_it_is() {
+        assert_eq!(library_model_dir("no-such-model-dir"), "no-such-model-dir");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_library_is_given_a_path_exempt_from_the_length_limit() {
+        // A directory whose files have paths well over 260 characters.
+        let root = std::env::temp_dir().join(format!("wake-word-long-{}", std::process::id()));
+        let mut dir = root.clone();
+        while dir.as_os_str().len() < 300 {
+            dir.push("d".repeat(40));
+        }
+        std::fs::create_dir_all(&dir).expect("create the directory");
+        let given = dir.to_str().expect("UTF-8").replace('\\', "/");
+
+        let verbatim = library_model_dir(&given);
+        let removed = std::fs::remove_dir_all(&root);
+
+        let prefix: String = ['\\', '\\', '?', '\\'].iter().collect();
+        assert!(verbatim.starts_with(&prefix), "{verbatim}");
+        assert!(!verbatim.contains('/'), "{verbatim}");
+        assert!(verbatim.ends_with(&"d".repeat(40)), "{verbatim}");
+        assert!(verbatim.len() >= 300, "{verbatim}");
+        removed.expect("remove the directory");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn elsewhere_the_library_is_given_the_path_as_it_is() {
+        let dir = std::env::temp_dir();
+        let given = format!("{}/.", dir.to_str().expect("UTF-8"));
+        assert_eq!(library_model_dir(&given), given);
     }
 
     #[test]

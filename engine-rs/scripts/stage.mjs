@@ -17,24 +17,42 @@
  *   silero_vad.onnx            the voice activity model
  *   ONNXRUNTIME-NOTICES.md     the license notices those two files carry
  *   SILERO-VAD-NOTICES.md
+ *   msvcp140.dll, msvcp140_1.dll, vcruntime140.dll, vcruntime140_1.dll
+ *                              Windows only: the Visual C++ runtime libraries
+ *   VC-RUNTIME-NOTICES.md      onnxruntime.dll imports, and their notice
  *
  * The engine looks for ONNX Runtime and the model in the directory that holds
  * the executable, so this layout needs no configuration. Each runtime file is
  * taken from its npm package, and both the package and the file are checked
- * against scripts/pinned-inputs.mjs first. On macOS the binary is given an
+ * against scripts/pinned-inputs.mjs first. The Visual C++ runtime libraries are
+ * unpacked from Microsoft's redistributable installer, which is checked the
+ * same way, as is each library; that step uses Windows' own expand.exe, so a
+ * Windows target is staged on Windows. On macOS the binary is given an
  * ad-hoc signature, without which it will not run on Apple silicon, and the
  * signature is verified.
  */
 
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
-import { checkBuffer, checkIntegrity, downloadBuffer } from './download.mjs';
+import { checkBuffer, checkIntegrity, downloadBuffer, downloadFile } from './download.mjs';
 import {
+  C_RUNTIME,
   engineFileName,
   npmTarballUrl,
   PACKAGE_DIR,
@@ -102,6 +120,85 @@ function run(command, args) {
   }
 }
 
+/**
+ * Where each cabinet file embedded in `image` starts and ends. A cabinet
+ * begins with the signature MSCF, four reserved zero bytes, its own length,
+ * and further down its format version, 1.3.
+ */
+function embeddedCabinets(image) {
+  const cabinets = [];
+  for (let at = image.indexOf('MSCF'); at !== -1; at = image.indexOf('MSCF', at + 4)) {
+    if (at + 36 > image.length) break;
+    const length = image.readUInt32LE(at + 8);
+    const plausible =
+      image.readUInt32LE(at + 4) === 0 &&
+      image.readUInt8(at + 24) === 3 &&
+      image.readUInt8(at + 25) === 1 &&
+      length >= 36 &&
+      at + length <= image.length;
+    if (plausible) {
+      cabinets.push(image.subarray(at, at + length));
+    }
+  }
+  return cabinets;
+}
+
+/**
+ * Unpack the Visual C++ runtime libraries from Microsoft's redistributable
+ * installer into `out`, with their notice.
+ *
+ * The installer is not run. It is an executable with cabinet files attached,
+ * and the one that holds the x64 runtime is itself inside the largest of
+ * them, so every cabinet found is expanded, and then every cabinet among the
+ * files that produced. Which cabinet a library came out of decides nothing:
+ * each library is checked against its pinned digest before it is kept.
+ */
+async function stageCRuntime(target, out) {
+  const runtime = C_RUNTIME[target];
+  if (!runtime) return;
+  if (process.platform !== 'win32') {
+    throw new Error(`the ${target} C runtime libraries are unpacked with expand.exe, so stage ${target} on Windows`);
+  }
+  // By full path: under Git Bash, which the workflows run their steps in, a
+  // bare `expand` is the coreutils program that turns tabs into spaces.
+  const expand = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'expand.exe');
+  const work = mkdtempSync(path.join(os.tmpdir(), 'wake-word-c-runtime-'));
+  try {
+    const installer = path.join(work, 'installer.exe');
+    await downloadFile(runtime.installer.url, installer, runtime.installer);
+
+    const found = new Map();
+    const unpack = (cabinet, depth) => {
+      const dir = mkdtempSync(path.join(work, 'cabinet-'));
+      const file = `${dir}.cab`;
+      writeFileSync(file, cabinet);
+      const result = spawnSync(expand, ['-F:*', file, dir], { encoding: 'utf8' });
+      if (result.status !== 0) {
+        throw new Error(`expand.exe exited ${result.status ?? result.signal}: ${result.stdout}${result.stderr}`);
+      }
+      for (const name of readdirSync(dir)) {
+        const content = readFileSync(path.join(dir, name));
+        found.set(name, content);
+        if (depth === 0 && content.toString('latin1', 0, 4) === 'MSCF') {
+          unpack(content, 1);
+        }
+      }
+    };
+    for (const cabinet of embeddedCabinets(readFileSync(installer))) {
+      unpack(cabinet, 0);
+    }
+
+    const label = `Visual C++ Redistributable ${runtime.version}`;
+    for (const file of runtime.files) {
+      place(found, file, out, label);
+    }
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+  copyFileSync(path.join(ENGINE_DIR, runtime.notices.from), path.join(out, runtime.notices.to));
+  console.log(`${runtime.notices.to}: copied from ${runtime.notices.from}`);
+}
+
 async function main() {
   const target = option('--target');
   if (!TARGETS.includes(target)) {
@@ -136,6 +233,8 @@ async function main() {
   for (const file of model.files) {
     place(modelFiles, file, out, modelLabel);
   }
+
+  await stageCRuntime(target, out);
 
   if (target.startsWith('darwin-')) {
     // The linker signs its output ad hoc, and stripping can leave that
