@@ -42,14 +42,17 @@ applies the speech and silence transitions: speech on the first chunk scoring
 0.5 or more, and silence once the score has stayed below it for 300 ms after
 the first quiet chunk arrived, which with 100 ms chunks is the fourth quiet
 chunk, and all four reach the spotter as the tail of the segment. The holdoff
-runs from the arrival of that first quiet chunk, its end and not its start:
-counting from its start ends every segment 100 ms sooner and cuts the tail off
-a phrase said on its own. While silent, chunks wait
-in a pre-roll ring; on speech the ring is flushed oldest first, ahead of the
-chunk that crossed the threshold, and chunks pass straight through until
-silence. The ring holds four chunks, so with the chunk that crossed the
-threshold the spotter is handed 500 ms of lead-in, five chunks in all. One
-chunk more or less moves every decode step, so the figure is pinned by a test.
+runs from the arrival of that first quiet chunk, its end and not its start,
+which is the semantics decibri gives its own default. Before the segment's end
+began finishing the decoding (below), counting from its start cut the tail off
+a phrase said on its own and lost a large share of them; it no longer costs
+detections, and a segment that ends one chunk sooner reports its phrase about
+40 ms sooner. While silent, chunks wait in a pre-roll ring; on speech the ring
+is flushed oldest first, ahead of the chunk that crossed the threshold, and
+chunks pass straight through until silence. The ring holds four chunks, so with
+the chunk that crossed the threshold the spotter is handed 500 ms of lead-in,
+five chunks in all. One chunk more or less moves every decode step, so the
+figure is pinned by a test.
 
 decibri's detector feed is the resampled mono signal before DC removal, the
 highpass, and AGC, so conditioning does not change what the detector hears.
@@ -87,7 +90,8 @@ The spotter does not take plain text. Each phrase reaches it as one keyword
 line: the SentencePiece pieces for the upper-cased phrase, then a boost score
 and the phrase's own trigger threshold, for example
 `▁HE Y ▁C LA U DE :3.0 #0.05`. The extension builds the lines, with a boost of
-3.0 and the clamped `wakeWord.confidenceThreshold` as every line's threshold.
+3.0 and, as each line's threshold, the clamped `wakeWord.confidenceThreshold`
+or the route's own `confidenceThreshold` where it sets one.
 A per-phrase threshold replaces the spotter-wide one, so the lines are where
 that setting takes effect. The spotter reports a hit as the decoded text of the
 pieces (`HEY CLAUDE`), and the engine maps that back through `phraseMap` to the
@@ -114,18 +118,22 @@ The spotter's stream, its decoding state, is restarted in three places:
 
 - after a detection, so one utterance is reported once;
 - at the end of each speech segment, so audio from either side of a silence is
-  never joined into a phrase nobody said in one breath;
+  never joined into a phrase nobody said in one breath. The segment's last
+  decode step is finished first: the stream is fed 1,600 ms of silence, as
+  sixteen chunks, and drained, so a phrase at the end of the segment is decoded
+  rather than discarded;
 - on `pause`, where the stream is replaced rather than reset. A reset leaves
   audio the stream has accepted and not yet decoded in place, and it would be
   decoded ahead of whatever is heard after the resume.
 
 The spotter decodes in steps of 320 ms of audio, counted from the first sample
 it is given, and reports a keyword once a step has covered the phrase's last
-piece and the blank after it. Audio still undecoded when a segment ends is cut
-off from the phrase by the reset. How much audio follows a phrase before the
-segment ends, and how much precedes it, therefore decides whether a phrase said
-on its own is detected, which is why the silence holdoff and the lead-in above
-are pinned by tests.
+piece and the blank after it. A phrase said on its own ends with its segment,
+which is why the segment's end feeds the stream silence and drains it before the
+reset (`SEGMENT_FLUSH_MS` in `src/spotter.rs`, which carries the measurement
+that chose the length). A pause replaces the stream instead of flushing it,
+because a detection from audio heard before the microphone was handed over must
+not arrive after it.
 
 ## Building
 
