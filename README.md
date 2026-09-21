@@ -178,7 +178,7 @@ Add your own phrases in `settings.json`. Any spoken English phrase works. Routes
 
 The speech engine listens only for the phrases in your routes, so speech that matches none of them never fires anything.
 
-Detection of uncommon words varies. The speech model works best with common English words, so a phrase built on a product name or other unusual word, such as "hey codex", may be missed more often than the default phrases. If one is, lower `wakeWord.confidenceThreshold` or add an alias made of common words.
+Detection of uncommon words varies. The speech model works best with common English words, so a phrase built on a product name or other unusual word, such as "hey codex", may be missed more often than the default phrases. If one is, give that route a lower `confidenceThreshold`, lower `wakeWord.confidenceThreshold` for every phrase, or add an alias made of common words.
 
 ### Phrase aliases
 
@@ -216,6 +216,21 @@ Override the global cooldown for individual routes with `cooldownSeconds`:
   "cooldownSeconds": 10
 }
 ```
+
+### Per-route threshold
+
+Override the global trigger threshold for one route with `confidenceThreshold`. Lower detects more easily, at the cost of more false triggers. Use it for a phrase the speech model finds hard, without making your other phrases trigger more readily:
+
+```json
+{
+  "label": "Claude",
+  "phrase": "hey claude",
+  "command": "claude-vscode.focus",
+  "confidenceThreshold": 0.03
+}
+```
+
+The range is 0.01 to 0.9, the same as `wakeWord.confidenceThreshold`. It applies to every phrase on the route, and a route without it uses the global setting.
 
 ### Handoff mode
 

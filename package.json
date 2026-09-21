@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -92,7 +92,9 @@
                   },
                   {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": {
+                      "type": "string"
+                    },
                     "minItems": 1,
                     "description": "Multiple phrases that trigger the same command (e.g. [\"hey claude\", \"open claude\"])"
                   }
@@ -117,7 +119,10 @@
               },
               "handoff": {
                 "type": "string",
-                "enum": ["timer", "manual"],
+                "enum": [
+                  "timer",
+                  "manual"
+                ],
                 "default": "timer",
                 "description": "How to resume after handing off. 'timer' resumes after cooldownSeconds. 'manual' waits until you click the status bar or run Wake Word: Enable Listening."
               }
