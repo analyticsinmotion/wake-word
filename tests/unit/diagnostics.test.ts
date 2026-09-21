@@ -98,6 +98,32 @@ describe("formatDiagnostics", () => {
     ]);
   });
 
+  it("shows a route's own threshold, and nothing for the routes without one", () => {
+    const routes: WakePhrase[] = [
+      { ...ROUTES[0], confidenceThreshold: 0.03 },
+      ROUTES[1],
+      { ...ROUTES[2], confidenceThreshold: 0.5 },
+    ];
+    const lines = formatDiagnostics(input({ routes }));
+    expect(lines).toContain('  "Claude" [hey claude] -> claude-vscode.focus (manual, threshold 0.03)');
+    expect(lines).toContain(
+      '  "Terminal" [hey computer, open terminal] -> workbench.action.terminal.focus (timer, 10s)'
+    );
+    expect(lines).toContain(
+      '  "Chat" [hey chat] -> workbench.action.chat.open (timer, threshold 0.5)'
+    );
+  });
+
+  it("shows the threshold a route's keyword lines will carry, clamped", () => {
+    const routes = [
+      { ...ROUTES[0], confidenceThreshold: 5 },
+      { ...ROUTES[2], confidenceThreshold: "nonsense" as unknown as number },
+    ];
+    const lines = formatDiagnostics(input({ routes, threshold: 0.3 }));
+    expect(lines).toContain('  "Claude" [hey claude] -> claude-vscode.focus (manual, threshold 0.9)');
+    expect(lines).toContain('  "Chat" [hey chat] -> workbench.action.chat.open (timer, threshold 0.3)');
+  });
+
   it("marks the built-in routes", () => {
     expect(formatDiagnostics(input({ usingDefaultRoutes: true }))).toContain("Routes: 3 (defaults)");
   });

@@ -19,6 +19,8 @@ import {
   SessionStats,
   clampThreshold,
   createSessionStats,
+  decideListenSettingsChange,
+  describeThreshold,
   detectPhraseCollisions,
   evaluateConfirmation,
   filterValidRoutes,
@@ -26,6 +28,7 @@ import {
   formatConfidence,
   formatConfirmationStatus,
   formatDiagnostics,
+  formatListenSettingsChange,
   formatPhraseChecks,
   formatPhraseChecksSummary,
   formatSessionStats,
@@ -62,7 +65,19 @@ let sessionStats: SessionStats = createSessionStats();
 let pendingConfirmation: PendingConfirmation | null = null;
 let confirmationTimer: ReturnType<typeof setTimeout> | null = null;
 let isManuallyPaused = false;
-let routesChangedWhilePaused = false;
+/**
+ * A change to the routes or the threshold that arrived while the engine was
+ * paused. The resume then goes through a full start; see resumeListening().
+ */
+let listenSettingsChangedWhilePaused = false;
+/**
+ * The same, for a change that arrived while a start was in flight. That
+ * engine was given the settings as they were when the start began, so
+ * listening restarts as soon as it reports READY.
+ */
+let listenSettingsChangedWhileStarting = false;
+/** A start is in flight: speechEngine.start() has been called, no `started` yet. */
+let engineStarting = false;
 let calibration: CalibrationRun | null = null;
 /** Advanced by each detection's handoff and by cancelPendingHandoff(). */
 let handoffGeneration = 0;
@@ -141,21 +156,27 @@ function readAudioDevice(config: vscode.WorkspaceConfiguration): string {
 
 // ── Engine wiring ────────────────────────────────────────────
 
-function wireEngine(engine: ISpeechEngine): void {
+function wireEngine(engine: ISpeechEngine, context: vscode.ExtensionContext): void {
   engine.on("detected", (phrase: WakePhrase, confidence?: number) => {
     onWakeWordDetected(phrase, confidence);
   });
   engine.on("started", () => {
     sessionStats.engineStarts++;
+    engineStarting = false;
     setStatusBar("listening");
     calibration?.onEngineStarted?.();
+    applyListenSettingsChangedWhileStarting(context);
   });
   engine.on("paused", () => setStatusBar("handed-off"));
-  engine.on("stopped", () => setStatusBar("off"));
+  engine.on("stopped", () => {
+    engineStarting = false;
+    setStatusBar("off");
+  });
   engine.on("debug", (info: string) => log("info", info));
   engine.on("warning", (msg: string) => log("warn", msg));
   engine.on("error", (err: Error) => {
     sessionStats.errors++;
+    engineStarting = false;
     log("error", err.message);
     vscode.window.showErrorMessage(`Wake Word error: ${err.message}`, "Show Log").then((choice) => {
       if (choice === "Show Log") {
@@ -182,7 +203,7 @@ export function activate(context: vscode.ExtensionContext) {
   sessionStats = createSessionStats();
 
   speechEngine = createEngine(context);
-  wireEngine(speechEngine);
+  wireEngine(speechEngine, context);
 
   // Status bar
   statusBarItem = vscode.window.createStatusBarItem(
@@ -253,6 +274,11 @@ export function activate(context: vscode.ExtensionContext) {
         // what the new engine does.
         calibration?.finish("stopped");
         const wasListening = speechEngine.isListening;
+        // Whatever the old engine was doing, it is about to be disposed of.
+        // A routes or threshold change in the same event needs nothing of
+        // its own: every path out of here ends in a start, which reads the
+        // settings again.
+        engineStarting = false;
         const cooldownActive = countdownTimer !== null;
         const manualActive = isManuallyPaused;
         isPausedByFocus = false;
@@ -260,7 +286,7 @@ export function activate(context: vscode.ExtensionContext) {
         clearConfirmation();
         speechEngine.dispose();
         speechEngine = createEngine(context);
-        wireEngine(speechEngine);
+        wireEngine(speechEngine, context);
         log("info", "Engine rebuilt due to settings change");
         // The counters describe one engine's run. Write them out before
         // they are reset for the new one.
@@ -276,17 +302,41 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      if (e.affectsConfiguration("wakeWord.routes")) {
-        if (speechEngine.isListening) {
-          stopListening();
-          handleConsentThenStart(context);
-        } else if (speechEngine.isPaused || countdownTimer !== null || isManuallyPaused) {
-          // The engine is paused for a handoff and must not take the
-          // microphone back now. The resume does a full start so the new
-          // routes are used; resume() alone would replay the old ones.
-          routesChangedWhilePaused = true;
-          log("info", "Routes changed during a handoff: applied when listening resumes");
-        }
+      // The routes and the threshold are read at the start and sent in the
+      // engine's config line, so a running engine has the old ones. What
+      // that means here depends on what the extension is doing: see
+      // decideListenSettingsChange().
+      const change = {
+        routes: e.affectsConfiguration("wakeWord.routes"),
+        threshold: e.affectsConfiguration("wakeWord.confidenceThreshold"),
+      };
+      const action = decideListenSettingsChange(change, {
+        listening: speechEngine.isListening,
+        starting: engineStarting,
+        paused: speechEngine.isPaused,
+        cooldown: countdownTimer !== null,
+        manualPause: isManuallyPaused,
+      });
+      const line = formatListenSettingsChange(change, action);
+      if (line) {
+        log("info", line);
+      }
+      switch (action) {
+        case "restart":
+          restartListening(context);
+          break;
+        case "apply-on-resume":
+          // The engine is paused and must not take the microphone back now:
+          // a handoff means an assistant has it. The resume does a full
+          // start; resume() alone would replay the settings it was paused
+          // with.
+          listenSettingsChangedWhilePaused = true;
+          break;
+        case "apply-when-started":
+          listenSettingsChangedWhileStarting = true;
+          break;
+        case "none":
+          break;
       }
     })
   );
@@ -428,11 +478,54 @@ function startListening() {
   const threshold = clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD));
   const audioDevice = readAudioDevice(config);
   const deviceNote = audioDevice ? `, device="${audioDevice}"` : "";
-  log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}${deviceNote}`);
+  log(
+    "info",
+    `Starting: ${routes.length} routes, threshold=${describeThreshold(threshold, routes)}, ` +
+      `devMode=${isDevMode}${deviceNote}`
+  );
   log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
   reportPhraseChecks(routes);
 
+  // The settings this start carries are the ones just read, so a change
+  // still waiting on a start is spent, and a change that arrives before the
+  // engine says READY is what the next one is for.
+  listenSettingsChangedWhileStarting = false;
+  engineStarting = true;
   speechEngine.start(routes, threshold, isDevMode);
+}
+
+/**
+ * Restart listening so the engine picks up settings it was not started
+ * with. The engine ignores a start while it is listening, so it is stopped
+ * first, exactly as a Disable then an Enable would, and the start goes
+ * through the consent check for the same reason: consent can have been
+ * withdrawn in another window since this one began listening.
+ */
+function restartListening(context: vscode.ExtensionContext): void {
+  stopListening();
+  handleConsentThenStart(context);
+}
+
+/**
+ * Apply a routes or threshold change that arrived while the engine was
+ * starting. Called when it reports READY, which is the first moment a
+ * restart costs no more than a reload of the model: the engine holds the
+ * microphone, so nothing is taken from a handoff.
+ *
+ * A calibration run is listening on this engine and its window is already
+ * open, so the change waits for the next start rather than cutting the run
+ * short.
+ */
+function applyListenSettingsChangedWhileStarting(context: vscode.ExtensionContext): void {
+  if (!listenSettingsChangedWhileStarting) {
+    return;
+  }
+  listenSettingsChangedWhileStarting = false;
+  if (calibration) {
+    log("info", "Settings changed during a calibration run: applied at the next start");
+    return;
+  }
+  restartListening(context);
 }
 
 function stopListening() {
@@ -443,7 +536,9 @@ function stopListening() {
   stopLockWatcher();
   isPausedByFocus = false;
   isManuallyPaused = false;
-  routesChangedWhilePaused = false;
+  listenSettingsChangedWhilePaused = false;
+  listenSettingsChangedWhileStarting = false;
+  engineStarting = false;
   lastDetectionTime = 0;
   speechEngine.stop();
   releaseLock(lockPath);
@@ -761,12 +856,13 @@ function resumeListening() {
   clearConfirmation();
   isManuallyPaused = false;
   lastDetectionTime = 0;
-  // resume() replays the phrases the engine was paused with. After a route
-  // change that is the wrong list, so go through a full start instead.
-  if (speechEngine.isPaused && !routesChangedWhilePaused) {
+  // resume() replays the phrases and the threshold the engine was paused
+  // with. After a change to either those are the wrong settings, so go
+  // through a full start instead.
+  if (speechEngine.isPaused && !listenSettingsChangedWhilePaused) {
     speechEngine.resume();
   } else {
-    routesChangedWhilePaused = false;
+    listenSettingsChangedWhilePaused = false;
     startListening();
   }
 }
@@ -860,7 +956,10 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
-  log("info", `Calibration: starting (${seconds}s, threshold=${threshold}, was ${prior.kind})`);
+  log(
+    "info",
+    `Calibration: starting (${seconds}s, threshold=${describeThreshold(threshold, routes)}, was ${prior.kind})`
+  );
 
   const run: CalibrationRun = {
     detections: [],

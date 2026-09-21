@@ -23,12 +23,17 @@
 //! segment.
 //!
 //! Where the holdoff starts decides how much audio follows a phrase before the
-//! segment ends, and the keyword spotter depends on that audio. It decodes in
-//! steps of 320 ms and reports a keyword only once a step has covered the
-//! phrase's last piece and the blank after it; whatever is still undecoded when
-//! the segment ends is cut off from the phrase by the reset. Ending every
-//! segment one chunk earlier, by counting the holdoff from the start of the
-//! first quiet chunk, loses a large share of phrases said on their own.
+//! segment ends. The keyword spotter decodes in steps of 320 ms and reports a
+//! keyword only once a step has covered the phrase's last piece and the blank
+//! after it, so this used to decide whether a phrase said on its own was
+//! reported at all: ending every segment one chunk earlier, by counting the
+//! holdoff from the start of the first quiet chunk, lost a large share of them.
+//! The segment's end now finishes that decoding on silence instead
+//! (`crate::spotter::SEGMENT_FLUSH_MS`), and with it one chunk either way costs
+//! no detections on the clip set that measured the flush. What the tail decides
+//! now is how soon a detection is reported: a segment that ends one chunk
+//! sooner reports its phrase about 40 ms sooner. The holdoff stays decibri's
+//! default, with decibri's semantics.
 //!
 //! The holdoff is counted in samples rather than on a wall-clock timer, so the
 //! transition depends only on the audio, never on how promptly a chunk was

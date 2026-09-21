@@ -107,6 +107,132 @@ export function clampThreshold(
   return Math.max(MIN_THRESHOLD, Math.min(MAX_THRESHOLD, numeric));
 }
 
+/**
+ * The threshold for a log line: the global setting, and how many routes
+ * replace it with a `confidenceThreshold` of their own.
+ *
+ * Without the count, a line naming only the global value reads as though it
+ * applied to every phrase, which it does not once a route carries its own.
+ * The per-route values themselves are in the diagnostics report, one per
+ * route.
+ */
+export function describeThreshold(threshold: number, routes: readonly WakePhrase[]): string {
+  const own = routes.filter((r) => r && r.confidenceThreshold !== undefined).length;
+  return own === 0 ? `${threshold}` : `${threshold} (overridden by ${plural(own, "route")})`;
+}
+
+// -- Settings that decide what the engine listens for -------------------
+
+/**
+ * Which of the settings a running engine cannot pick up on its own changed.
+ *
+ * Both are read in startListening() and sent in the engine's config line:
+ * the routes become its keyword lines, and the threshold becomes every
+ * line's trigger value. An engine already running was given the old ones,
+ * so a change to either has to reach it through a start.
+ *
+ * `wakeWord.audioDevice` is not here: the engine is built with the
+ * microphone it listens on, so that setting replaces the engine itself.
+ */
+export interface ListenSettingsChange {
+  routes: boolean;
+  threshold: boolean;
+}
+
+/** What the extension is doing when a settings change arrives. */
+export interface ListeningState {
+  /** The engine holds the microphone. */
+  listening: boolean;
+  /** A start is in flight: the engine has not reported READY yet. */
+  starting: boolean;
+  /** The engine is paused: a handoff, a cooldown, or a focus-loss pause. */
+  paused: boolean;
+  /** A cooldown countdown is running. */
+  cooldown: boolean;
+  /** A manual handoff is waiting for the user to resume. */
+  manualPause: boolean;
+}
+
+/**
+ * What to do about it.
+ *
+ * `restart` stops the engine and starts it again with the new settings.
+ * `apply-on-resume` holds them until the paused engine resumes, which then
+ * goes through a full start. `apply-when-started` holds them until the
+ * start in flight reports READY, because that engine was given the old
+ * ones. `none` leaves them for the next start to read.
+ */
+export type ListenSettingsAction = "none" | "restart" | "apply-on-resume" | "apply-when-started";
+
+/**
+ * Decide what a change to the listening settings does in the state the
+ * extension is in.
+ *
+ * The rule that shapes this: a paused engine must not take the microphone
+ * back because a setting changed. Paused means a handoff, and a handoff
+ * means an assistant has the microphone. So every paused state defers, and
+ * only an engine that already holds the microphone restarts.
+ *
+ * A start in flight is checked before the paused flags because a resume
+ * through startListening() leaves the engine paused until READY arrives:
+ * the resume that would have consumed a deferral has already happened, so
+ * deferring to it would drop the change. `apply-when-started` reopens no
+ * microphone either, since it acts only once the engine is listening.
+ */
+export function decideListenSettingsChange(
+  change: ListenSettingsChange,
+  state: ListeningState
+): ListenSettingsAction {
+  if (!change.routes && !change.threshold) {
+    return "none";
+  }
+  if (state.listening) {
+    return "restart";
+  }
+  if (state.starting) {
+    return "apply-when-started";
+  }
+  if (state.paused || state.cooldown || state.manualPause) {
+    return "apply-on-resume";
+  }
+  // Off, in the error state, or standing by while another window listens.
+  // The next start reads the settings itself.
+  return "none";
+}
+
+/**
+ * Which settings changed, as the subject of a log line. At least one of them
+ * has, since a line is only written for a change the extension acts on.
+ */
+export function describeListenSettingsChange(change: ListenSettingsChange): string {
+  if (change.routes && change.threshold) {
+    return "Routes and confidence threshold";
+  }
+  return change.routes ? "Routes" : "Confidence threshold";
+}
+
+/**
+ * The output channel line for a settings change: what changed, and when it
+ * will take effect. Null for a change the extension does not act on, which
+ * is not worth a line.
+ */
+export function formatListenSettingsChange(
+  change: ListenSettingsChange,
+  action: ListenSettingsAction
+): string | null {
+  if (action === "none") {
+    return null;
+  }
+  const subject = describeListenSettingsChange(change);
+  if (action === "restart") {
+    return `${subject} changed: restarting listening`;
+  }
+  if (action === "apply-on-resume") {
+    return `${subject} changed while listening was paused: applied when listening resumes`;
+  }
+  return `${subject} changed while the engine was starting: applied as soon as it is listening`;
+}
+
 // -- Debounce -----------------------------------------------------------
 
 /**
@@ -729,6 +855,7 @@ export interface DiagnosticsInput {
   modelPresent: boolean;
   modelSha256: string;
   audioDevice: string;
+  /** The global wakeWord.confidenceThreshold, already clamped. */
   threshold: number;
   cooldownSeconds: number;
   confirmationMode: boolean;
@@ -782,8 +909,16 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     const handoff = resolveHandoff(route.handoff);
     const cooldown =
       handoff === "timer" && typeof route.cooldownSeconds === "number" ? `, ${route.cooldownSeconds}s` : "";
+    // Only for a route that set one, and the value its keyword lines carry:
+    // the same clamp the engine's config line goes through, falling back to
+    // the global threshold reported above.
+    const threshold =
+      route.confidenceThreshold === undefined
+        ? ""
+        : `, threshold ${clampThreshold(route.confidenceThreshold, input.threshold)}`;
     lines.push(
-      `  "${route.label}" [${normalizePhrases(route.phrase).join(", ")}] -> ${route.command} (${handoff}${cooldown})`
+      `  "${route.label}" [${normalizePhrases(route.phrase).join(", ")}] -> ${route.command} ` +
+        `(${handoff}${cooldown}${threshold})`
     );
   }
 

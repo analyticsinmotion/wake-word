@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.0] - 2026-09-21
+
+### Added
+
+- Routes can set `confidenceThreshold` to override `wakeWord.confidenceThreshold` for their own phrases, in the same range of 0.01 to 0.9. A phrase the speech model finds hard can be made easier to detect without making the other phrases trigger more readily. It applies to every alias on the route, and a route without it uses the global setting.
+
+### Changed
+
+- Wake phrases said on their own are detected far more reliably. The speech engine now finishes processing each phrase before it resets, so a phrase is no longer lost when speech stops at the wrong moment. "Hey Claude" is detected more than twice as often. A detection now arrives about 30 ms later.
+
+### Fixed
+
+- A change to `wakeWord.confidenceThreshold` now takes effect straight away. Listening restarts with the new value instead of waiting for listening to be turned off and on again. If the change arrives while the microphone has been handed to an assistant, it is held until listening resumes.
+
 ## [0.14.0] - 2026-09-20
 
 ### Changed

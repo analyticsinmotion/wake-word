@@ -295,6 +295,92 @@ describe("buildKeywordSpec", () => {
       expect(spec.skipped).toEqual([]);
     });
   });
+
+  describe("with a route's own threshold", () => {
+    it("writes the route's threshold on its line instead of the global one", () => {
+      const spec = buildKeywordSpec(
+        [{ phrase: "hey claude", confidenceThreshold: 0.03 }],
+        fakeEncodePieces,
+        0.05
+      );
+      expect(spec.keywordLines).toEqual([B + "HE Y " + B + "CL AUDE :3.0 #0.03"]);
+    });
+
+    it("writes the global threshold for a route that has none", () => {
+      const spec = buildKeywordSpec([{ phrase: "hey claude" }], fakeEncodePieces, 0.2);
+      expect(spec.keywordLines).toEqual([B + "HE Y " + B + "CL AUDE :3.0 #0.2"]);
+    });
+
+    it("gives every alias of a route the route's threshold", () => {
+      const spec = buildKeywordSpec(
+        [{ phrase: ["hey chat", "open chat"], confidenceThreshold: 0.4 }],
+        fakeEncodePieces,
+        0.05
+      );
+      expect(spec.keywordLines).toEqual([
+        B + "HE Y " + B + "CH AT :3.0 #0.4",
+        B + "OP EN " + B + "CH AT :3.0 #0.4",
+      ]);
+    });
+
+    it("gives each route its own threshold in one spec", () => {
+      const spec = buildKeywordSpec(
+        [
+          { phrase: "hey claude", confidenceThreshold: 0.02 },
+          { phrase: "hey chat" },
+          { phrase: "hey computer", confidenceThreshold: 0.5 },
+        ],
+        fakeEncodePieces,
+        0.05
+      );
+      expect(spec.keywordLines.map((line) => line.slice(line.indexOf("#")))).toEqual([
+        "#0.02",
+        "#0.05",
+        "#0.5",
+      ]);
+    });
+
+    it("clamps a route's threshold into the setting range", () => {
+      const line = (confidenceThreshold: unknown) =>
+        buildKeywordSpec([{ phrase: "hey", confidenceThreshold }], fakeEncodePieces, 0.05)
+          .keywordLines[0];
+      expect(line(0.001)).toBe(B + "HE Y :3.0 #0.01");
+      expect(line(-1)).toBe(B + "HE Y :3.0 #0.01");
+      expect(line(5)).toBe(B + "HE Y :3.0 #0.9");
+      expect(line("0.6")).toBe(B + "HE Y :3.0 #0.6");
+    });
+
+    it("falls back to the global threshold for an unusable route value", () => {
+      for (const confidenceThreshold of [undefined, null, NaN, 0, "not a number", {}]) {
+        const spec = buildKeywordSpec(
+          [{ phrase: "hey", confidenceThreshold }],
+          fakeEncodePieces,
+          0.2
+        );
+        expect(spec.keywordLines).toEqual([B + "HE Y :3.0 #0.2"]);
+      }
+    });
+
+    it("clamps the global fallback before a route falls back to it", () => {
+      const spec = buildKeywordSpec(
+        [{ phrase: "hey", confidenceThreshold: "nonsense" }],
+        fakeEncodePieces,
+        5
+      );
+      expect(spec.keywordLines).toEqual([B + "HE Y :3.0 #0.9"]);
+    });
+
+    it("keeps the route's threshold out of the debug tokens and the lookup key", () => {
+      const spec = buildKeywordSpec(
+        [{ phrase: "hey chat", confidenceThreshold: 0.03 }],
+        fakeEncodePieces
+      );
+      expect(spec.details).toEqual([
+        { phrase: "hey chat", tokens: B + "HE Y " + B + "CH AT", decoded: "HEY CHAT" },
+      ]);
+      expect(Object.keys(spec.phraseMap)).toEqual(["HEY CHAT"]);
+    });
+  });
 });
 
 describe("keywordTexts", () => {
