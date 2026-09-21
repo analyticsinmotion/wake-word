@@ -10,7 +10,7 @@ npm run lint               # Run ESLint (flat config, eslint.config.mjs) + SVG c
 npm test                   # Run the unit test suite once (vitest)
 npm run test:watch         # Run the unit tests in watch mode
 npm run package            # Build .vsix package
-npm run benchmark          # Acoustic benchmark over tests/acoustic/fixtures (manual; needs the sherpa model)
+npm run benchmark          # Acoustic benchmark over tests/acoustic/fixtures (manual; needs `npm run compile`, sherpa-onnx installed with --no-save, and the speech model)
 
 # Engine packaging (after `cargo build --release` in engine-rs/)
 node engine-rs/scripts/stage.mjs --target win32-x64             # Engine, ONNX Runtime, Silero model into bin/
@@ -68,7 +68,10 @@ wake-word/
     mocks/vscode.ts    # Stub for the `vscode` module, wired up in vitest.config.mts
     mocks/childProcess.ts  # MockChildProcess: drives the engine state machine without a real process
     acoustic/          # Acoustic benchmark: FRR, FAR, and latency over WAV recordings (manual, not CI)
+      README.md              # How to record the fixtures and run the benchmark
       run-benchmark.js       # Drives the sherpa-onnx spotter over fixtures/positive and fixtures/negative
+      benchmarkCore.test.js  # Tests for lib/benchmark-core.js
+      modelPath.test.js      # Tests for lib/model-path.js
       lib/benchmark-core.js  # WAV parsing, fixture naming, statistics, report; unit tested
       lib/model-path.js      # Forward-slash model paths for the sherpa-onnx package's WASM VFS; unit tested
       fixtures/              # positive/<phrase>-<nn>.wav and negative/*.wav; only silence-10s.wav is committed
@@ -274,13 +277,13 @@ Manual testing checklist:
 26. Add a route with the single-word phrase `"search"`. When listening restarts, the output channel shows a `Phrase warning (<label>)` line and one "phrase warning found" notification appears. Disable and enable listening: no second notification. Change the phrase to `"stop"`: the notification appears again, counting two warnings.
 27. Add two routes with the phrases `"hey claude"` and `"claude"`. The output channel shows a "Phrase collision" line naming both.
 28. Say "Hey Computer" and, during the countdown, run **Wake Word: Enable Listening**. The log shows "Resumed: user resumed during the cooldown", the countdown disappears, and the status bar shows "Wake: Listening".
-29. With a model already downloaded by 0.13.0, install 0.13.1 and enable listening: no download notification appears, and in debug mode the log shows "Model already present". Then delete the `sherpa-onnx` folder from global storage and enable listening on macOS or Linux: the model downloads, extracts, and phrases are detected.
+29. With a model already downloaded by an earlier version, install the current one and enable listening: no download notification appears, and in debug mode the log shows "Model already present". Then delete the `sherpa-onnx` folder from global storage and enable listening on macOS or Linux: the model downloads, extracts, and phrases are detected.
 30. With the default routes, say each default phrase a few times: "Hey Claude", "Hey Chat", "Open Chat", "Hey Computer", and "Open Terminal". Each fires its route (the chat panel opens for both chat phrases, the terminal focuses for both terminal phrases). Then talk normally for a few minutes, including sentences with "chat", "computer", and "terminal" in them, and note any false triggers. Repeat on macOS or Linux.
 31. Add a route with the phrase `"route 66"` beside the defaults and enable listening. The output channel shows one `Phrase "route 66" skipped: "66" is not in the speech model's vocabulary` warning, no error notification appears, and the default phrases are detected. Then make it the only route: the error notification says "No valid phrases to detect".
 32. In the debug console of the window that launched the Extension Development Host, evaluate `process.listenerCount('uncaughtException')` and `process.listenerCount('unhandledRejection')`. Disable and enable listening three times and evaluate them again: both numbers are unchanged, because the tokeniser's listeners stay in its worker thread.
 33. Download a platform `.vsix` from a CI run and install it with **Extensions: Install from VSIX...**. In the installed extension's folder, `bin/` holds `wake-word-engine` (executable on macOS and Linux), the ONNX Runtime library, `silero_vad.onnx`, and the two notices, and `bin/wake-word-engine --self-test` prints `SELF-TEST:OK` with `ort=` and `vad-model=` naming files in that `bin/`. Do this on Windows, on macOS, and on a Linux older than the runner (for example Ubuntu 22.04 or a RHEL 8 derivative).
 34. On a machine with nothing but the editor installed, install a platform `.vsix` and enable listening: the `Spawning:` line names `bin/wake-word-engine`, phrases are detected, and pause and resume work. On Windows, do this on an account whose global storage path makes the model's file paths longer than 260 characters. Then rename `bin/wake-word-engine` in the installed extension and enable listening: the error notification names that path.
-35. On a Windows installation without the Microsoft Visual C++ Redistributable (a fresh Windows 10 or 11), install the `win32-x64` `.vsix` and enable listening. Record the error the extension shows and the output channel line, because neither names the redistributable, and check the troubleshooting row in the README against them. `bin\wake-word-engine.exe --self-test` shows the same failure without the editor. Install the redistributable and confirm listening then works.
+35. On a Windows installation without the Microsoft Visual C++ Redistributable (a fresh Windows 10 or 11), install the `win32-x64` `.vsix` and enable listening. Record the error the extension shows and the output channel line, because neither names the redistributable, and check the README's Prerequisites note against them. `bin\wake-word-engine.exe --self-test` shows the same failure without the editor. Install the redistributable and confirm listening then works.
 
 ## Boundaries
 

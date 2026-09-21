@@ -147,7 +147,7 @@ The Claude route uses manual handoff (see [Handoff mode](#handoff-mode)): after 
 
 ### Custom routes
 
-Add your own phrases in `settings.json`. Any spoken English phrase works:
+Add your own phrases in `settings.json`. Any spoken English phrase works. Routes are a list of objects, so the Settings editor links out to JSON rather than showing a form:
 
 ```json
 {
@@ -178,7 +178,7 @@ Add your own phrases in `settings.json`. Any spoken English phrase works:
 
 The speech engine listens only for the phrases in your routes, so speech that matches none of them never fires anything.
 
-Detection of uncommon words varies. The speech model works best with common English words, so a phrase built on a product name or other unusual word, such as "hey codex", may be missed more often than the default phrases. If one is, run **Wake Word: Calibrate** to see what is heard, lower `wakeWord.confidenceThreshold`, or add an alias made of common words.
+Detection of uncommon words varies. The speech model works best with common English words, so a phrase built on a product name or other unusual word, such as "hey codex", may be missed more often than the default phrases. If one is, lower `wakeWord.confidenceThreshold` or add an alias made of common words.
 
 ### Phrase aliases
 
@@ -202,7 +202,7 @@ When listening starts, Wake Word checks your phrases. Anything likely to detect 
 - The same phrase on two routes. Only the first of those routes can fire.
 - A phrase contained in another route's phrase, such as `"claude"` and `"hey claude"`. The shorter one may trigger when the longer one is spoken. Aliases on the same route are not compared, because they run the same command.
 
-Warnings never block a phrase. They are shown once per session, and again when you change your routes' phrases. **Wake Word: Show Diagnostics** lists them as well.
+Warnings never block a phrase. They are shown once per session, and again when you change your routes' phrases.
 
 ### Per-route cooldown
 
@@ -239,14 +239,11 @@ The status bar shows **Wake: Paused** while a manual route waits. The default Cl
 
 When a wake phrase is detected:
 
-1. The extension asks the speech engine to close the microphone and waits for it to
-   confirm. The engine keeps its process running with the speech model loaded, so
-   listening comes back without reloading it. A process that has not confirmed within
-   500 ms is stopped, which closes the microphone as well
+1. The extension asks the speech engine to close the microphone and waits for it to confirm. The engine keeps its process running with the speech model loaded, so listening comes back without reloading it. A process that has not confirmed within 500 ms is stopped, which closes the microphone as well
 2. Only then does the target VS Code command fire (opening the assistant)
 3. The assistant's voice mode takes over the microphone with no contention
 4. After `wakeWord.cooldownSeconds` (default: 30), wake word listening resumes. A route with `handoff: "manual"` waits for you instead. Running **Wake Word: Enable Listening** during a cooldown resumes early
-5. Status bar shows a live countdown (`Wake: 30s → Wake: 29s → ...`) during handoff, then returns to "Wake: Listening". A manual route shows "Wake: Paused" instead, with no countdown
+5. Status bar shows a live countdown (`Wake: 30s` → `Wake: 29s` → ...) during handoff, then returns to "Wake: Listening". A manual route shows "Wake: Paused" instead, with no countdown
 
 This ensures only one thing uses the mic at a time.
 
@@ -281,20 +278,6 @@ The lock lives in the extension's global storage, which windows of the same edit
 
 Changing it restarts the engine. If the value matches no device, or more than one, the error notification says so and names the value.
 
-### Calibrating
-
-**Wake Word: Calibrate** listens for 15 seconds and logs every wake phrase it hears, with the time, without firing any route. Say each of your phrases a few times at your normal distance, then open the Wake Word output channel: the summary counts the detections of each phrase. No detections means the microphone, the room, or the threshold needs attention; a phrase heard only some of the times you said it is on the edge. The keyword spotter applies the threshold itself and reports no confidence score, so the summary has counts only. Whatever the extension was doing before, listening, a cooldown, or a manual pause, is put back afterwards.
-
-## Commands
-
-- **Wake Word: Enable Listening** -- start the detector
-- **Wake Word: Disable Listening** -- stop the detector
-- **Wake Word: Toggle Listening** -- toggle on/off (also via status bar click)
-- **Wake Word: Reset Microphone Consent** -- clear consent and re-prompt
-- **Wake Word: Open Settings** -- open the Settings editor filtered to Wake Word (also linked from the status bar tooltip)
-- **Wake Word: Calibrate** -- listen for 15 seconds and log what is heard without firing any route (see [Calibrating](#calibrating))
-- **Wake Word: Show Diagnostics** -- write the versions, platform, speech engine self-test, model, audio device, settings, routes, phrase warnings, and engine state to the output channel, with an option to copy them for a bug report. Your home directory is replaced with `~`, and no audio is included
-
 ## Common command IDs
 
 Useful values for the `command` field in your routes. Command IDs listed are for VS Code. Cursor and other editors may use different IDs for the same features.
@@ -310,52 +293,20 @@ Useful values for the `command` field in your routes. Command IDs listed are for
 | Toggle Sidebar | `workbench.action.toggleSidebarVisibility` |
 | New File | `workbench.action.files.newUntitledFile` |
 
-## How It Works (Technical)
-
-The extension runs one speech engine on every platform: a native program in the extension's `bin/` folder, started as a background child process. It uses `decibri` for mic capture and `sherpa-onnx` for keyword spotting, and finds the inference runtime and the voice activity model beside itself, so nothing has to be installed. A local speech model (~17MB) is downloaded to VS Code's global storage on first use, checked against a pinned SHA-256 digest, and cached. The process is started once and kept across handoffs: a handoff closes only the microphone, and the model stays loaded for the resume.
-
-The engine talks to the extension over stdout: `READY`, `DETECTED:<phrase>`, `PAUSED`, `RELEASED`, `ERROR:<message>`, and `DEBUG:<info>`. It takes `pause`, `resume`, and `stop` commands on stdin, and answers `PAUSED` once it has closed the microphone for a handoff, `READY` once it has reopened it, and `RELEASED` once it has closed it for good.
-
-Captured audio passes through voice activity detection (Silero VAD) before it reaches the keyword spotter, so the spotter only runs while someone is speaking and an idle editor does not decode silence. decibri also conditions the signal on the way through: DC offset removal, an 80 Hz high-pass to drop rumble below the voice band, and automatic gain control targeting -18 dBFS so the confidence threshold sees a consistent level.
-
-### Flow
-
-1. The extension builds the phrase list and spawns the engine process
-2. The engine writes `READY` when the mic is open
-3. Each detection is written to stdout as `DETECTED:<phrase>`
-4. The extension reads stdout and matches the phrase to its route
-5. On handoff, the extension sends `pause` and waits for `PAUSED`, for at most 500 ms before it stops the process; the engine keeps its process and model loaded
-6. The route's command fires
-7. After the cooldown, or when you resume a manual route, the engine reopens the microphone
-
-The extension host has one runtime npm dependency, `sentencepiece-js`: SentencePiece compiled to WebAssembly, which turns each wake phrase into the speech model's word pieces. It runs in a worker thread of its own. All native code is isolated in the engine child process.
-
-## Troubleshooting
-
-| Problem | Solution |
-| --- | --- |
-| Reporting a problem | Run **Wake Word: Show Diagnostics**, choose **Copy to Clipboard**, and paste the report into your issue. It has no audio, and your home directory is replaced with `~`. |
-| Engine starts but never detects phrases | Run **Wake Word: Calibrate** to see what the engine hears. Try lowering `wakeWord.confidenceThreshold` (e.g. `0.02`). Speak clearly and close to your microphone. |
-| Some phrases detect better than others | The keyword spotter uses an open-vocabulary model that works best with common English words. Proper nouns and unusual words may need a lower confidence threshold: try lowering `wakeWord.confidenceThreshold` (e.g. `0.02`). The default phrases are tuned for reliable detection at the default of `0.05`. For a custom phrase that is still missed, run **Wake Word: Calibrate** and try an alias made of common words. |
-| Too many false positives | Enable `wakeWord.confirmationMode`, which requires the phrase twice within 5 seconds: say it, pause about three seconds, say it again. The status bar shows `Wake: Confirm` between the two. Also try raising `wakeWord.confidenceThreshold` (e.g. `0.1` to `0.3`) and using longer, more distinctive wake phrases. |
-| "Phrase warning" notification | One of your phrases is a single word, very short, a common word, or clashes with another route's phrase. The output channel says which and why. See [Phrase warnings](#phrase-warnings). |
-| Listening does not resume after a wake phrase | The route uses `handoff: "manual"`, which the default Claude route does. Click **Wake: Paused** in the status bar or run **Wake Word: Enable Listening**. Set `handoff` to `"timer"` on that route to resume after the cooldown instead. |
-| "Failed to start audio engine" | Ensure your microphone is connected and not in use by another application. Check your system sound settings. |
-| Status bar shows "Wake: Error" | Click the status bar item to retry. Check the Output panel for details. If the error persists, try **Wake Word: Reset Microphone Consent** and re-enable. |
-| Extension keeps restarting | The engine retries up to 3 times on crash with increasing delays. If it fails after 3 retries, check that your audio device is working. |
-| Listening fails to start on Windows and the log says "Failed to start voice activity detection" | Install the **Microsoft Visual C++ Redistributable (x64)**, then enable listening again. **Wake Word: Show Diagnostics** shows the same failure on its `Engine binary:` line, which tells it apart from a microphone problem. |
-| "The speech engine is missing from this installation" | The extension was installed for another platform, or the install is incomplete. Reinstall Wake Word from the Marketplace. |
-| Microphone access denied (Windows) | Open Settings → Privacy & security → Microphone and turn on **Microphone access** and **Let desktop apps access your microphone**. |
-| Microphone access denied (macOS) | Open System Settings → Privacy & Security → Microphone and enable access for VS Code (or your editor). |
-| Model download fails | Check your internet connection. The model is ~17MB downloaded from GitHub. If behind a proxy, ensure HTTPS traffic to `github.com` is allowed. |
-| High CPU while idle | The engine gates keyword spotting on voice activity detection, so a quiet room should cost close to nothing. Sustained CPU with no one speaking usually means a noisy input: check the correct microphone is selected and lower its input gain. |
-| Status bar shows "Wake: Other window" | Another window of the same editor is listening. Only one listens at a time, and this window takes over automatically when that one stops. To move listening here now, disable it in the other window. |
-| Wrong microphone is used | Set `wakeWord.audioDevice` to part of the device's name (e.g. `"USB"`) or its index. |
-| "No microphone matching ... was found" | The `wakeWord.audioDevice` value did not match any input device. Compare it with the device names in your system sound settings, or clear it to use the default. |
-
 ## Privacy
 
 All speech recognition runs locally on your machine. No audio data ever leaves your device. A local `sherpa-onnx` model processes audio in memory in the engine child process. Nothing is recorded, stored, or transmitted. The only network request the extension makes is the one-time download of the speech model from GitHub.
+
+## Dependencies
+
+The speech engine is built on two open source projects, both packaged with the extension.
+
+| Project | What it does | Links |
+| --- | --- | --- |
+| decibri | Microphone capture, signal conditioning, and voice activity detection | [GitHub](https://github.com/decibri/decibri) / [decibri.com](https://decibri.com) |
+| sherpa-onnx | Open-vocabulary keyword spotting | [GitHub](https://github.com/k2-fsa/sherpa-onnx) |
+
+The extension host has one runtime npm dependency, `sentencepiece-js`, which turns each wake phrase into the speech model's word pieces. All native code runs in the engine child process.
 
 ## Platform Support
 
