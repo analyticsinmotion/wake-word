@@ -4,6 +4,13 @@ export interface WakePhrase {
   command: string;
   cooldownSeconds?: number;
   /**
+   * Trigger threshold for this route's phrases, in place of the global
+   * `wakeWord.confidenceThreshold`. Same range and meaning: lower detects
+   * more easily. It is clamped by clampThreshold(), which falls back to the
+   * global value when this one is missing or unusable.
+   */
+  confidenceThreshold?: number;
+  /**
    * How listening resumes after this route fires. `timer` (the default)
    * resumes after the cooldown; `manual` waits for the user to resume from
    * the status bar or the Enable command. See resolveHandoff().

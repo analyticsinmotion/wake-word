@@ -107,6 +107,20 @@ export function clampThreshold(
   return Math.max(MIN_THRESHOLD, Math.min(MAX_THRESHOLD, numeric));
 }
 
+/**
+ * The threshold for a log line: the global setting, and how many routes
+ * replace it with a `confidenceThreshold` of their own.
+ *
+ * Without the count, a line naming only the global value reads as though it
+ * applied to every phrase, which it does not once a route carries its own.
+ * The per-route values themselves are in the diagnostics report, one per
+ * route.
+ */
+export function describeThreshold(threshold: number, routes: readonly WakePhrase[]): string {
+  const own = routes.filter((r) => r && r.confidenceThreshold !== undefined).length;
+  return own === 0 ? `${threshold}` : `${threshold} (overridden by ${plural(own, "route")})`;
+}
+
 // -- Debounce -----------------------------------------------------------
 
 /**
@@ -729,6 +743,7 @@ export interface DiagnosticsInput {
   modelPresent: boolean;
   modelSha256: string;
   audioDevice: string;
+  /** The global wakeWord.confidenceThreshold, already clamped. */
   threshold: number;
   cooldownSeconds: number;
   confirmationMode: boolean;
@@ -782,8 +797,16 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     const handoff = resolveHandoff(route.handoff);
     const cooldown =
       handoff === "timer" && typeof route.cooldownSeconds === "number" ? `, ${route.cooldownSeconds}s` : "";
+    // Only for a route that set one, and the value its keyword lines carry:
+    // the same clamp the engine's config line goes through, falling back to
+    // the global threshold reported above.
+    const threshold =
+      route.confidenceThreshold === undefined
+        ? ""
+        : `, threshold ${clampThreshold(route.confidenceThreshold, input.threshold)}`;
     lines.push(
-      `  "${route.label}" [${normalizePhrases(route.phrase).join(", ")}] -> ${route.command} (${handoff}${cooldown})`
+      `  "${route.label}" [${normalizePhrases(route.phrase).join(", ")}] -> ${route.command} ` +
+        `(${handoff}${cooldown}${threshold})`
     );
   }
 

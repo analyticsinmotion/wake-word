@@ -16,11 +16,12 @@ import { clampThreshold } from "./wakeWordCore";
  *         Higher values help words the model saw little of in training, such
  *         as proper nouns, at the cost of more false triggers.
  *
- *   #<threshold>  Per-phrase trigger threshold, from the
- *         wakeWord.confidenceThreshold setting: the acoustic probability, 0
+ *   #<threshold>  Per-phrase trigger threshold: the acoustic probability, 0
  *         to 1, the decoded sequence must reach before the spotter reports
  *         it. It replaces the spotter's global threshold for that phrase, and
  *         every line carries one, so this is where the setting takes effect.
+ *         The value is the route's own `confidenceThreshold` where it has
+ *         one, otherwise the global wakeWord.confidenceThreshold setting.
  *
  * The boost and the 0.05 default were tested against the default routes on
  * Windows with the gigaspeech 3.3M model. Without boosting, uncommon words in
@@ -38,9 +39,15 @@ export const WORD_BOUNDARY = "▁";
 /** The boost score written on every keyword line. */
 export const BOOST_SCORE = "3.0";
 
-/** A route as the keyword builder reads it. Only `phrase` is used. */
+/**
+ * A route as the keyword builder reads it: the phrase or aliases, and the
+ * route's own trigger threshold if it set one. Both are `unknown` because
+ * they come from user-edited JSON; buildKeywordSpec() skips what it cannot
+ * use rather than throwing.
+ */
 export interface PhraseSource {
   phrase?: unknown;
+  confidenceThreshold?: unknown;
 }
 
 /** How one phrase was tokenised, for the debug log. */
@@ -81,11 +88,13 @@ export interface KeywordSpec {
 
 /**
  * Every phrase string the keyword builder uses, with the text it tokenises:
- * upper-cased and trimmed. Non-string and blank phrases are left out.
+ * upper-cased and trimmed. Non-string and blank phrases are left out. Each
+ * one carries its route's `confidenceThreshold` as configured, so every
+ * alias of a route gets that route's threshold.
  */
 function* phraseStrings(
   phrases: readonly (PhraseSource | null | undefined)[] | null | undefined
-): Generator<{ phrase: string; text: string }> {
+): Generator<{ phrase: string; text: string; threshold: unknown }> {
   for (const p of phrases || []) {
     if (!p) {
       continue;
@@ -99,7 +108,7 @@ function* phraseStrings(
       if (text.length === 0) {
         continue;
       }
-      yield { phrase: r, text };
+      yield { phrase: r, text, threshold: p.confidenceThreshold };
     }
   }
 }
@@ -136,10 +145,12 @@ export function decodePieces(tokens: readonly string[]): string {
 /**
  * Build the sherpa-onnx keyword list and the decoded-to-spoken lookup map.
  *
- * `encodePieces` is the SentencePiece encoder. `threshold` is the
- * wakeWord.confidenceThreshold setting, written as every line's trigger
- * threshold; it is clamped here as well, so a missing or unusable value gives
- * the default rather than a line sherpa-onnx cannot parse.
+ * `encodePieces` is the SentencePiece encoder. `threshold` is the global
+ * wakeWord.confidenceThreshold setting, written as the trigger threshold of
+ * every line whose route did not set a `confidenceThreshold` of its own. Both
+ * values go through the same clamp, the route's falling back to the global
+ * one, so a missing or unusable value gives a threshold in range rather than
+ * a line sherpa-onnx cannot parse.
  *
  * Non-string and blank phrases are skipped rather than thrown on:
  * wakeWord.routes is user-edited JSON and a bad entry must not take the engine
@@ -155,13 +166,13 @@ export function buildKeywordSpec(
   threshold?: unknown,
   vocabulary?: ReadonlySet<string>
 ): KeywordSpec {
-  const trigger = clampThreshold(threshold);
+  const globalTrigger = clampThreshold(threshold);
   const phraseMap: Record<string, string> = {};
   const keywordLines: string[] = [];
   const details: KeywordDetail[] = [];
   const skipped: SkippedPhrase[] = [];
 
-  for (const { phrase, text } of phraseStrings(phrases)) {
+  for (const { phrase, text, threshold: routeThreshold } of phraseStrings(phrases)) {
     const tokens = encodePieces(text);
     const tokenStr = tokens.join(" ");
     const decoded = decodePieces(tokens);
@@ -172,6 +183,7 @@ export function buildKeywordSpec(
         continue;
       }
       phraseMap[decoded] = phrase.toLowerCase().trim();
+      const trigger = clampThreshold(routeThreshold, globalTrigger);
       keywordLines.push(`${tokenStr} :${BOOST_SCORE} #${trigger}`);
       details.push({ phrase, tokens: tokenStr, decoded });
     }

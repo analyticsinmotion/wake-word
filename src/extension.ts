@@ -19,6 +19,7 @@ import {
   SessionStats,
   clampThreshold,
   createSessionStats,
+  describeThreshold,
   detectPhraseCollisions,
   evaluateConfirmation,
   filterValidRoutes,
@@ -428,7 +429,11 @@ function startListening() {
   const threshold = clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD));
   const audioDevice = readAudioDevice(config);
   const deviceNote = audioDevice ? `, device="${audioDevice}"` : "";
-  log("info", `Starting: ${routes.length} routes, threshold=${threshold}, devMode=${isDevMode}${deviceNote}`);
+  log(
+    "info",
+    `Starting: ${routes.length} routes, threshold=${describeThreshold(threshold, routes)}, ` +
+      `devMode=${isDevMode}${deviceNote}`
+  );
   log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
   reportPhraseChecks(routes);
 
@@ -860,7 +865,10 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
-  log("info", `Calibration: starting (${seconds}s, threshold=${threshold}, was ${prior.kind})`);
+  log(
+    "info",
+    `Calibration: starting (${seconds}s, threshold=${describeThreshold(threshold, routes)}, was ${prior.kind})`
+  );
 
   const run: CalibrationRun = {
     detections: [],

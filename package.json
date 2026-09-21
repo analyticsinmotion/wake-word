@@ -109,6 +109,12 @@
                 "maximum": 300,
                 "description": "Override the global cooldown for this route (seconds). Falls back to wakeWord.cooldownSeconds if not set."
               },
+              "confidenceThreshold": {
+                "type": "number",
+                "minimum": 0.01,
+                "maximum": 0.9,
+                "description": "Override the global trigger threshold for this route (0.01 to 0.9). Lower values detect this route's phrases more easily but increase false positives. Applies to every phrase on the route. Falls back to wakeWord.confidenceThreshold if not set."
+              },
               "handoff": {
                 "type": "string",
                 "enum": ["timer", "manual"],
