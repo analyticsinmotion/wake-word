@@ -119,19 +119,16 @@ describe("readVocabulary", () => {
 });
 
 describe("the sentencepiece-js dependency", () => {
-  it("is pinned to the version the Node engine pins, so both tokenise alike", () => {
-    const manifest = (dir: string) =>
-      JSON.parse(readFileSync(path.join(__dirname, "..", "..", dir, "package.json"), "utf8"));
-    const host = manifest(".").dependencies["sentencepiece-js"];
-    expect(host).toMatch(/^\d+\.\d+\.\d+$/);
-    expect(host).toBe(manifest("engine").dependencies["sentencepiece-js"]);
+  it("is pinned to an exact version, because its pieces are the keyword lines", () => {
+    const manifest = JSON.parse(readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf8"));
+    expect(manifest.dependencies["sentencepiece-js"]).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });
 
 /**
  * The pieces sentencepiece-js 1.1.0 produces from the model's bpe.model for
- * each upper-cased phrase. The Node engine builds its keyword lines from
- * exactly these, and the Rust engine was checked against the same table.
+ * each upper-cased phrase. The keyword lines are built from exactly these,
+ * and the engine was checked against the same table.
  */
 const REFERENCE_PIECES: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["HEY CLAUDE", ["▁HE", "Y", "▁C", "LA", "U", "DE"]],

@@ -2,7 +2,8 @@
 
 Measures false rejection rate (FRR), false acceptance rate (FAR), and
 detection latency for the Wake Word keyword spotter, using the same
-sherpa-onnx model, keyword list, and threshold the extension runs.
+sherpa-onnx release, model, keyword list, and threshold the extension
+runs.
 
 This is the framework and a starter fixture. The numbers only mean
 something once real recordings are in `fixtures/`. It is a manual tool,
@@ -78,11 +79,19 @@ node tests/acoustic/run-benchmark.js [--model-dir <path>] [--threshold <n>]
                                      [--phrases <a,b,c>] [--fixtures <dir>] [--verbose]
 ```
 
-The script needs `engine/node_modules` (`cd engine && npm install`) and
-the keyword spotting model. Without `--model-dir` it looks in each
-editor's global storage for the copy the extension downloads when the
-engine first starts, so the simplest way to get the model is to enable
-listening once and let the extension fetch it. To use
+The script needs three things:
+
+```bash
+npm run compile                              # dist/, for the keyword builder
+npm install --no-save sherpa-onnx@<version>  # the version engine-rs/Cargo.toml pins
+```
+
+and the keyword spotting model. The engine links sherpa-onnx as a C
+library, so the npm package is installed only to run this benchmark;
+`--no-save` keeps it out of the manifest. Without `--model-dir` the
+script looks in each editor's global storage for the copy the extension
+downloads when the engine first starts, so the simplest way to get the
+model is to enable listening once and let the extension fetch it. To use
 a copy elsewhere, extract the tarball named in `src/sherpaEngine.ts` and
 pass its directory.
 
@@ -128,13 +137,16 @@ tests/acoustic/
   README.md              this file
   run-benchmark.js       drives the sherpa-onnx spotter over the fixtures
   lib/benchmark-core.js  WAV parsing, fixture naming, statistics, report
+  lib/model-path.js      forward-slash model paths for the sherpa-onnx package
   benchmarkCore.test.js  unit tests for the pure module (run by npm test)
+  modelPath.test.js      unit tests for the path helper (run by npm test)
   fixtures/
     positive/            <phrase>-<nn>.wav
     negative/            anything that must not trigger; silence-10s.wav is committed
 ```
 
-`benchmark-core.js` has no dependency on the engine and is covered by
-`npm test`. `tests/unit/benchmarkConstants.test.ts` checks that its copy
-of the default phrases and the model file list match the extension's, so
-a change to either fails the suite until the benchmark follows.
+`benchmark-core.js` loads no model and no native package, and is covered
+by `npm test`. `tests/unit/benchmarkConstants.test.ts` checks that its
+copy of the default phrases and the model file list match the
+extension's, so a change to either fails the suite until the benchmark
+follows.

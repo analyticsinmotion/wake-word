@@ -1,9 +1,6 @@
 //! The keyword spotter: the decode loop, the sherpa-onnx engine underneath it,
 //! and the preparation step that builds both.
 //!
-//! Port of `engine/lib/spotter.js` and of the model half of `main()` in
-//! `engine/audio-engine.js`.
-//!
 //! The model is a streaming transducer. It is loaded once and kept for the life
 //! of the process; what changes is its stream, the decoding state for the audio
 //! fed so far. The stream is restarted in three places, and each one exists to
@@ -186,18 +183,18 @@ impl SpeechSink for SpotterSlot {
 
 /// The spotter configuration.
 ///
-/// Every value is the one the Node engine passes to `createKws()`, so the
-/// model, the keyword lines, the boost, and the thresholds mean the same thing
-/// in both engines. The keyword lines are handed over in memory; nothing is
+/// A unit test pins every value, because the model, the keyword lines, the
+/// boost, and the thresholds only mean what they are documented to mean under
+/// this configuration. The keyword lines are handed over in memory; nothing is
 /// written to disk.
 ///
 /// `keywords_threshold` is the spotter-wide trigger threshold. Every keyword
 /// line carries its own `#` threshold, which replaces it, so the value decides
 /// nothing; it is passed because a line without the field would fall back to
-/// it. `modeling_unit` and `bpe_vocab` are passed because the Node engine
-/// passes them. The keyword spotter expects lines that are already tokenised
-/// and uses neither: it creates a spotter with `bpe_vocab` naming an empty
-/// file, or no file at all.
+/// it. `modeling_unit` and `bpe_vocab` are set for completeness. The keyword
+/// spotter expects lines that are already tokenised and uses neither: it
+/// creates a spotter with `bpe_vocab` naming an empty file, or no file at
+/// all.
 pub fn spotter_config(model_dir: &str, threshold: f64, keywords: &str) -> KeywordSpotterConfig {
     let file = |name: &str| {
         Some(
@@ -515,9 +512,8 @@ fn listening_for(lines: &[String], phrase_map: &PhraseMap) -> Vec<String> {
 
 /// Check the keyword lines and load the model.
 ///
-/// The lines arrive tokenised, so this is the model half of the Node engine's
-/// startup: every line is checked against the model's token table, then the
-/// transducer loads. A line the spotter cannot take, a token table that cannot
+/// The lines arrive tokenised: every line is checked against the model's token
+/// table, then the transducer loads. A line the spotter cannot take, a token table that cannot
 /// be read, and a model that cannot load are all model load failures.
 /// `progress` carries the debug line and the phase timing as they happen.
 ///
@@ -914,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn the_configuration_matches_the_node_engine_field_for_field() {
+    fn the_configuration_is_pinned_field_for_field() {
         let config = spotter_config("models", 0.05, "\u{2581}HE Y :3.0 #0.05");
         let file = |name: &str| {
             Some(

@@ -12,18 +12,15 @@
 //! inside a phrase that is shorter than the holdoff does not split the phrase
 //! into two segments.
 //!
-//! The policy is decibri's: its Node.js microphone applies exactly this state
-//! machine (`Microphone._processVadValue`), with a threshold of 0.5 and a
-//! holdoff of 300 ms by default. The Rust crate scores audio but leaves the
-//! transitions to its caller, so they are implemented here.
+//! The policy is decibri's, with its defaults: a threshold of 0.5 and a
+//! holdoff of 300 ms. The crate scores audio but leaves the transitions to its
+//! caller, so they are implemented here.
 //!
 //! The holdoff runs from the moment the first quiet chunk has arrived, which is
-//! the end of that chunk. decibri's live microphone starts a 300 ms timer when
-//! it scores the first chunk below the threshold, and it scores a chunk only
-//! after delivering it, so the timer comes due as the third chunk after that
-//! one arrives, and that chunk is delivered first. With 100 ms chunks, silence
-//! is therefore declared on the fourth consecutive quiet chunk, and everything
-//! up to and including it is part of the speech segment.
+//! the end of that chunk, so with 100 ms chunks the 300 ms comes due as the
+//! fourth consecutive quiet chunk arrives. Silence is therefore declared on
+//! that chunk, and everything up to and including it is part of the speech
+//! segment.
 //!
 //! Where the holdoff starts decides how much audio follows a phrase before the
 //! segment ends, and the keyword spotter depends on that audio. It decodes in

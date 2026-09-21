@@ -1,10 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   DiagnosticsInput,
-  MIN_ENGINE_NODE_MAJOR,
   createSessionStats,
   formatDiagnostics,
-  nodeVersionNote,
   recordDetection,
   redactHome,
 } from "../../src/wakeWordCore";
@@ -19,25 +17,28 @@ const ROUTES: WakePhrase[] = [
     command: "workbench.action.terminal.focus",
     cooldownSeconds: 10,
   },
-  { label: "Copilot", phrase: "hey copilot", command: "workbench.action.chat.open" },
+  { label: "Chat", phrase: "hey chat", command: "workbench.action.chat.open" },
 ];
 
 const STARTED = Date.UTC(2026, 8, 15, 9, 0, 0);
+
+const ENGINE_BINARY =
+  "C:\\Users\\Ann\\.vscode\\extensions\\analytics-in-motion.wake-word\\bin\\wake-word-engine.exe";
 
 function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
   const stats = createSessionStats(STARTED);
   recordDetection(stats, "Claude");
   stats.engineStarts = 2;
   return {
-    extensionVersion: "0.13.0",
+    extensionVersion: "0.14.0",
     platform: "win32",
     arch: "x64",
     osRelease: "10.0.26200",
     editorName: "Visual Studio Code",
     vscodeVersion: "1.104.0",
     hostNodeVersion: "v22.19.0",
-    engineNodePath: "C:\\Program Files\\nodejs\\node.exe",
-    engineNodeVersion: "v22.18.0",
+    engineBinaryPath: ENGINE_BINARY,
+    engineBinaryStatus: "self-test OK, sherpa-onnx=1.13.8",
     state: "listening",
     isListening: true,
     isPaused: false,
@@ -67,12 +68,13 @@ describe("formatDiagnostics", () => {
   it("renders the full report", () => {
     expect(formatDiagnostics(input())).toEqual([
       "=== Wake Word Diagnostics ===",
-      "Version: 0.13.0",
+      "Version: 0.14.0",
       "Platform: win32 x64 (10.0.26200)",
       "VS Code: 1.104.0 (Visual Studio Code)",
       "Node.js (extension host): v22.19.0",
-      "Node.js (engine): C:\\Program Files\\nodejs\\node.exe (v22.18.0)",
       "Engine: sherpa-onnx",
+      "Engine binary: ~\\.vscode\\extensions\\analytics-in-motion.wake-word\\bin\\wake-word-engine.exe " +
+        "(self-test OK, sherpa-onnx=1.13.8)",
       "State: listening",
       "Listening: true",
       "Paused: false",
@@ -88,7 +90,7 @@ describe("formatDiagnostics", () => {
       "Routes: 3",
       '  "Claude" [hey claude] -> claude-vscode.focus (manual)',
       '  "Terminal" [hey computer, open terminal] -> workbench.action.terminal.focus (timer, 10s)',
-      '  "Copilot" [hey copilot] -> workbench.action.chat.open (timer)',
+      '  "Chat" [hey chat] -> workbench.action.chat.open (timer)',
       "Phrase checks: no warnings",
       "Lock: held by this window (pid 4242, since 2026-09-15T09:00:00.000Z)",
       "Session: 12min, 1 detection (Claude: 1), 0 errors, 2 engine starts, 0 cooldowns",
@@ -115,20 +117,20 @@ describe("formatDiagnostics", () => {
     expect(lines.slice(at + 1, at + 3)).toEqual(["  Phrase warning (Go): one", "  Phrase collision: two"]);
   });
 
-  it("flags an engine Node.js older than the supported version", () => {
-    expect(formatDiagnostics(input({ engineNodeVersion: "v20.11.1" }))).toContain(
-      "Node.js (engine): C:\\Program Files\\nodejs\\node.exe (v20.11.1) (Wake Word requires 22 or later)"
-    );
+  it("reports an engine binary that is not there", () => {
+    const lines = formatDiagnostics(input({ engineBinaryStatus: "missing" }));
+    expect(lines.some((line) => line.endsWith("wake-word-engine.exe (missing)"))).toBe(true);
   });
 
-  it("reports a Node.js that could not be run as given", () => {
-    const lines = formatDiagnostics(input({ engineNodePath: "node", engineNodeVersion: "could not run: spawn node ENOENT" }));
-    expect(lines).toContain("Node.js (engine): node (could not run: spawn node ENOENT)");
+  it("reports an engine binary that could not be run, with the reason", () => {
+    const lines = formatDiagnostics(input({ engineBinaryStatus: "could not run: spawn EACCES" }));
+    expect(lines.some((line) => line.endsWith("(could not run: spawn EACCES)"))).toBe(true);
   });
 
   it("reports the engine binary and its self-test, with the home directory redacted", () => {
     const lines = formatDiagnostics(
       input({
+        platform: "linux",
         homeDir: "/home/ann",
         engineBinaryPath: "/home/ann/.vscode/extensions/wake-word/bin/wake-word-engine",
         engineBinaryStatus:
@@ -140,10 +142,6 @@ describe("formatDiagnostics", () => {
       "Engine binary: ~/.vscode/extensions/wake-word/bin/wake-word-engine " +
         "(self-test OK, sherpa-onnx=1.13.8, ort=~/.vscode/extensions/wake-word/bin/libonnxruntime.so)"
     );
-  });
-
-  it("leaves the engine binary line out when it is not given one", () => {
-    expect(formatDiagnostics(input()).some((line) => line.startsWith("Engine binary:"))).toBe(false);
   });
 
   it("reports the settings it is given", () => {
@@ -164,11 +162,14 @@ describe("formatDiagnostics", () => {
   it("redacts the home directory from every line, ignoring case on Windows", () => {
     const lines = formatDiagnostics(
       input({
-        engineNodePath: "c:\\users\\ann\\AppData\\Local\\fnm\\node.exe",
+        engineBinaryPath: "c:\\users\\ann\\.vscode\\extensions\\wake-word\\bin\\wake-word-engine.exe",
         audioDevice: "C:\\Users\\Ann",
       })
     );
-    expect(lines).toContain("Node.js (engine): ~\\AppData\\Local\\fnm\\node.exe (v22.18.0)");
+    expect(lines).toContain(
+      "Engine binary: ~\\.vscode\\extensions\\wake-word\\bin\\wake-word-engine.exe " +
+        "(self-test OK, sherpa-onnx=1.13.8)"
+    );
     expect(lines).toContain("Audio device: ~");
     expect(lines.join("\n")).not.toMatch(/ann/i);
   });
@@ -178,30 +179,14 @@ describe("formatDiagnostics", () => {
       input({
         platform: "linux",
         homeDir: "/home/ann",
-        engineNodePath: "/home/ann/.nvm/versions/node/v22.18.0/bin/node",
+        engineBinaryPath: "/home/ann/.vscode/extensions/wake-word/bin/wake-word-engine",
         modelDir: "/home/ann/.config/Code/User/globalStorage/x",
       })
     );
-    expect(lines).toContain("Node.js (engine): ~/.nvm/versions/node/v22.18.0/bin/node (v22.18.0)");
+    expect(lines).toContain(
+      "Engine binary: ~/.vscode/extensions/wake-word/bin/wake-word-engine (self-test OK, sherpa-onnx=1.13.8)"
+    );
     expect(lines).toContain("Model dir: ~/.config/Code/User/globalStorage/x");
-  });
-});
-
-describe("nodeVersionNote", () => {
-  it("says nothing for a supported version", () => {
-    expect(MIN_ENGINE_NODE_MAJOR).toBe(22);
-    expect(nodeVersionNote("v22.0.0")).toBe("");
-    expect(nodeVersionNote("v24.3.1")).toBe("");
-  });
-
-  it("notes an older version", () => {
-    expect(nodeVersionNote("v18.19.0")).toBe(" (Wake Word requires 22 or later)");
-    expect(nodeVersionNote("20.11.1")).toBe(" (Wake Word requires 22 or later)");
-  });
-
-  it("says nothing about text that is not a version", () => {
-    expect(nodeVersionNote("could not run: spawn node ENOENT")).toBe("");
-    expect(nodeVersionNote("")).toBe("");
   });
 });
 
@@ -237,9 +222,9 @@ describe("redactHome", () => {
   });
 
   it("leaves text alone for a root, drive-only, or empty home", () => {
-    expect(redactHome("/usr/bin/node", "/", false)).toBe("/usr/bin/node");
-    expect(redactHome("C:\\node.exe", "C:\\", true)).toBe("C:\\node.exe");
-    expect(redactHome("/usr/bin/node", "", false)).toBe("/usr/bin/node");
+    expect(redactHome("/opt/wake-word/bin", "/", false)).toBe("/opt/wake-word/bin");
+    expect(redactHome("C:\\wake-word.exe", "C:\\", true)).toBe("C:\\wake-word.exe");
+    expect(redactHome("/opt/wake-word/bin", "", false)).toBe("/opt/wake-word/bin");
   });
 });
 

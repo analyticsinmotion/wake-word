@@ -1,14 +1,11 @@
 # wake-word-engine
 
-A Rust implementation of `engine/audio-engine.js`: the child process the Wake
-Word extension talks to over stdin and stdout.
+The child process the Wake Word extension talks to over stdin and stdout.
 
 **The extension runs this binary.** `SherpaEngine` in `src/sherpaEngine.ts`
 spawns `bin/wake-word-engine` from the installed extension, with no arguments.
 Each platform `.vsix` carries it, built in CI, in `bin/` with the files it
 loads at run time; see [Release builds](#release-builds).
-`engine/audio-engine.js` under system Node.js is still packaged, and
-`ENGINE_KIND` in `src/sherpaEngine.ts` selects it instead.
 
 ## What it does
 
@@ -17,17 +14,16 @@ It speaks the whole protocol, opens a real microphone through the
 with Silero voice activity detection, and feeds what passes the gate to a
 [sherpa-onnx](https://crates.io/crates/sherpa-onnx) keyword spotter. When the
 spotter hears a configured phrase the engine writes `DETECTED:<phrase>`. The
-model files, the keyword line syntax, the boost, and the thresholds are the
-Node engine's. The engine has no tokeniser: the extension tokenises the wake
-phrases and sends the finished keyword lines in the config line.
+engine has no tokeniser: the extension tokenises the wake phrases and sends the
+finished keyword lines in the config line.
 
-The Node engine needs a system Node.js 22 or later on the user's machine, plus
-npm packages with native addons shipped inside the `.vsix`. A native binary
-removes the Node.js prerequisite and the ABI matching that goes with it.
+Nothing has to be installed to run it. ONNX Runtime and the voice activity
+model are loaded at run time from beside the executable, and everything else,
+the keyword spotter included, is linked in.
 
 ### Capture
 
-Every microphone is opened with the options the Node engine uses:
+Every microphone is opened with these options:
 
 | Option | Value |
 | --- | --- |
@@ -45,13 +41,15 @@ decibri's detector feed with Silero, clamps the delivered samples to [-1, 1]
 applies the speech and silence transitions: speech on the first chunk scoring
 0.5 or more, and silence once the score has stayed below it for 300 ms after
 the first quiet chunk arrived, which with 100 ms chunks is the fourth quiet
-chunk. That is when decibri's Node.js microphone declares it, and all four
-chunks reach the spotter as the tail of the segment. While silent, chunks wait
+chunk, and all four reach the spotter as the tail of the segment. The holdoff
+runs from the arrival of that first quiet chunk, its end and not its start:
+counting from its start ends every segment 100 ms sooner and cuts the tail off
+a phrase said on its own. While silent, chunks wait
 in a pre-roll ring; on speech the ring is flushed oldest first, ahead of the
 chunk that crossed the threshold, and chunks pass straight through until
 silence. The ring holds four chunks, so with the chunk that crossed the
-threshold the spotter is handed 500 ms of lead-in, the same five chunks the
-Node engine hands its spotter.
+threshold the spotter is handed 500 ms of lead-in, five chunks in all. One
+chunk more or less moves every decode step, so the figure is pinned by a test.
 
 decibri's detector feed is the resampled mono signal before DC removal, the
 highpass, and AGC, so conditioning does not change what the detector hears.
@@ -61,7 +59,7 @@ On Windows, decibri names each input by its endpoint name alone, such as
 Settings shows in brackets after it. Two devices can therefore share a name,
 and a name substring cannot tell them apart; select such a device by index.
 
-Capture errors are reported with the messages `engine/lib/mic-errors.js` uses,
+Capture errors are reported by `src/mic_errors.rs`,
 switching on decibri's stable error codes, and naming `wakeWord.audioDevice`
 when the user chose a device. A stream that fails while running, such as a
 device that is unplugged, is fatal: `ERROR:` and exit 1, so the extension
@@ -78,7 +76,7 @@ engine configures it:
 | encoder, decoder, joiner | the three `*-epoch-12-avg-2-chunk-16-left-64.int8.onnx` files in `modelDir` |
 | tokens | `tokens.txt` |
 | provider, threads | `cpu`, 1 |
-| `modeling_unit`, `bpe_vocab` | `bpe`, `bpe.model`, as the Node engine passes them; the keyword spotter uses neither and does not check that the file exists |
+| `modeling_unit`, `bpe_vocab` | `bpe`, `bpe.model`; the keyword spotter uses neither and does not check that the file exists |
 | max active paths | 4 |
 | trailing blanks | 1 |
 | keywords score | 1.0 |
@@ -96,7 +94,7 @@ pieces (`HEY CLAUDE`), and the engine maps that back through `phraseMap` to the
 phrase as configured, lower-cased, before writing `DETECTED:`.
 
 The pieces come from the model's SentencePiece file, `bpe.model`, which the
-extension reads with the same tokeniser the Node engine uses. Despite its name
+extension reads in a worker thread of its own. Despite its name
 the file is a Unigram model with the `nmt_nfkc` normaliser: pieces are chosen
 by a best-path search over piece scores, not by merge rules, and full-width and
 ligature forms fold to plain letters first.
@@ -127,7 +125,7 @@ piece and the blank after it. Audio still undecoded when a segment ends is cut
 off from the phrase by the reset. How much audio follows a phrase before the
 segment ends, and how much precedes it, therefore decides whether a phrase said
 on its own is detected, which is why the silence holdoff and the lead-in above
-match the Node engine's exactly.
+are pinned by tests.
 
 ## Building
 
@@ -276,7 +274,7 @@ stale, and verifies the signature.
 **The package check.** After `vsce package`, `scripts/verify-vsix.mjs` at the
 repository root reads the `.vsix` and fails unless:
 
-- the extension, the Node engine, and `node_modules/sentencepiece-js` are in it;
+- the extension and `node_modules/sentencepiece-js` are in it;
 - `bin/` holds the engine for the target's architecture, stored executable on
   macOS and Linux, and the pinned runtime files and notices;
 - on Windows the engine imports no C runtime DLL and does not import ONNX
@@ -345,19 +343,8 @@ the microphone cannot open without them.
 2. the `WAKE_WORD_VAD_MODEL` environment variable;
 3. `silero_vad.onnx` in the directory that holds the executable.
 
-For local development, the decibri npm package the Node engine installs
-carries both files: the model in `engine/node_modules/decibri/models/` and
-ONNX Runtime in the platform package under `engine/node_modules/@decibri/`.
-Point the environment at them:
-
-```bash
-# from the repository root, after `cd engine && npm install`
-export ORT_DYLIB_PATH="$PWD/engine/node_modules/@decibri/decibri-win32-x64-msvc/onnxruntime.dll"
-export WAKE_WORD_VAD_MODEL="$PWD/engine/node_modules/decibri/models/silero_vad.onnx"
-```
-
-Or lay the binary out as the `.vsix` does, with both files beside it, which
-needs no variables:
+The simplest way to get both for local development is to lay the binary out as
+the `.vsix` does, with both files beside it, which needs no variables:
 
 ```bash
 # from the repository root, after `cargo build --release` in engine-rs/
@@ -422,8 +409,8 @@ DEBUG:VAD: silence
 
 ## The protocol
 
-Identical to the Node engine's. The extension's side of it lives in
-`src/sherpaEngine.ts` and `src/wakeWordCore.ts`.
+The extension's side of it lives in `src/sherpaEngine.ts` and
+`src/wakeWordCore.ts`.
 
 ### stdin
 
@@ -431,7 +418,6 @@ The first line is a JSON config object:
 
 ```json
 {
-  "phrases": [{ "phrase": "hey claude", "label": "Claude" }],
   "threshold": 0.05,
   "modelDir": "<path>",
   "debugMode": false,
@@ -453,13 +439,12 @@ a phrase whose pieces are not all in the model's token table, with a warning,
 so one bad route does not take the engine down; the engine's own check, above,
 catches any such line that arrives anyway.
 
-`phrases` is there for engines that tokenise for themselves; this one does not
-read it. `threshold` is clamped to 0.01 to 0.9, defaulting to 0.05, and passed
-as the spotter-wide threshold; each line carries its own. `modelDir` is the
-keyword spotting model directory described above. `audioDevice` is a device
-index when it is nothing but digits, otherwise a case-insensitive name
-substring; empty means the system default. `vadModelPath` and `ortLibraryPath`
-are described above; the extension does not send them.
+`threshold` is clamped to 0.01 to 0.9, defaulting to 0.05, and passed as the
+spotter-wide threshold; each line carries its own. `modelDir` is the keyword
+spotting model directory described above. `audioDevice` is a device index when
+it is nothing but digits, otherwise a case-insensitive name substring; empty
+means the system default. `vadModelPath` and `ortLibraryPath` are described
+above; the extension does not send them.
 
 Every line after the config is a command:
 
@@ -573,18 +558,17 @@ stream can be replaced safely once a pause has closed the microphone.
 | Crate | Why |
 | --- | --- |
 | `decibri` `=6.3.0` | microphone capture, conditioning, device selection, Silero voice activity detection, and the typed errors. Built without default features, with `capture`, `vad`, `gain`, and `ort-load-dynamic` |
-| `sherpa-onnx` `=1.13.8` | the keyword spotter. The same release as the Node engine's `sherpa-onnx` package, so the model and its configuration carry over. Built with `static`, which links the C library and its own ONNX Runtime into the executable |
+| `sherpa-onnx` `=1.13.8` | the keyword spotter. Pinned exactly: the model files and the keyword line syntax are read by this version of the C library. Built with `static`, which links the C library and its own ONNX Runtime into the executable |
 | `serde_json` | the config line |
 
 The config line is read out of a `serde_json::Value` field by field rather than
-deserialised into a struct, because the Node engine coerces rather than
-rejects, and a derived struct would turn a value of the wrong type into a
-fatal parse error instead of ignoring it.
+deserialised into a struct. It carries user-edited settings, and a derived
+struct would turn a value of the wrong type into a fatal parse error instead of
+defaulting the field and opening the microphone.
 
 decibri is pinned to an exact version and bumped deliberately. `gain` provides
 the AGC stage. decibri's default feature set would also build playback, the
 denoise stage, and echo cancellation, none of which the engine uses.
 
-sherpa-onnx is pinned to the release the Node engine uses and the two are
-bumped together; a unit test fails if the library that was linked reports a
-different version from the one `Cargo.toml` pins.
+sherpa-onnx is pinned exactly; a unit test fails if the library that was linked
+reports a different version from the one `Cargo.toml` pins.

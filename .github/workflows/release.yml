@@ -40,40 +40,6 @@ jobs:
 
       - run: npm ci
 
-      - name: Install engine dependencies
-        run: cd engine && npm install
-
-      # npm installs only the @decibri platform package whose os/cpu fields
-      # match the runner, so this directory normally holds one package already.
-      # This step turns that into a guarantee: any other platform's binary is
-      # removed, and the build fails unless exactly one package matching the
-      # target remains. The smoke test and the .vsix below then see the tree
-      # that ships.
-      - name: Prune non-target engine binaries
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          cd engine/node_modules/@decibri
-          kept=0
-          for dir in */; do
-            case "$dir" in
-              *"$TARGET"*) kept=$((kept + 1)) ;;
-              *) echo "Removing $dir"; rm -rf "$dir" ;;
-            esac
-          done
-          echo "Remaining @decibri packages:"
-          ls -la
-          if [ "$kept" -ne 1 ]; then
-            echo "::error::Expected exactly one @decibri package matching $TARGET, found $kept"
-            exit 1
-          fi
-
-      # Fail the release before publishing if the shipped engine tree cannot
-      # load on this platform.
-      - name: Smoke test engine
-        run: node engine/audio-engine.js --self-test
-
       - name: Lint
         if: matrix.lint
         run: npm run lint

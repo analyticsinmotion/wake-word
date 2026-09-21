@@ -13,8 +13,8 @@ export const DETECTION_DEBOUNCE_MS = 3000;
 
 /**
  * Bounds enforced on `wakeWord.confidenceThreshold`, and its default. The
- * value becomes every keyword line's trigger threshold in the engine, and
- * clampKeywordThreshold() in engine/lib/control.js repeats these numbers.
+ * value becomes every keyword line's trigger threshold in the engine, whose
+ * config.rs repeats these numbers, and the package.json schema states them.
  */
 export const MIN_THRESHOLD = 0.01;
 export const MAX_THRESHOLD = 0.9;
@@ -120,28 +120,6 @@ export function shouldDebounce(
   windowMs: number = DETECTION_DEBOUNCE_MS
 ): boolean {
   return now - lastDetectionTime < windowMs;
-}
-
-// -- Retired settings ---------------------------------------------------
-
-/**
- * Logged when settings.json still carries `wakeWord.engine: "windows"`.
- *
- * 0.13.0 removed the setting along with the engine it selected. VS Code
- * ignores a setting nothing contributes, so the stale value does no harm,
- * but a user who chose that engine deliberately should be told where it went.
- */
-export const RETIRED_ENGINE_NOTICE =
-  "The 'windows' engine has been retired. Wake Word now uses the sherpa-onnx " +
-  "engine on all platforms. You can remove wakeWord.engine from your settings.";
-
-/**
- * The notice for a leftover `wakeWord.engine` value, or null when there is
- * nothing to say. Only `windows` gets one: `auto` and `sherpa` already
- * describe what runs now.
- */
-export function retiredEngineNotice(value: unknown): string | null {
-  return value === "windows" ? RETIRED_ENGINE_NOTICE : null;
 }
 
 // -- stdout protocol ----------------------------------------------------
@@ -710,28 +688,12 @@ export function formatPhraseChecksSummary(count: number): string {
 
 // -- Diagnostics --------------------------------------------------------
 
-/** The oldest Node.js major version the engine process is supported on. */
-export const MIN_ENGINE_NODE_MAJOR = 22;
-
-/**
- * A note for a `node --version` string older than MIN_ENGINE_NODE_MAJOR, or
- * nothing. Anything that does not parse as a version, such as the reason the
- * probe could not run, gets no note.
- */
-export function nodeVersionNote(version: string): string {
-  const match = /^v?(\d+)\./.exec(version.trim());
-  if (!match || Number(match[1]) >= MIN_ENGINE_NODE_MAJOR) {
-    return "";
-  }
-  return ` (Wake Word requires ${MIN_ENGINE_NODE_MAJOR} or later)`;
-}
-
 /**
  * Replace the user's home directory with `~` wherever it appears in `text`.
  *
  * Diagnostics are meant to be pasted into an issue, and paths under the home
- * directory (the model's global storage, a Node.js installed per user) carry
- * the account name. Only whole path segments match, so `/home/ann` does not
+ * directory (the model's global storage, the installed extension) carry the
+ * account name. Only whole path segments match, so `/home/ann` does not
  * eat the start of `/home/anna`. A root or drive-only home would match every
  * path and is left alone.
  */
@@ -754,13 +716,10 @@ export interface DiagnosticsInput {
   editorName: string;
   vscodeVersion: string;
   hostNodeVersion: string;
-  engineNodePath: string;
-  /** `node --version` from the engine's executable, or why it could not run. */
-  engineNodeVersion: string;
-  /** The packaged engine binary, when the report covers it. */
-  engineBinaryPath?: string;
+  /** The packaged engine binary the extension spawns. */
+  engineBinaryPath: string;
   /** What the binary's self-test reported, or why it could not run. */
-  engineBinaryStatus?: string;
+  engineBinaryStatus: string;
   /** What the extension is doing, in words. */
   state: string;
   isListening: boolean;
@@ -802,11 +761,8 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     `Platform: ${input.platform} ${input.arch} (${input.osRelease})`,
     `VS Code: ${input.vscodeVersion} (${input.editorName})`,
     `Node.js (extension host): ${input.hostNodeVersion}`,
-    `Node.js (engine): ${input.engineNodePath} (${input.engineNodeVersion})${nodeVersionNote(input.engineNodeVersion)}`,
     "Engine: sherpa-onnx",
-    ...(input.engineBinaryPath === undefined
-      ? []
-      : [`Engine binary: ${input.engineBinaryPath} (${input.engineBinaryStatus ?? "not checked"})`]),
+    `Engine binary: ${input.engineBinaryPath} (${input.engineBinaryStatus})`,
     `State: ${input.state}`,
     `Listening: ${input.isListening}`,
     `Paused: ${input.isPaused}`,

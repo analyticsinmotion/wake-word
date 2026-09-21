@@ -5,11 +5,9 @@ import {
   MODEL_NAME,
   MODEL_SHA256,
   SherpaEngine,
-  findSystemNode,
   modelStatus,
   nativeEnginePath,
   probeNativeEngine,
-  probeNodeVersion,
 } from "./sherpaEngine";
 import {
   CALIBRATION_DURATION_MS,
@@ -36,7 +34,6 @@ import {
   releaseThenFire,
   resolveHandoff,
   resolveRoutes,
-  retiredEngineNotice,
   shouldDebounce,
   validatePhraseQuality,
 } from "./wakeWordCore";
@@ -50,7 +47,6 @@ import {
 } from "./lockFile";
 
 let statusBarItem: vscode.StatusBarItem;
-let engineBarItem: vscode.StatusBarItem;
 let statusBarState: StatusBarState = "off";
 let outputChannel: vscode.OutputChannel;
 let countdownTimer: ReturnType<typeof setInterval> | null = null;
@@ -123,12 +119,12 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
 
 /**
  * Build the speech engine. Every platform runs the sherpa-onnx engine:
- * decibri for capture and a keyword spotter, in a child process under
- * system Node.js.
+ * decibri for capture and a keyword spotter, in the packaged engine's child
+ * process.
  */
 function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
   const config = vscode.workspace.getConfiguration("wakeWord");
-  return new SherpaEngine(context, config.get<string>("nodePath", ""), readAudioDevice(config));
+  return new SherpaEngine(context, readAudioDevice(config));
 }
 
 /**
@@ -180,13 +176,6 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("Wake Word");
   context.subscriptions.push(outputChannel);
 
-  // wakeWord.engine is no longer contributed, but a value left in
-  // settings.json is still readable.
-  const notice = retiredEngineNotice(vscode.workspace.getConfiguration("wakeWord").get<unknown>("engine"));
-  if (notice) {
-    log("info", notice);
-  }
-
   // Shared by every window of this editor, which is what lets them agree on
   // who holds the microphone. See lockFile.ts.
   lockPath = lockFilePath(context.globalStorageUri.fsPath);
@@ -195,7 +184,7 @@ export function activate(context: vscode.ExtensionContext) {
   speechEngine = createEngine(context);
   wireEngine(speechEngine);
 
-  // Status bar indicators
+  // Status bar
   statusBarItem = vscode.window.createStatusBarItem(
     "wakeWord.status",
     vscode.StatusBarAlignment.Right,
@@ -205,21 +194,6 @@ export function activate(context: vscode.ExtensionContext) {
   statusBarItem.command = "wakeWord.toggle";
   context.subscriptions.push(statusBarItem);
 
-  // Every platform has run the same engine since 0.13.0. The indicator stays
-  // for that release so Windows users, who ran a different engine before,
-  // can see which one they are on now. Remove it in 0.14.0.
-  engineBarItem = vscode.window.createStatusBarItem(
-    "wakeWord.engine",
-    vscode.StatusBarAlignment.Right,
-    99
-  );
-  engineBarItem.name = "Wake Word Engine";
-  engineBarItem.text = "$(gear) Sherpa";
-  engineBarItem.tooltip = "Speech engine: sherpa-onnx. Click to show Wake Word diagnostics.";
-  engineBarItem.command = "wakeWord.diagnostics";
-  context.subscriptions.push(engineBarItem);
-
-  // Both items created — safe to call setStatusBar now
   setStatusBar("off");
   statusBarItem.show();
 
@@ -269,11 +243,9 @@ export function activate(context: vscode.ExtensionContext) {
   // Re-init when settings change
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      // The engine is built with the node path and the microphone, so a
-      // change to either needs a new one.
-      const engineChanged =
-        e.affectsConfiguration("wakeWord.nodePath") ||
-        e.affectsConfiguration("wakeWord.audioDevice");
+      // The engine is built with the microphone it listens on, so a change
+      // to that setting needs a new one.
+      const engineChanged = e.affectsConfiguration("wakeWord.audioDevice");
 
       if (engineChanged) {
         // A calibration run cannot outlive its engine. Settled here it
@@ -294,7 +266,6 @@ export function activate(context: vscode.ExtensionContext) {
         // they are reset for the new one.
         logSessionStats();
         sessionStats = createSessionStats();
-        updateEngineIndicator(cooldownActive || manualActive);
         if (cooldownActive) {
           log("info", "Engine rebuilt during cooldown: the new engine starts when the cooldown expires");
         } else if (manualActive) {
@@ -1072,13 +1043,11 @@ function describeState(): string {
 /**
  * Write a diagnostics report to the output channel and offer to show it or
  * copy it for an issue. Local only: it reads settings, state, and files the
- * extension owns, and runs `node --version`. No audio, no network, and the
- * home directory is redacted from every line.
+ * extension owns, and runs the engine's self-test. No audio, no network, and
+ * the home directory is redacted from every line.
  */
 async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("wakeWord");
-  const nodePath = findSystemNode(config.get<string>("nodePath", ""));
-  const engineNodeVersion = await probeNodeVersion(nodePath);
   const engineBinaryPath = nativeEnginePath(context.extensionPath);
   const engineBinaryStatus = await probeNativeEngine(engineBinaryPath);
   const routes = buildRoutes(config);
@@ -1092,8 +1061,6 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     editorName: vscode.env.appName,
     vscodeVersion: vscode.version,
     hostNodeVersion: process.version,
-    engineNodePath: nodePath,
-    engineNodeVersion,
     engineBinaryPath,
     engineBinaryStatus,
     state: describeState(),
@@ -1137,14 +1104,6 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
 
 // ── Status bar ──────────────────────────────────────────────
 
-function updateEngineIndicator(visible: boolean): void {
-  if (visible) {
-    engineBarItem.show();
-  } else {
-    engineBarItem.hide();
-  }
-}
-
 /**
  * Tooltip that ends with a link to the extension's settings, so the status
  * bar is a way into configuring wake phrases as well as toggling them.
@@ -1176,7 +1135,6 @@ function setStatusBar(state: StatusBarState) {
       statusBarItem.text = "$(mic-off) Wake: Off";
       statusBarItem.tooltip = tooltipWithSettingsLink("Click to enable wake word listening.");
       statusBarItem.backgroundColor = undefined;
-      updateEngineIndicator(false);
       break;
     case "listening":
       statusBarItem.text = "$(mic) Wake: Listening";
@@ -1184,7 +1142,6 @@ function setStatusBar(state: StatusBarState) {
         "Listening for wake words. Click to disable."
       );
       statusBarItem.backgroundColor = undefined;
-      updateEngineIndicator(true);
       break;
     case "handed-off":
       statusBarItem.text = "$(mic-filled) Wake: Active";
@@ -1193,7 +1150,6 @@ function setStatusBar(state: StatusBarState) {
       statusBarItem.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.warningBackground"
       );
-      updateEngineIndicator(true);
       break;
     case "paused":
       statusBarItem.text = "$(debug-pause) Wake: Paused";
@@ -1201,14 +1157,12 @@ function setStatusBar(state: StatusBarState) {
       statusBarItem.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.warningBackground"
       );
-      updateEngineIndicator(true);
       break;
     case "calibrating":
       statusBarItem.text = "$(pulse) Wake: Calibrating";
       statusBarItem.tooltip =
         "Listening for wake phrases without acting on them. Click to cancel.";
       statusBarItem.backgroundColor = undefined;
-      updateEngineIndicator(true);
       break;
     case "error":
       statusBarItem.text = "$(error) Wake: Error";
@@ -1216,7 +1170,6 @@ function setStatusBar(state: StatusBarState) {
       statusBarItem.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.errorBackground"
       );
-      updateEngineIndicator(false);
       break;
     case "other-window":
       statusBarItem.text = "$(mic-off) Wake: Other window";
@@ -1224,7 +1177,6 @@ function setStatusBar(state: StatusBarState) {
         "Another editor window is already listening. Only one instance listens " +
         "at a time. This window takes over automatically when that one stops.";
       statusBarItem.backgroundColor = undefined;
-      updateEngineIndicator(false);
       break;
   }
 }

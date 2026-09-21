@@ -2,13 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   WORD_BOUNDARY,
   buildKeywordSpec,
-  configPhrases,
   decodePieces,
   keywordTexts,
   parseVocabulary,
   skippedPhraseWarning,
 } from "../../src/keywords";
-import { WakePhrase } from "../../src/speechEngineInterface";
 
 const B = WORD_BOUNDARY;
 
@@ -341,40 +339,5 @@ describe("skippedPhraseWarning", () => {
       'Phrase "route 66" skipped: "66" is not in the speech model\'s vocabulary. ' +
         "Phrases can use the letters A to Z, apostrophes, and hyphens; write numbers as words."
     );
-  });
-});
-
-describe("configPhrases", () => {
-  const route = (label: string, phrase: string | string[]): WakePhrase => ({
-    label,
-    phrase,
-    command: "x.y",
-  });
-
-  it("passes every route on as configured when nothing is refused", () => {
-    const routes = [route("Claude", "hey claude"), route("Terminal", ["hey computer", "open terminal"])];
-    expect(configPhrases(routes, new Set())).toEqual([
-      { phrase: "hey claude", label: "Claude" },
-      { phrase: ["hey computer", "open terminal"], label: "Terminal" },
-    ]);
-  });
-
-  it("takes a refused alias out and keeps the rest of the route", () => {
-    const routes = [route("Roads", ["route 66", "open maps"])];
-    expect(configPhrases(routes, new Set(["route 66"]))).toEqual([
-      { phrase: ["open maps"], label: "Roads" },
-    ]);
-  });
-
-  it("drops a route with no phrase left", () => {
-    const routes = [route("Roads", "route 66"), route("Chat", ["hey chat"]), route("Cafe", ["café"])];
-    expect(configPhrases(routes, new Set(["route 66", "café"]))).toEqual([
-      { phrase: ["hey chat"], label: "Chat" },
-    ]);
-  });
-
-  it("leaves entries that are not strings for the engine to skip", () => {
-    const routes = [{ label: "Odd", phrase: ["hey chat", 7], command: "x.y" } as unknown as WakePhrase];
-    expect(configPhrases(routes, new Set())).toEqual([{ phrase: ["hey chat", 7], label: "Odd" }]);
   });
 });

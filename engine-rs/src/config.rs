@@ -1,13 +1,9 @@
 //! The config line the extension sends as the first line of stdin.
 //!
-//! Port of the config half of `engine/lib/control.js` (`clampKeywordThreshold`,
-//! `resolveAudioDevice`).
-//!
 //! The shape, as `src/sherpaEngine.ts` writes it:
 //!
 //! ```json
-//! { "phrases": [{ "phrase": "hey claude", "label": "Claude" }],
-//!   "threshold": 0.05, "modelDir": "<path>",
+//! { "threshold": 0.05, "modelDir": "<path>",
 //!   "debugMode": false, "audioDevice": "",
 //!   "keywordLines": ["▁HE Y ▁C LA U DE :3.0 #0.05"],
 //!   "phraseMap": { "HEY CLAUDE": "hey claude" } }
@@ -17,24 +13,22 @@
 //! per phrase, SentencePiece pieces followed by the boost and the trigger
 //! threshold, and `phraseMap` maps the decoded text of each line's pieces,
 //! which is what the spotter reports on a hit, to the phrase as configured,
-//! lower-cased. The engine needs both and has no tokeniser, so it does not
-//! read `phrases`, which is there for engines that tokenise for themselves.
+//! lower-cased. The engine has no tokeniser and needs both.
 //!
 //! Two more optional fields, `vadModelPath` and `ortLibraryPath`, locate the
 //! Silero model and the ONNX Runtime library; the extension does not send
 //! them, and without them the engine searches the places `crate::assets`
 //! describes. The values are read one at a time out of a `serde_json::Value`
-//! rather than deserialised into a struct, because the Node engine coerces
-//! rather than rejects: a threshold of zero becomes the default, and a value
-//! of the wrong type is ignored. Deserialising into typed fields would turn
-//! each of those into a fatal `Invalid config JSON`, which is a different
+//! rather than deserialised into a struct, so that each is coerced rather than
+//! rejected: a threshold of zero becomes the default, and a value of the wrong
+//! type is ignored. Deserialising into typed fields would turn each of those
+//! into a fatal `Invalid config JSON`, which is a different
 //! engine.
 
 use serde_json::Value;
 
 /// Lowest usable keyword threshold, matching `clampThreshold()` in
-/// `src/wakeWordCore.ts` and `clampKeywordThreshold()` in
-/// `engine/lib/control.js`.
+/// `src/wakeWordCore.ts`, which clamps the same setting on the host.
 pub const MIN_THRESHOLD: f64 = 0.01;
 /// Highest usable keyword threshold.
 pub const MAX_THRESHOLD: f64 = 0.9;
@@ -55,8 +49,8 @@ pub enum AudioDevice {
 }
 
 impl AudioDevice {
-    /// How the device reads in a debug line, matching the Node engine's
-    /// `JSON.stringify(micOptions.device)`.
+    /// How the device reads in a debug line: the JSON form of what decibri
+    /// is given, a quoted name or a bare index.
     pub fn describe(&self) -> Option<String> {
         match self {
             AudioDevice::Default => None,
@@ -123,9 +117,8 @@ pub struct Config {
 impl Config {
     /// Read a config out of whatever `JSON.parse()` would have produced.
     ///
-    /// Anything that is not a JSON object yields an empty config, the same
-    /// outcome the Node engine reaches by destructuring a non-object and
-    /// finding every field undefined.
+    /// Anything that is not a JSON object yields an empty config, which is
+    /// what reading every field off a non-object comes to.
     pub fn from_json(value: &Value) -> Config {
         Config {
             keyword_lines: collect_keyword_lines(value.get("keywordLines")),
@@ -262,7 +255,7 @@ mod tests {
     #[test]
     fn parses_the_config_the_extension_sends_on_start() {
         let parsed = config(
-            r#"{"phrases":[{"phrase":"hey claude","label":"Claude"}],"threshold":0.3,
+            r#"{"threshold":0.3,
                 "modelDir":"C:\\Users\\me\\models","debugMode":true,"audioDevice":"",
                 "keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3"],
                 "phraseMap":{"HEY CLAUDE":"hey claude"}}"#,

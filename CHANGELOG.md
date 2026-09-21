@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.14.0] - 2026-09-20
+
+### Changed
+
+- The speech engine is now a program packaged with the extension, in
+  place of a script run under a separately installed Node.js. Nothing
+  has to be installed alongside the extension on any platform, and the
+  engine finds the inference runtime and the voice activity model beside
+  itself.
+- Windows: the installation notes now state that the Microsoft Visual
+  C++ Redistributable (x64) is required, with a troubleshooting entry
+  for the error shown when it is missing. The requirement has applied
+  since 0.13.0.
+- Linux now needs glibc 2.28 or later, down from 2.34. macOS needs 14.0
+  or later on Apple silicon.
+- **Wake Word: Show Diagnostics** reports the engine program and the
+  result of its self-test in place of the Node.js version it ran under.
+
+### Fixed
+
+- Windows: the speech model now loads when the path to it is 260
+  characters or longer, as it can be with a long account name or a
+  redirected profile.
+
+### Removed
+
+- The `wakeWord.nodePath` setting, the Node.js lookup behind it, and the
+  "Could not find Node.js" error. An entry left in settings.json has no
+  effect and can be removed.
+- The status bar item naming the speech engine. One engine has run on
+  every platform since 0.13.0, so it always read the same thing. The
+  listening status item is unchanged, and **Wake Word: Show
+  Diagnostics** is still in the command palette.
+- The startup notice for a `wakeWord.engine` entry left in
+  settings.json. The setting has had no effect since 0.13.0.
+
 ## [0.13.2] - 2026-09-16
 
 ### Changed

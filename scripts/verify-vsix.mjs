@@ -11,8 +11,8 @@
  * library than the systems it is meant for. None of those fails a build, so
  * each is checked here, on the artifact itself:
  *
- *   - the extension, the Node engine, and the sentencepiece-js package the
- *     extension host loads are present;
+ *   - the extension and the sentencepiece-js package the extension host loads
+ *     are present;
  *   - the engine binary is present, is built for the target's architecture,
  *     and on macOS and Linux is stored executable;
  *   - ONNX Runtime and the Silero model are present beside it, byte for byte
@@ -344,7 +344,6 @@ function main() {
   for (const required of [
     'extension/package.json',
     'extension/dist/extension.js',
-    'extension/engine/audio-engine.js',
     'extension/node_modules/sentencepiece-js/package.json',
     'extension/node_modules/sentencepiece-js/dist/index.js',
   ]) {

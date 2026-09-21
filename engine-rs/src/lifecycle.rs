@@ -1,17 +1,12 @@
 //! The engine state machine: config, prepare, capture, pause, resume, stop.
 //!
-//! Port of the lifecycle in `engine/audio-engine.js` (`main()`,
-//! `pauseCapture()`, `resumeCapture()`, `shutdown()`, the `stopping` and
-//! `captureWanted` flags) together with `CaptureSession` in
-//! `engine/lib/capture.js`.
-//!
 //! Everything here is driven by events and holds no threads of its own, so the
 //! cases that are hard to reach in a running process are reachable in a test:
 //! a `pause` or a `stop` that lands while the microphone is still opening, a
 //! `pause` that lands before the microphone has ever opened, and an event that
 //! arrives after shutdown has started.
 //!
-//! Three flags carry the whole thing, and they are the Node engine's:
+//! Three flags carry the whole thing:
 //!
 //! - `stopping`: shutdown has begun, so every later command and event is
 //!   ignored. `RELEASED` is said once.
@@ -125,7 +120,7 @@ pub struct Prepared {
     pub listening_for: Vec<String>,
 }
 
-/// Why preparation failed. Fatal, with the Node engine's wording.
+/// Why preparation failed. Fatal; the wording is what the extension logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareError {
     /// The transducer could not be loaded, or a keyword line is one it cannot
@@ -222,8 +217,7 @@ struct CaptureOptions {
 
 /// The microphone's lifecycle: open, pause, resume, stop.
 ///
-/// Port of `CaptureSession` in `engine/lib/capture.js`. The engine process
-/// outlives a pause: `pause()` closes the microphone and says `PAUSED`,
+/// The engine process outlives a pause: `pause()` closes the microphone and says `PAUSED`,
 /// `resume()` opens a new one and says `READY`, and `stop()` closes it for good
 /// and says `RELEASED`.
 pub struct CaptureSession {
@@ -520,11 +514,10 @@ impl Lifecycle {
             return;
         }
         if self.config.is_some() {
-            // The Node engine calls main() again for a second config line,
-            // which loads a second model and opens a second microphone while
-            // the first is still open and running. The extension sends
-            // exactly one config line per child, so that path is unreachable
-            // from the host, and ignoring it is the safe reading.
+            // The extension sends exactly one config line per child, so a
+            // second one cannot arrive from the host. Acting on it would load
+            // a second model and open a second microphone beside the first, so
+            // it is ignored.
             self.ctx
                 .out
                 .debug("ignoring a second config line: the engine is already configured");
@@ -812,7 +805,7 @@ mod tests {
         }
     }
 
-    const CONFIG: &str = r#"{"phrases":[{"phrase":"hey claude","label":"Claude"}],"threshold":0.05,"modelDir":"/models","debugMode":false,"audioDevice":"","keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
+    const CONFIG: &str = r#"{"threshold":0.05,"modelDir":"/models","debugMode":false,"audioDevice":"","keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
     const DEBUG_CONFIG: &str = r#"{"modelDir":"/models","debugMode":true,"keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.05"],"phraseMap":{"HEY CLAUDE":"hey claude"}}"#;
 
     /// A config line with one keyword line and its phrase map entry, plus
@@ -1456,7 +1449,7 @@ mod tests {
     #[test]
     fn refuses_a_config_without_keyword_lines_before_preparing() {
         for json in [
-            r#"{"phrases":[{"phrase":"hey claude"}],"modelDir":"/models","phraseMap":{"HEY CLAUDE":"hey claude"}}"#,
+            r#"{"modelDir":"/models","phraseMap":{"HEY CLAUDE":"hey claude"}}"#,
             r#"{"keywordLines":"▁HE Y :3.0 #0.05","phraseMap":{"HEY":"hey"}}"#,
         ] {
             let mut harness = Harness::new();
@@ -1541,8 +1534,7 @@ mod tests {
     fn hands_preparation_the_keyword_lines_the_phrase_map_the_threshold_and_the_model_directory() {
         let mut harness = Harness::new();
         harness.line(
-            r#"{"phrases":[{"phrase":["Hey Claude","open claude"]}],
-                "keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3","▁O P EN ▁C LA U DE :3.0 #0.3"],
+            r#"{"keywordLines":["▁HE Y ▁C LA U DE :3.0 #0.3","▁O P EN ▁C LA U DE :3.0 #0.3"],
                 "phraseMap":{"HEY CLAUDE":"hey claude","OPEN CLAUDE":"open claude"},
                 "threshold":0.3,"modelDir":"/models/kws"}"#,
         );

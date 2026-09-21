@@ -1,8 +1,7 @@
 //! Pre-roll ring buffer and VAD gate.
 //!
-//! Port of `VadGate` in `engine/lib/vad-gate.js`. While the detector reports
-//! silence, each chunk is held in a short ring instead of reaching the keyword
-//! spotter. When speech starts the ring is flushed oldest first, and chunks
+//! While the detector reports silence, each chunk is held in a short ring
+//! instead of reaching the keyword spotter. When speech starts the ring is flushed oldest first, and chunks
 //! then pass straight through until silence, which discards whatever the ring
 //! gathered in between.
 //!

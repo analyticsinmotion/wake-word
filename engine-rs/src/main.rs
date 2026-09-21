@@ -1,7 +1,6 @@
 //! `wake-word-engine`: the child process the Wake Word extension talks to.
 //!
-//! Replaces `engine/audio-engine.js` and speaks the same protocol, word for
-//! word. The extension writes a JSON config line to stdin, then `pause`,
+//! The extension writes a JSON config line to stdin, then `pause`,
 //! `resume`, and `stop` commands; the engine answers on stdout with `READY`,
 //! `DETECTED:<phrase>`, `PAUSED`, `RELEASED`, `ERROR:<msg>`, and, in debug
 //! mode, `DEBUG:<msg>`.
@@ -131,8 +130,8 @@ fn run_self_test() -> ! {
 
 /// Read stdin and post one event per complete line, then one for EOF.
 ///
-/// A trailing partial line at EOF is dropped, as it is in the Node engine: an
-/// unterminated line is not a command.
+/// A trailing partial line at EOF is dropped: an unterminated line is not a
+/// command.
 fn spawn_stdin_reader(events: Sender<Event>) {
     thread::spawn(move || {
         let mut splitter = LineSplitter::new();

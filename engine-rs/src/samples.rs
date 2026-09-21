@@ -1,8 +1,7 @@
 //! Sample conditioning between capture and the keyword spotter.
 //!
-//! Port of `toSpotterSamples()` in `engine/lib/samples.js`, less the part that
-//! reinterprets a byte buffer as floats: decibri's Rust API hands over
-//! `Vec<f32>` directly.
+//! decibri hands over `Vec<f32>`, so the only step between capture and the
+//! keyword spotter is the clamp below.
 
 /// Clamp every sample to [-1, 1] in place, and turn NaN into silence.
 ///

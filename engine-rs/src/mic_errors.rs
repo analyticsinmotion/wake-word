@@ -1,10 +1,9 @@
 //! decibri's typed errors, turned into messages a user can act on.
 //!
-//! Port of `micErrorMessage()` in `engine/lib/mic-errors.js`. Every decibri
-//! error carries a stable code, `DecibriError::code()`, which is the same
-//! string the Node.js package exposes as `err.code`, so the mapping switches on
-//! the code exactly as the JavaScript does. Anything unrecognised falls back to
-//! the raw message under the caller's prefix.
+//! Every decibri error carries a stable code, `DecibriError::code()`, and the
+//! mapping switches on that rather than on the message text, which is not
+//! stable. Anything unrecognised falls back to the raw message under the
+//! caller's prefix.
 
 use crate::config::AudioDevice;
 
@@ -61,8 +60,7 @@ pub fn mic_error_message(
     let message = &error.message;
 
     match error.code {
-        // An index past the end of the device list. In the Node.js package this
-        // is a plain RangeError with no code; the Rust crate gives it one.
+        // An index past the end of the device list.
         Some("DEVICE_INDEX_OUT_OF_RANGE") if chosen.is_some() => format!(
             "Microphone index {} is out of range. Check {SETTING} against the input devices on this machine.",
             chosen.unwrap_or_default()
@@ -260,9 +258,9 @@ mod tests {
     }
 
     #[test]
-    fn every_code_the_node_engine_maps_produces_its_own_message() {
-        // The eleven codes engine/lib/mic-errors.js switches on, plus the index
-        // case. None of them may fall through to the generic fallback.
+    fn every_code_that_is_mapped_produces_its_own_message() {
+        // The eleven codes with a message of their own, plus the index case.
+        // None of them may fall through to the generic fallback.
         let device = name("Desk Mic 2");
         for code in [
             "MICROPHONE_NOT_FOUND",

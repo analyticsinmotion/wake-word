@@ -1,5 +1,5 @@
 import { EventEmitter } from "events";
-import { spawn, ChildProcess, execFile, execSync } from "child_process";
+import { spawn, ChildProcess, execFile } from "child_process";
 import { createHash } from "crypto";
 import {
   accessSync,
@@ -16,7 +16,7 @@ import * as path from "path";
 import * as https from "https";
 import { pipeline } from "stream/promises";
 import * as vscode from "vscode";
-import { buildKeywordSpec, configPhrases, keywordTexts, skippedPhraseWarning } from "./keywords";
+import { buildKeywordSpec, keywordTexts, skippedPhraseWarning } from "./keywords";
 import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 import { extractTarGz } from "./tarExtract";
 import { Tokenised, readVocabulary, tokenise } from "./tokeniser";
@@ -34,16 +34,12 @@ import {
  *
  * Spawns the engine as a child process: the native binary packaged in bin/,
  * which finds ONNX Runtime and the voice activity model beside itself and
- * needs nothing installed. ENGINE_KIND can select audio-engine.js under
- * system Node.js (not Electron, so that native addons load against the
- * correct Node.js ABI) instead; both speak the same protocol.
+ * needs nothing installed.
  *
  * Before spawning, the phrases are tokenised here, in a worker thread (see
  * tokeniser.ts), and the config line carries the finished keyword lines and
  * the decoded-to-spoken phrase map. A phrase with a piece the model's token
- * table lacks is left out with a warning. The native engine reads
- * `keywordLines` and `phraseMap`; audio-engine.js reads `phrases` and
- * tokenises them itself.
+ * table lacks is left out with a warning.
  *
  * The child lives across handoffs. pause() tells it to close the microphone
  * and resume() to reopen it, so the models load once per start instead of
@@ -124,14 +120,11 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    * `audioDevice` is the `wakeWord.audioDevice` setting: empty for the
    * system default, otherwise a device index or a case-insensitive name
    * substring. It is fixed for the life of the engine; the extension builds
-   * a new engine when the setting changes, as it does for `nodePath`.
-   * `engineKind` chooses the child process: see ENGINE_KIND.
+   * a new engine when the setting changes.
    */
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly nodePathOverride: string = "",
-    private readonly audioDevice: string = "",
-    private readonly engineKind: EngineKind = ENGINE_KIND
+    private readonly audioDevice: string = ""
   ) {
     super();
   }
@@ -226,23 +219,23 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       return;
     }
 
-    const launch = engineLaunch(this.engineKind, path.dirname(__dirname), this.nodePathOverride);
-    if (launch.kind === "native") {
-      // A packaged binary that is absent or cannot be run is reported by
-      // name. Left to the spawn, it would surface as ENOENT or EACCES with
-      // nothing to say which file was meant.
-      const problem = prepareNativeEngine(launch.command);
-      if (problem) {
-        this.emit("error", new Error(problem));
-        return;
-      }
+    // The binary takes no arguments: it reads its config on stdin and finds
+    // ONNX Runtime and the voice activity model beside itself.
+    const binary = nativeEnginePath(path.dirname(__dirname));
+    // A packaged binary that is absent or cannot be run is reported by name.
+    // Left to the spawn, it would surface as ENOENT or EACCES with nothing to
+    // say which file was meant.
+    const problem = prepareNativeEngine(binary);
+    if (problem) {
+      this.emit("error", new Error(problem));
+      return;
     }
-    this.emit("debug", `Spawning: ${[launch.command, ...launch.args].join(" ")}`);
+    this.emit("debug", `Spawning: ${binary}`);
 
     this.resetChildState();
     // windowsHide: the child is a console program. Without it Windows can
     // give it a console window of its own for as long as it runs.
-    const proc = spawn(launch.command, launch.args, {
+    const proc = spawn(binary, [], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -258,10 +251,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     });
 
     // Send config as JSON line then leave stdin open (child reads more commands).
-    // `phrases` leaves out what the keyword lines leave out, so a child that
-    // tokenises for itself listens for the same phrases.
     const config = {
-      phrases: configPhrases(phrases, new Set(spec.skipped.map((s) => s.phrase))),
       threshold: safeThreshold,
       modelDir,
       debugMode,
@@ -290,18 +280,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       this.process = null;
       this.resetChildState();
 
-      if (launch.kind === "native") {
-        // The binary was there a moment ago, so this is not a missing
-        // Node.js: say which file would not start, and why.
-        this.emit("error", new Error(`Failed to start the speech engine at ${launch.command}: ${err.message}`));
-      } else if (err.message.includes("ENOENT") || err.message.includes("not found")) {
-        // The executable the lookup found is gone (Node.js upgraded or
-        // removed), so the next start must look again rather than reuse it.
-        clearNodePathCache();
-        this.emit("error", new Error(NODE_NOT_FOUND_MESSAGE));
-      } else {
-        this.emit("error", new Error("Failed to start audio engine: " + err.message));
-      }
+      // The binary was there a moment ago, checked by prepareNativeEngine():
+      // say which file would not start, and why.
+      this.emit("error", new Error(`Failed to start the speech engine at ${binary}: ${err.message}`));
     });
 
     proc.on("exit", (code) => {
@@ -748,44 +729,12 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 // ── Helpers ─────────────────────────────────────────────────
 
 /**
- * The child process an engine runs: the native binary in bin/, or
- * audio-engine.js under system Node.js.
- */
-export type EngineKind = "native" | "node";
-
-/**
- * The child process every engine runs unless its constructor is told
- * otherwise. Both kinds are packaged and speak the same protocol, so changing
- * this value is the whole of switching between them.
- */
-export const ENGINE_KIND: EngineKind = "native";
-
-/** What to spawn for an engine. */
-export interface EngineLaunch {
-  kind: EngineKind;
-  command: string;
-  args: string[];
-}
-
-/**
  * Where the packaged engine binary is, given the extension's root directory.
  * It needs no arguments and no paths: it looks for ONNX Runtime and the voice
  * activity model in the directory that holds it.
  */
 export function nativeEnginePath(extensionRoot: string, platform: NodeJS.Platform = process.platform): string {
   return path.join(extensionRoot, "bin", platform === "win32" ? "wake-word-engine.exe" : "wake-word-engine");
-}
-
-/** The command and arguments that start an engine of this kind. */
-export function engineLaunch(kind: EngineKind, extensionRoot: string, nodePathOverride = ""): EngineLaunch {
-  if (kind === "node") {
-    return {
-      kind,
-      command: findSystemNode(nodePathOverride),
-      args: [path.join(extensionRoot, "engine", "audio-engine.js")],
-    };
-  }
-  return { kind, command: nativeEnginePath(extensionRoot), args: [] };
 }
 
 /**
@@ -825,7 +774,9 @@ export function prepareNativeEngine(binary: string, platform: NodeJS.Platform = 
 /**
  * The engine binary's self-test, for Show Diagnostics: its `SELF-TEST:` lines
  * on one line, or why it could not run. The self-test opens no microphone and
- * loads no model. Never rejects, and gives up after `timeoutMs`.
+ * loads no keyword spotting model; it does load the voice activity model,
+ * which is what makes it report a missing inference runtime. Never rejects,
+ * and gives up after `timeoutMs`.
  */
 export function probeNativeEngine(binary: string, timeoutMs = 5000): Promise<string> {
   return new Promise((resolve) => {
@@ -843,94 +794,6 @@ export function probeNativeEngine(binary: string, timeoutMs = 5000): Promise<str
       } else {
         resolve(err ? `could not run: ${err.message}` : "self-test printed nothing");
       }
-    });
-  });
-}
-
-/**
- * Shown when the Node.js executable cannot be spawned. Before 0.13.0 Windows
- * needed no Node.js at all, so the message says what changed and where to get
- * it as well as how to point the extension at an existing install.
- */
-export const NODE_NOT_FOUND_MESSAGE =
-  "Could not find Node.js. Wake Word now requires Node.js 22 or later on all platforms. " +
-  "Download from https://nodejs.org/. If it is already installed, set `wakeWord.nodePath` " +
-  "in Settings to the full path to your node executable.";
-
-/**
- * The executable the last lookup found. The location of Node.js does not
- * change while the editor runs, and the lookup spawns a shell synchronously
- * on the extension host thread, so it runs once rather than on every start.
- */
-let cachedNodePath: string | null = null;
-
-/**
- * Locate the system Node.js executable.
- *
- * Resolution order:
- *   1. wakeWord.nodePath user setting (highest priority, never cached)
- *   2. The path an earlier lookup found
- *   3. `where node` / `which node` shell command
- *   4. Well-known install paths per platform
- *   5. Bare 'node' as last resort
- *
- * A path found by 3 or 4 is cached. The bare fallback is not: a Node.js
- * installed after a failed lookup is picked up by the next start instead of
- * needing a reload.
- */
-export function findSystemNode(override?: string): string {
-  if (override) return override;
-  if (cachedNodePath) return cachedNodePath;
-
-  try {
-    const cmd = process.platform === "win32" ? "where node" : "which node";
-    const result = execSync(cmd, { encoding: "utf8", windowsHide: true }).trim().split("\n")[0].trim();
-    if (result) {
-      cachedNodePath = result;
-      return result;
-    }
-  } catch {
-    // fall through
-  }
-
-  const wellKnown =
-    process.platform === "win32"
-      ? ["C:\\Program Files\\nodejs\\node.exe"]
-      : process.platform === "darwin"
-      ? ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
-      : ["/usr/bin/node", "/usr/local/bin/node"];
-
-  for (const p of wellKnown) {
-    if (existsSync(p)) {
-      cachedNodePath = p;
-      return p;
-    }
-  }
-
-  return "node";
-}
-
-/**
- * Forget the cached lookup. Called when spawning the cached path fails, and
- * by tests.
- */
-export function clearNodePathCache(): void {
-  cachedNodePath = null;
-}
-
-/**
- * `node --version` from the executable the engine runs under, for Show
- * Diagnostics. Settles with the reason the probe failed rather than
- * rejecting, and gives up after `timeoutMs`.
- */
-export function probeNodeVersion(nodePath: string, timeoutMs = 5000): Promise<string> {
-  return new Promise((resolve) => {
-    execFile(nodePath, ["--version"], { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
-      if (err) {
-        resolve(`could not run: ${err.message}`);
-        return;
-      }
-      resolve(String(stdout).trim() || "no version reported");
     });
   });
 }

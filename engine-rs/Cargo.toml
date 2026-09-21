@@ -12,11 +12,11 @@ name = "wake-word-engine"
 path = "src/main.rs"
 
 # serde_json: the config line is parsed into a serde_json::Value and read field
-# by field rather than derived into a struct, because the Node engine accepts
-# whatever JSON.parse() produces and coerces it in JavaScript: a non-string
-# phrase is skipped, not fatal, and a missing threshold falls back to the
-# default. A derived struct would reject those lines outright and change the
-# engine's behaviour.
+# by field rather than derived into a struct. It carries user-edited settings,
+# so each field is coerced rather than rejected: a non-string phrase is
+# skipped, not fatal, and a missing threshold falls back to the default. A
+# derived struct would reject such a line outright and leave the microphone
+# closed.
 #
 # decibri: microphone capture, conditioning, device selection, and Silero voice
 # activity detection. Pinned exactly and bumped deliberately. Default features
@@ -25,9 +25,9 @@ path = "src/main.rs"
 # ONNX Runtime from a shared library at run time rather than linking it in; see
 # src/assets.rs for where it is looked for.
 #
-# sherpa-onnx: the keyword spotter. Pinned exactly to the release the Node
-# engine's sherpa-onnx package is built from, so the model files, the keyword
-# line syntax, the boost, and the thresholds behave the same in both engines.
+# sherpa-onnx: the keyword spotter. Pinned exactly, because the model files,
+# the keyword line syntax, the boost, and the thresholds are all read by this
+# version of the C library; tests/acoustic measures the same release.
 # The `static` feature links the C library and its own ONNX Runtime into the
 # executable. The crate's build script downloads the official prebuilt static
 # libraries for the target from the sherpa-onnx release of the same version and

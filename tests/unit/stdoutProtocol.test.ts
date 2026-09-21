@@ -98,7 +98,7 @@ describe("parseEngineLine", () => {
   });
 
   it("parses the sherpa DETECTED form, which carries no confidence", () => {
-    // audio-engine.js stopped sending a fabricated |1.0 suffix: the keyword
+    // The engine stopped sending a fabricated |1.0 suffix: the keyword
     // spotter applies its own threshold and returns no usable score.
     // SherpaEngine discards the parsed value and emits no confidence at all.
     expect(parseEngineLine("DETECTED:hey computer")).toEqual({
