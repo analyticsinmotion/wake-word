@@ -37,6 +37,15 @@ export class Uri {
   }
 }
 
+export class MarkdownString {
+  isTrusted = false;
+  constructor(public value = "") {}
+}
+
+export const env = {
+  appName: "Test Editor",
+};
+
 function notImplemented(name: string): never {
   throw new Error(
     `vscode.${name} was called in a unit test. Unit tests must not touch the ` +
@@ -63,4 +72,12 @@ export const workspace = {
 export const commands = {
   registerCommand: () => notImplemented("commands.registerCommand"),
   executeCommand: () => notImplemented("commands.executeCommand"),
+  getCommands: () => notImplemented("commands.getCommands"),
+};
+
+export const extensions = {
+  get all(): never {
+    return notImplemented("extensions.all");
+  },
+  onDidChange: () => notImplemented("extensions.onDidChange"),
 };

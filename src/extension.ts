@@ -15,9 +15,15 @@ import {
   DEFAULT_THRESHOLD,
   DETECTION_DEBOUNCE_MS,
   CalibrationDetection,
+  CommandSources,
+  ListenSettingsChange,
+  ListeningState,
   PendingConfirmation,
+  RouteAvailability,
   SessionStats,
+  checkRouteAvailability,
   clampThreshold,
+  commandSources,
   createSessionStats,
   decideListenSettingsChange,
   describeThreshold,
@@ -33,10 +39,12 @@ import {
   formatPhraseChecksSummary,
   formatSessionStats,
   phraseChecksKey,
+  planAvailabilityReport,
   recordDetection,
   releaseThenFire,
   resolveHandoff,
   resolveRoutes,
+  setAsideKey,
   shouldDebounce,
   validatePhraseQuality,
 } from "./wakeWordCore";
@@ -83,11 +91,38 @@ let calibration: CalibrationRun | null = null;
 let handoffGeneration = 0;
 /** phraseChecksKey() of the routes whose phrase checks were last reported. */
 let lastPhraseChecksKey = "";
+/** The extension's global state: where the set-aside routes the user was told about are kept. */
+let extensionState: vscode.Memento | null = null;
+/**
+ * setAsideKey() of the check whose routes the engine was last started with,
+ * or, while waiting for a command, of the check that found none. A resume
+ * replays the engine's routes, so it compares a fresh check with this, and
+ * so does an extension change.
+ */
+let appliedSetAsideKey: string | null = null;
+/** The last check reported this session; null before the first. */
+let reportedAvailability: RouteAvailability | null = null;
+/**
+ * None of the routes' commands was available at the last start, so no
+ * engine was started and the microphone is closed. An extension change or a
+ * routes change starts listening again. See startListening().
+ */
+let waitingForCommands = false;
+/**
+ * Advanced by every start, resume, stop, and calibration run. A start or a
+ * resume reads the editor's commands, which takes a round trip, and
+ * compares this afterwards: if it moved, something else has decided what
+ * listening does since, and the earlier one stands down.
+ */
+let listenRequest = 0;
+
+/** Global state key for the set-aside routes the user was last told about. */
+const TOLD_SET_ASIDE_KEY = "wakeWord.setAsideNotified";
 
 /** How long Calibrate waits for an engine it had to start before giving up. */
 const CALIBRATION_START_TIMEOUT_MS = 30_000;
 
-type CalibrationOutcome = "completed" | "cancelled" | "stopped" | "error" | "start-timeout";
+type CalibrationOutcome = "completed" | "cancelled" | "stopped" | "error" | "start-timeout" | "no-commands";
 
 /** A Calibrate run in progress. See runCalibration(). */
 interface CalibrationRun {
@@ -113,6 +148,8 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
     // so listening waits for the user to resume rather than restarting under
     // the assistant and competing for the microphone.
     handoff: "manual",
+    // The command comes from the Claude Code extension. Where that is not
+    // installed, the route is set aside: see checkRouteAvailability().
   },
   {
     // The command opens the editor's generic chat panel, whichever chat
@@ -201,6 +238,7 @@ export function activate(context: vscode.ExtensionContext) {
   // who holds the microphone. See lockFile.ts.
   lockPath = lockFilePath(context.globalStorageUri.fsPath);
   sessionStats = createSessionStats();
+  extensionState = context.globalState;
 
   speechEngine = createEngine(context);
   wireEngine(speechEngine, context);
@@ -218,10 +256,11 @@ export function activate(context: vscode.ExtensionContext) {
   setStatusBar("off");
   statusBarItem.show();
 
-  // Register commands
+  // Register commands. Enable and a click that enables are the user asking
+  // to listen, so they are told why when nothing can be listened for.
   context.subscriptions.push(
     vscode.commands.registerCommand("wakeWord.enable", () =>
-      handleConsentThenStart(context)
+      handleConsentThenStart(context, true)
     ),
     vscode.commands.registerCommand("wakeWord.disable", () => stopListening()),
     vscode.commands.registerCommand("wakeWord.toggle", () => {
@@ -233,7 +272,7 @@ export function activate(context: vscode.ExtensionContext) {
       } else if (speechEngine.isListening || speechEngine.isPaused) {
         stopListening();
       } else {
-        handleConsentThenStart(context);
+        return handleConsentThenStart(context, true);
       }
     }),
     vscode.commands.registerCommand("wakeWord.openSettings", () => {
@@ -257,7 +296,7 @@ export function activate(context: vscode.ExtensionContext) {
   const autoStart = config.get<boolean>("enableOnStartup", true);
   if (autoStart) {
     setTimeout(() => {
-      handleConsentThenStart(context);
+      void handleConsentThenStart(context);
     }, 1000);
   }
 
@@ -297,7 +336,7 @@ export function activate(context: vscode.ExtensionContext) {
         } else if (manualActive) {
           log("info", "Engine rebuilt during a manual handoff: the new engine starts when you resume");
         } else if (wasListening) {
-          startListening();
+          void startListening();
         }
         return;
       }
@@ -306,38 +345,19 @@ export function activate(context: vscode.ExtensionContext) {
       // engine's config line, so a running engine has the old ones. What
       // that means here depends on what the extension is doing: see
       // decideListenSettingsChange().
-      const change = {
+      applyListenSettingsChange(context, {
         routes: e.affectsConfiguration("wakeWord.routes"),
         threshold: e.affectsConfiguration("wakeWord.confidenceThreshold"),
-      };
-      const action = decideListenSettingsChange(change, {
-        listening: speechEngine.isListening,
-        starting: engineStarting,
-        paused: speechEngine.isPaused,
-        cooldown: countdownTimer !== null,
-        manualPause: isManuallyPaused,
+        availability: false,
       });
-      const line = formatListenSettingsChange(change, action);
-      if (line) {
-        log("info", line);
-      }
-      switch (action) {
-        case "restart":
-          restartListening(context);
-          break;
-        case "apply-on-resume":
-          // The engine is paused and must not take the microphone back now:
-          // a handoff means an assistant has it. The resume does a full
-          // start; resume() alone would replay the settings it was paused
-          // with.
-          listenSettingsChangedWhilePaused = true;
-          break;
-        case "apply-when-started":
-          listenSettingsChangedWhileStarting = true;
-          break;
-        case "none":
-          break;
-      }
+    })
+  );
+
+  // An extension installed, removed, enabled, or disabled can bring a
+  // route's command in or take it away.
+  context.subscriptions.push(
+    vscode.extensions.onDidChange(() => {
+      void onExtensionsChanged(context);
     })
   );
 
@@ -361,7 +381,7 @@ export function activate(context: vscode.ExtensionContext) {
         // resumeListening(), not resume(): a routes change made while the
         // window was unfocused has to be applied, and resume() would bring
         // the engine back with the old phrases.
-        resumeListening();
+        void resumeListening();
       }
     })
   );
@@ -381,8 +401,14 @@ export function deactivate() {
 
 const CONSENT_KEY = "wakeWord.userConsented";
 
+/**
+ * Start listening, asking for consent first if it has not been given.
+ * `explicit` is set when the user asked, from Enable or the status bar: see
+ * startListening().
+ */
 async function handleConsentThenStart(
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  explicit = false
 ): Promise<void> {
   // After a manual handoff, Enable is the resume the status bar promises.
   if (isManuallyPaused) {
@@ -394,7 +420,7 @@ async function handleConsentThenStart(
   // status bar and, when it expired, left it on the last second.
   if (countdownTimer !== null) {
     log("info", "Resumed: user resumed during the cooldown");
-    resumeListening();
+    void resumeListening();
     return;
   }
   if (speechEngine.isListening || isStarting) {
@@ -404,7 +430,7 @@ async function handleConsentThenStart(
   const hasConsented = context.globalState.get<boolean>(CONSENT_KEY, false);
 
   if (hasConsented) {
-    startListening();
+    await startListening(explicit);
     return;
   }
 
@@ -426,7 +452,7 @@ async function handleConsentThenStart(
 
     if (choice === "Allow Microphone Listening") {
       await context.globalState.update(CONSENT_KEY, true);
-      startListening();
+      await startListening(explicit);
     } else {
       setStatusBar("off");
     }
@@ -452,8 +478,27 @@ function logSessionStats(): void {
 
 // ── Core logic ──────────────────────────────────────────────
 
-function startListening() {
+/**
+ * Start listening for the routes whose commands are available.
+ *
+ * The editor's commands are read first, which is the one wait in a start.
+ * Everything after it, from reading the settings to starting the engine,
+ * runs without another, so a stop, a settings change, or another start
+ * cannot land in the middle; one that lands during the wait supersedes this
+ * start, which then stands down.
+ *
+ * `explicit` is set when the user asked to listen. If no route's command is
+ * available, they are then told so even if they were told before.
+ */
+async function startListening(explicit = false): Promise<void> {
   cancelPendingHandoff();
+  const request = ++listenRequest;
+  const sources = await readCommandSources();
+  if (request !== listenRequest) {
+    return;
+  }
+  waitingForCommands = false;
+
   const config = vscode.workspace.getConfiguration("wakeWord");
   const routes = buildRoutes(config);
 
@@ -475,23 +520,49 @@ function startListening() {
   }
   stopLockWatcher();
 
+  const availability = checkRouteAvailability(routes, DEFAULT_ROUTES, sources);
+  reportAvailability(availability, explicit);
+  // The settings this start carries are the ones just read, so a change
+  // still waiting on a start or a resume is spent, and a change that arrives
+  // before the engine says READY is what the next one is for.
+  listenSettingsChangedWhilePaused = false;
+  listenSettingsChangedWhileStarting = false;
+  appliedSetAsideKey = setAsideKey(availability.setAside);
+
+  if (availability.listened.length === 0) {
+    waitForCommands();
+    return;
+  }
+
+  const listened = availability.listened;
   const threshold = clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD));
   const audioDevice = readAudioDevice(config);
   const deviceNote = audioDevice ? `, device="${audioDevice}"` : "";
+  const setAsideNote = availability.setAside.length > 0 ? `, ${availability.setAside.length} set aside` : "";
   log(
     "info",
-    `Starting: ${routes.length} routes, threshold=${describeThreshold(threshold, routes)}, ` +
+    `Starting: ${listened.length} routes${setAsideNote}, threshold=${describeThreshold(threshold, listened)}, ` +
       `devMode=${isDevMode}${deviceNote}`
   );
   log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
-  reportPhraseChecks(routes);
+  reportPhraseChecks(listened);
 
-  // The settings this start carries are the ones just read, so a change
-  // still waiting on a start is spent, and a change that arrives before the
-  // engine says READY is what the next one is for.
-  listenSettingsChangedWhileStarting = false;
   engineStarting = true;
-  speechEngine.start(routes, threshold, isDevMode);
+  speechEngine.start(listened, threshold, isDevMode);
+}
+
+/**
+ * No route's command is available, so there is nothing to listen for. Stop
+ * the engine, which only matters for a paused one left from a handoff, give
+ * the listener lock up so another window can listen, and wait: an extension
+ * change or a routes change starts listening again, through
+ * decideListenSettingsChange(), and so does Enable or a status bar click.
+ */
+function waitForCommands(): void {
+  speechEngine.stop();
+  releaseLock(lockPath);
+  waitingForCommands = true;
+  setStatusBar("no-commands");
 }
 
 /**
@@ -503,7 +574,56 @@ function startListening() {
  */
 function restartListening(context: vscode.ExtensionContext): void {
   stopListening();
-  handleConsentThenStart(context);
+  void handleConsentThenStart(context);
+}
+
+/** What the extension is doing, for decideListenSettingsChange(). */
+function listeningState(): ListeningState {
+  return {
+    listening: speechEngine.isListening,
+    starting: engineStarting,
+    paused: speechEngine.isPaused,
+    cooldown: countdownTimer !== null,
+    manualPause: isManuallyPaused,
+    waiting: waitingForCommands,
+  };
+}
+
+/**
+ * Act on a change to what the engine listens for: the routes, the
+ * threshold, or which routes' commands are available. What that means
+ * depends on what the extension is doing: see decideListenSettingsChange().
+ */
+function applyListenSettingsChange(
+  context: vscode.ExtensionContext,
+  change: ListenSettingsChange,
+  state: ListeningState = listeningState()
+): void {
+  const action = decideListenSettingsChange(change, state);
+  const line = formatListenSettingsChange(change, action);
+  if (line) {
+    log("info", line);
+  }
+  switch (action) {
+    case "restart":
+      restartListening(context);
+      break;
+    case "apply-on-resume":
+      // The engine is paused and must not take the microphone back now:
+      // a handoff means an assistant has it. The resume does a full
+      // start; resume() alone would replay the settings it was paused
+      // with.
+      listenSettingsChangedWhilePaused = true;
+      break;
+    case "apply-when-started":
+      listenSettingsChangedWhileStarting = true;
+      break;
+    case "start":
+      void handleConsentThenStart(context);
+      break;
+    case "none":
+      break;
+  }
 }
 
 /**
@@ -531,6 +651,9 @@ function applyListenSettingsChangedWhileStarting(context: vscode.ExtensionContex
 function stopListening() {
   calibration?.finish("stopped");
   cancelPendingHandoff();
+  // A start or a resume still reading the commands stands down: see
+  // listenRequest.
+  listenRequest++;
   clearResumeTimer();
   clearConfirmation();
   stopLockWatcher();
@@ -539,6 +662,7 @@ function stopListening() {
   listenSettingsChangedWhilePaused = false;
   listenSettingsChangedWhileStarting = false;
   engineStarting = false;
+  waitingForCommands = false;
   lastDetectionTime = 0;
   speechEngine.stop();
   releaseLock(lockPath);
@@ -579,7 +703,7 @@ function startLockWatcher(): void {
     }
     stopLockWatcher();
     log("info", "The listening window has stopped. Taking over.");
-    startListening();
+    void startListening();
   }, LOCK_CHECK_INTERVAL_MS);
 }
 
@@ -627,6 +751,88 @@ function reportPhraseChecks(routes: readonly WakePhrase[]): void {
       outputChannel.show();
     }
   });
+}
+
+// ── Route availability ──────────────────────────────────────
+
+/**
+ * The commands this editor has: the ones registered, and the ones declared
+ * by installed, enabled extensions, which covers the commands of extensions
+ * that have not started yet. See checkRouteAvailability().
+ *
+ * Null when the list cannot be read. Every route is then listened for,
+ * rather than setting aside routes that may work.
+ */
+async function readCommandSources(): Promise<CommandSources | null> {
+  try {
+    const registered = await vscode.commands.getCommands();
+    return commandSources(registered, vscode.extensions.all);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("warn", `Could not read the editor's commands (${message}): every route is listened for`);
+    return null;
+  }
+}
+
+/** Check the configured routes' commands. */
+async function checkConfiguredRoutes(): Promise<RouteAvailability> {
+  const sources = await readCommandSources();
+  return checkRouteAvailability(buildRoutes(vscode.workspace.getConfiguration("wakeWord")), DEFAULT_ROUTES, sources);
+}
+
+/**
+ * Log what changed in the routes set aside since the last check this
+ * session, and tell the user about a route newly set aside: once, and not
+ * again while it stays set aside, restarts included. What they were told
+ * is kept in global state, which stays on this machine. Settings would
+ * carry it to other machines through Settings Sync, where the command may
+ * be there. See planAvailabilityReport().
+ */
+function reportAvailability(availability: RouteAvailability, explicit: boolean): void {
+  const report = planAvailabilityReport(
+    availability,
+    reportedAvailability,
+    extensionState?.get(TOLD_SET_ASIDE_KEY),
+    explicit
+  );
+  reportedAvailability = availability;
+  for (const line of report.lines) {
+    log(line.level, line.text);
+  }
+  if (report.told) {
+    void extensionState?.update(TOLD_SET_ASIDE_KEY, report.told);
+  }
+  if (report.notification) {
+    vscode.window.showWarningMessage(report.notification, "Show Log").then((choice) => {
+      if (choice === "Show Log") {
+        outputChannel.show();
+      }
+    });
+  }
+}
+
+/**
+ * An extension was installed, removed, enabled, or disabled. Check the
+ * routes' commands again, and if that changes which routes are listened
+ * for, apply it as a routes change is applied: a restart while listening,
+ * held for the resume during a handoff, held for READY during a start, and
+ * a start while waiting for a command. Off, or standing by for another
+ * window, there is nothing to do: the next start checks for itself.
+ */
+async function onExtensionsChanged(context: vscode.ExtensionContext): Promise<void> {
+  const change: ListenSettingsChange = { routes: false, threshold: false, availability: true };
+  if (decideListenSettingsChange(change, listeningState()) === "none") {
+    return;
+  }
+  const availability = await checkConfiguredRoutes();
+  // The state can have moved while the commands were read.
+  const state = listeningState();
+  change.availability = setAsideKey(availability.setAside) !== appliedSetAsideKey;
+  if (decideListenSettingsChange(change, state) === "none") {
+    return;
+  }
+  reportAvailability(availability, false);
+  applyListenSettingsChange(context, change, state);
 }
 
 // ── Wake word triggered ─────────────────────────────────────
@@ -725,7 +931,7 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     vscode.window.showErrorMessage(
       `Wake Word: Could not execute "${phrase.command}" -- ${message}`
     );
-    resumeListening();
+    void resumeListening();
     return;
   }
   if (isDevMode) {
@@ -825,7 +1031,7 @@ function startCountdown(seconds: number) {
 
     if (countdownRemaining <= 0) {
       clearResumeTimer();
-      resumeListening();
+      void resumeListening();
       log("info", "Resumed: cooldown expired");
     } else {
       statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
@@ -847,24 +1053,36 @@ function enterManualPause(): void {
 
 function resumeFromManualHandoff(): void {
   log("info", "Resumed: user resumed after manual handoff");
-  resumeListening();
+  void resumeListening();
 }
 
-function resumeListening() {
+async function resumeListening(): Promise<void> {
   cancelPendingHandoff();
+  const request = ++listenRequest;
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
   lastDetectionTime = 0;
-  // resume() replays the phrases and the threshold the engine was paused
+  // resume() replays the routes and the threshold the engine was paused
   // with. After a change to either those are the wrong settings, so go
-  // through a full start instead.
+  // through a full start instead. The same goes for which routes are set
+  // aside, which can change during a pause with no extension changing, when
+  // a command is registered late, so the commands are checked first.
   if (speechEngine.isPaused && !listenSettingsChangedWhilePaused) {
-    speechEngine.resume();
-  } else {
-    listenSettingsChangedWhilePaused = false;
-    startListening();
+    const availability = await checkConfiguredRoutes();
+    if (request !== listenRequest) {
+      return;
+    }
+    if (
+      speechEngine.isPaused &&
+      !listenSettingsChangedWhilePaused &&
+      setAsideKey(availability.setAside) === appliedSetAsideKey
+    ) {
+      speechEngine.resume();
+      return;
+    }
   }
+  await startListening();
 }
 
 function clearResumeTimer() {
@@ -882,6 +1100,7 @@ type PriorState =
   | { kind: "cooldown"; remaining: number }
   | { kind: "manual" }
   | { kind: "focus-paused" }
+  | { kind: "waiting" }
   | { kind: "off" };
 
 /** What the extension was doing when Calibrate was run, so it can be put back. */
@@ -897,6 +1116,9 @@ function capturePriorState(): PriorState {
   }
   if (isPausedByFocus) {
     return { kind: "focus-paused" };
+  }
+  if (waitingForCommands) {
+    return { kind: "waiting" };
   }
   return { kind: "off" };
 }
@@ -916,7 +1138,9 @@ function capturePriorState(): PriorState {
  * A run ends on its timer, on the notification's Cancel, on a status bar
  * click, when listening is disabled or the engine is rebuilt (nothing is
  * restored then: those have settled the state themselves), or when the
- * engine reports an error.
+ * engine reports an error. A run that starts the engine starts it for the
+ * routes whose commands are available, and ends before it starts if there
+ * are none.
  */
 async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
   if (calibration) {
@@ -951,8 +1175,10 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
 
   const prior = capturePriorState();
   // A handoff still releasing the microphone would fire its command and
-  // start a cooldown in the middle of the run.
+  // start a cooldown in the middle of the run, and a start or a resume still
+  // reading the commands would start the engine beside the run's own start.
   cancelPendingHandoff();
+  listenRequest++;
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
@@ -1020,16 +1246,45 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
           openWindow();
         };
         timer = setTimeout(() => run.finish("start-timeout"), CALIBRATION_START_TIMEOUT_MS);
-        Promise.resolve(speechEngine.start(routes, threshold, isDevMode)).catch((err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          log("error", `Calibration: the engine failed to start: ${message}`);
-          run.finish("error");
-        });
+        void startCalibrationEngine(run, routes, threshold);
       })
   );
 
   reportCalibration(run, outcome);
   restorePriorState(prior, outcome);
+}
+
+/**
+ * Start the engine for a calibration run, for the routes whose commands are
+ * available, as a start for listening does. The engine keeps those routes
+ * after the run and a resume replays them, so a route set aside must not
+ * reach it here either. With nothing to listen for, the run ends without
+ * starting anything, and the user is told why: they asked for the run.
+ */
+async function startCalibrationEngine(
+  run: CalibrationRun,
+  routes: WakePhrase[],
+  threshold: number
+): Promise<void> {
+  const sources = await readCommandSources();
+  if (calibration !== run) {
+    // Cancelled, or listening was disabled, while the commands were read.
+    return;
+  }
+  const availability = checkRouteAvailability(routes, DEFAULT_ROUTES, sources);
+  reportAvailability(availability, true);
+  if (availability.listened.length === 0) {
+    run.finish("no-commands");
+    return;
+  }
+  appliedSetAsideKey = setAsideKey(availability.setAside);
+  try {
+    await speechEngine.start(availability.listened, threshold, isDevMode);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", `Calibration: the engine failed to start: ${message}`);
+    run.finish("error");
+  }
 }
 
 function reportCalibration(run: CalibrationRun, outcome: CalibrationOutcome): void {
@@ -1051,6 +1306,11 @@ function reportCalibration(run: CalibrationRun, outcome: CalibrationOutcome): vo
   }
   if (outcome === "stopped") {
     log("info", "Calibration: cancelled because listening was disabled or the engine changed");
+    return;
+  }
+  if (outcome === "no-commands") {
+    // The routes and the reason were logged, and shown, by the check.
+    log("warn", "Calibration: not started, because none of the routes' commands are available");
     return;
   }
   if (run.startedAt === 0) {
@@ -1098,6 +1358,12 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
     case "focus-paused":
       speechEngine.pause();
       break;
+    case "waiting":
+      // Listening was waiting for a route's command. A start checks the
+      // commands again and either listens or goes back to waiting.
+      speechEngine.stop();
+      void startListening();
+      break;
     case "off":
       speechEngine.stop();
       releaseLock(lockPath);
@@ -1136,6 +1402,9 @@ function describeState(): string {
   if (speechEngine.isPaused) {
     return "paused";
   }
+  if (waitingForCommands) {
+    return "waiting: none of the routes' commands are available";
+  }
   return "not listening";
 }
 
@@ -1149,7 +1418,9 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("wakeWord");
   const engineBinaryPath = nativeEnginePath(context.extensionPath);
   const engineBinaryStatus = await probeNativeEngine(engineBinaryPath);
-  const routes = buildRoutes(config);
+  // Checked now, whatever the extension is doing: the report says which
+  // routes a start would listen for, and why the others are set aside.
+  const availability = await checkConfiguredRoutes();
   const model = modelStatus(context.globalStorageUri.fsPath);
 
   const lines = formatDiagnostics({
@@ -1175,9 +1446,10 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     confirmationMode: config.get<boolean>("confirmationMode", false),
     pauseOnFocusLoss: config.get<boolean>("pauseOnFocusLoss", false),
     enableOnStartup: config.get<boolean>("enableOnStartup", true),
-    routes,
+    routes: availability.listened,
+    setAside: availability.setAside,
     usingDefaultRoutes: filterValidRoutes(config.get<WakePhrase[]>("routes", [])).length === 0,
-    phraseChecks: checkPhrases(routes),
+    phraseChecks: checkPhrases(availability.listened),
     lock: describeLock(readLock(lockPath)),
     sessionStats,
     now: Date.now(),
@@ -1225,7 +1497,8 @@ type StatusBarState =
   | "paused"
   | "calibrating"
   | "error"
-  | "other-window";
+  | "other-window"
+  | "no-commands";
 
 function setStatusBar(state: StatusBarState) {
   statusBarState = state;
@@ -1275,6 +1548,16 @@ function setStatusBar(state: StatusBarState) {
       statusBarItem.tooltip =
         "Another editor window is already listening. Only one instance listens " +
         "at a time. This window takes over automatically when that one stops.";
+      statusBarItem.backgroundColor = undefined;
+      break;
+    case "no-commands":
+      // Route labels and commands are the user's text and never go in this
+      // trusted tooltip; the notification and Show Diagnostics name them.
+      statusBarItem.text = "$(mic-off) Wake: No commands";
+      statusBarItem.tooltip = tooltipWithSettingsLink(
+        "None of the routes' commands are available in this editor, so the microphone is off. " +
+          "Listening starts once one is available. Click to check again."
+      );
       statusBarItem.backgroundColor = undefined;
       break;
   }

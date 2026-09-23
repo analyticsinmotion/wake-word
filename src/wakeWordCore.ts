@@ -93,6 +93,425 @@ export function resolveRoutes(
   return valid.length > 0 ? valid : [...defaults];
 }
 
+// -- Command availability -----------------------------------------------
+
+/**
+ * An installed extension as the availability check reads it, from
+ * `vscode.extensions.all`, which lists the installed extensions that are
+ * enabled. `packageJSON` is the extension's manifest: another publisher's
+ * file, so nothing about its shape is assumed.
+ */
+export interface InstalledExtension {
+  id: string;
+  packageJSON: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const ON_COMMAND = "onCommand:";
+
+/**
+ * The commands a manifest declares: each `contributes.commands` entry, and
+ * each command named by an `onCommand:` activation event.
+ *
+ * Either makes a command runnable before its extension has started. Running
+ * a command that is not registered raises its `onCommand:` activation event,
+ * which the editor also raises for every contributed command, and the
+ * extension registers its commands as it activates. `contributes.commands`
+ * can be a single object rather than a list. Anything malformed is skipped,
+ * never thrown on.
+ */
+export function manifestCommands(packageJSON: unknown): string[] {
+  const commands: string[] = [];
+  const manifest = isRecord(packageJSON) ? packageJSON : {};
+  const contributes = isRecord(manifest.contributes) ? manifest.contributes : {};
+  const contributed = contributes.commands;
+  for (const entry of Array.isArray(contributed) ? contributed : [contributed]) {
+    if (isRecord(entry) && typeof entry.command === "string" && entry.command.length > 0) {
+      commands.push(entry.command);
+    }
+  }
+  const events = manifest.activationEvents;
+  for (const event of Array.isArray(events) ? events : []) {
+    if (typeof event === "string" && event.startsWith(ON_COMMAND) && event.length > ON_COMMAND.length) {
+      commands.push(event.slice(ON_COMMAND.length));
+    }
+  }
+  return commands;
+}
+
+/** Every command the extensions declare, each with the first extension that declares it. */
+export function declaredCommands(extensions: readonly InstalledExtension[]): Map<string, string> {
+  const declared = new Map<string, string>();
+  for (const extension of extensions) {
+    for (const command of manifestCommands(extension.packageJSON)) {
+      if (!declared.has(command)) {
+        declared.set(command, String(extension.id));
+      }
+    }
+  }
+  return declared;
+}
+
+/** What the availability check knows about the commands in this editor. */
+export interface CommandSources {
+  /** Commands registered now, from `vscode.commands.getCommands()`. */
+  registered: ReadonlySet<string>;
+  /** Commands the installed, enabled extensions declare, with the extension that declares each. */
+  declared: ReadonlyMap<string, string>;
+  /** Identifiers of the installed, enabled extensions, lower-cased. */
+  installed: ReadonlySet<string>;
+}
+
+export function commandSources(
+  registered: Iterable<string>,
+  extensions: readonly InstalledExtension[]
+): CommandSources {
+  return {
+    registered: new Set(registered),
+    declared: declaredCommands(extensions),
+    installed: new Set(extensions.map((extension) => String(extension.id).toLowerCase())),
+  };
+}
+
+/**
+ * How a command is available: registered already, declared by an installed
+ * extension that has not registered it yet, or neither. Command IDs are
+ * compared exactly, as the editor compares them.
+ */
+export type CommandStatus = "registered" | "declared" | "missing";
+
+export function commandStatus(command: string, sources: CommandSources): CommandStatus {
+  if (sources.registered.has(command)) {
+    return "registered";
+  }
+  return sources.declared.has(command) ? "declared" : "missing";
+}
+
+/** What provides a missing command, where that is known. */
+export type CommandProvider =
+  | {
+      kind: "extension";
+      id: string;
+      name: string;
+      /** Installed and enabled, but not declaring the command. */
+      installed: boolean;
+    }
+  | { kind: "editor" }
+  | { kind: "unknown" };
+
+/**
+ * The providers of the default routes' commands, by command prefix:
+ * `claude-vscode.` commands come from the Claude Code extension, and
+ * `workbench.` commands are the editor's own.
+ */
+const KNOWN_PROVIDERS: ReadonlyArray<{
+  prefix: string;
+  provider: { kind: "extension"; id: string; name: string } | { kind: "editor" };
+}> = [
+  { prefix: "claude-vscode.", provider: { kind: "extension", id: "anthropic.claude-code", name: "Claude Code" } },
+  { prefix: "workbench.", provider: { kind: "editor" } },
+];
+
+/**
+ * What provides `command`, from the fixed list above. An extension on that
+ * list can be installed and still not declare the command, when the command
+ * ID is mistyped, so the result says whether it is installed.
+ */
+export function commandProvider(command: string, installed: ReadonlySet<string>): CommandProvider {
+  const known = KNOWN_PROVIDERS.find((entry) => command.startsWith(entry.prefix));
+  if (!known) {
+    return { kind: "unknown" };
+  }
+  if (known.provider.kind === "editor") {
+    return { kind: "editor" };
+  }
+  return { ...known.provider, installed: installed.has(known.provider.id) };
+}
+
+/**
+ * Why a route is not listened for. A value of its own rather than a flag on
+ * the route, so a route that is off for any other reason is never taken for
+ * one whose command is missing, and both can hold at once.
+ */
+export type SetAsideReason = "action-missing";
+
+/**
+ * A route that is not listened for, and why. Held in memory only: the
+ * extension never writes it to settings, which Settings Sync would carry to
+ * other machines, where the command can be there.
+ */
+export interface SetAsideRoute {
+  /** The route as configured. */
+  route: WakePhrase;
+  label: string;
+  /** One of the built-in default routes, rather than one from wakeWord.routes. */
+  isDefault: boolean;
+  command: string;
+  reason: SetAsideReason;
+  /** What provides the command, where that is known. */
+  provider: CommandProvider;
+}
+
+/** A listened route whose command is declared by an extension that has not registered it yet. */
+export interface DeclaredOnlyRoute {
+  label: string;
+  command: string;
+  /** The extension that declares the command. */
+  extension: string;
+}
+
+export interface RouteAvailability {
+  /** The routes to listen for, in their configured order. */
+  listened: WakePhrase[];
+  /** The routes set aside because their command is missing, in their configured order. */
+  setAside: SetAsideRoute[];
+  /** Listened routes that count as available only through a declaration. */
+  declaredOnly: DeclaredOnlyRoute[];
+}
+
+/**
+ * Split the routes into the ones to listen for and the ones whose command
+ * is not available in this editor.
+ *
+ * A command is available when it is registered, or when an installed,
+ * enabled extension declares it (see manifestCommands()). The second half is
+ * not optional: `getCommands()` lists only registered commands, an extension
+ * registers its commands as it activates, and one that activates on
+ * `onStartupFinished`, as this extension does, may not have started when
+ * the check runs. Running a declared command starts its extension first, so
+ * such a route works and is listened for.
+ *
+ * `defaults` identifies the built-in routes, by identity: resolveRoutes()
+ * returns those objects themselves. With no sources, because the command
+ * list could not be read, every route is listened for rather than setting
+ * aside routes that may work.
+ */
+export function checkRouteAvailability(
+  routes: readonly WakePhrase[],
+  defaults: readonly WakePhrase[],
+  sources: CommandSources | null
+): RouteAvailability {
+  const availability: RouteAvailability = { listened: [], setAside: [], declaredOnly: [] };
+  for (const route of routes) {
+    const status = sources ? commandStatus(route.command, sources) : "registered";
+    if (sources && status === "missing") {
+      availability.setAside.push({
+        route,
+        label: route.label,
+        isDefault: defaults.includes(route),
+        command: route.command,
+        reason: "action-missing",
+        provider: commandProvider(route.command, sources.installed),
+      });
+      continue;
+    }
+    availability.listened.push(route);
+    if (sources && status === "declared") {
+      availability.declaredOnly.push({
+        label: route.label,
+        command: route.command,
+        extension: sources.declared.get(route.command) ?? "",
+      });
+    }
+  }
+  return availability;
+}
+
+/** A set-aside route's identity when sets of them are compared: label, command, and reason. */
+function setAsideEntry(label: string, command: string, reason: string): string {
+  return JSON.stringify([label, command, reason]);
+}
+
+function entryOf(setAside: SetAsideRoute): string {
+  return setAsideEntry(setAside.label, setAside.command, setAside.reason);
+}
+
+/**
+ * The set-aside routes as one comparable string, whatever their order. The
+ * extension compares it with the one for the routes the engine was started
+ * with, to tell whether which routes are listened for has changed.
+ */
+export function setAsideKey(setAside: readonly SetAsideRoute[]): string {
+  return [...new Set(setAside.map(entryOf))].sort().join("\n");
+}
+
+/**
+ * Why a set-aside route's command is missing, naming what provides it where
+ * that is known.
+ */
+export function describeMissingCommand(setAside: Pick<SetAsideRoute, "command" | "provider">): string {
+  const { command, provider } = setAside;
+  switch (provider.kind) {
+    case "extension":
+      return provider.installed
+        ? `${provider.name} (${provider.id}) is installed but does not provide ${command}`
+        : `${command} needs ${provider.name} (${provider.id}), which is not installed or is disabled`;
+    case "editor":
+      return `${command} is not available in this editor`;
+    case "unknown":
+      return `no installed extension provides ${command}`;
+  }
+}
+
+/**
+ * The set-aside routes the user was last told about, as kept in the
+ * extension's global state: one `[label, command, reason]` triple each.
+ * Global state stays on this machine unless an extension asks for a key to
+ * be synchronised, which this one never does.
+ */
+export type ToldSetAside = Array<[string, string, string]>;
+
+/** The entries of a remembered value. Anything unreadable, such as a value of another shape, counts as nothing told. */
+function toldEntries(told: unknown): Set<string> {
+  const entries = new Set<string>();
+  for (const item of Array.isArray(told) ? told : []) {
+    if (Array.isArray(item) && item.length === 3 && item.every((part) => typeof part === "string")) {
+      entries.add(setAsideEntry(item[0], item[1], item[2]));
+    }
+  }
+  return entries;
+}
+
+function sameEntries(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  return a.size === b.size && [...a].every((entry) => b.has(entry));
+}
+
+/** One output channel line. */
+export interface ReportLine {
+  level: "info" | "warn";
+  text: string;
+}
+
+/** What to say about one availability check. See planAvailabilityReport(). */
+export interface AvailabilityReport {
+  /** Output channel lines, in order. */
+  lines: ReportLine[];
+  /** The notification to show, or null for none. */
+  notification: string | null;
+  /** The value to remember in global state as told, or null when the remembered one already matches. */
+  told: ToldSetAside | null;
+}
+
+function listItem(setAside: SetAsideRoute): string {
+  return `"${setAside.label}": ${describeMissingCommand(setAside)}.`;
+}
+
+/** The notification for routes newly set aside while others are still listened for. */
+export function formatSetAsideNotification(setAside: readonly SetAsideRoute[]): string {
+  if (setAside.length === 1) {
+    return (
+      `Wake Word is not listening for "${setAside[0].label}": ${describeMissingCommand(setAside[0])}. ` +
+      "It comes back once the command is available."
+    );
+  }
+  return (
+    `Wake Word is not listening for ${setAside.length} routes whose commands are missing. ` +
+    `${setAside.map(listItem).join(" ")} They come back once their commands are available.`
+  );
+}
+
+/** The notification when every route is set aside, so nothing is listened for. */
+export function formatNothingToListenFor(setAside: readonly SetAsideRoute[]): string {
+  return (
+    "Wake Word is not listening: none of the routes' commands are available in this editor. " +
+    `${setAside.map(listItem).join(" ")} Listening starts once a route's command is available.`
+  );
+}
+
+/**
+ * Decide what to say about an availability check.
+ *
+ * The output channel gets a line for each route newly set aside and each one
+ * back, and for each route newly counted as available only through a
+ * declaration, compared with the previous check of this session (`previous`,
+ * null before the first, so every session's log explains the routes set
+ * aside at its first check). It also gets a line whenever nothing can be
+ * listened for at all.
+ *
+ * A notification is raised only for a route set aside that the user has not
+ * already been told about (`told`, the value remembered in global state), so
+ * it is not repeated on every start or across restarts, and a route coming
+ * back raises none. When every route is set aside the notification says so,
+ * and `explicit`, set when the user asked to listen, raises it even if they
+ * were told before: their request would otherwise do nothing they can see.
+ */
+export function planAvailabilityReport(
+  availability: RouteAvailability,
+  previous: Pick<RouteAvailability, "setAside" | "declaredOnly"> | null,
+  told: unknown,
+  explicit: boolean
+): AvailabilityReport {
+  const lines: ReportLine[] = [];
+  const before = new Set((previous?.setAside ?? []).map(entryOf));
+  const now = new Set(availability.setAside.map(entryOf));
+
+  for (const setAside of availability.setAside) {
+    if (!before.has(entryOf(setAside))) {
+      lines.push({
+        level: "warn",
+        text:
+          `Route "${setAside.label}" set aside: ${describeMissingCommand(setAside)}. ` +
+          "Its phrases are not listened for until the command is available.",
+      });
+    }
+  }
+  // Back means listened for again, not merely gone: a route removed from the
+  // settings is neither.
+  const listened = new Set(availability.listened.map((route) => JSON.stringify([route.label, route.command])));
+  for (const setAside of previous?.setAside ?? []) {
+    if (!now.has(entryOf(setAside)) && listened.has(JSON.stringify([setAside.label, setAside.command]))) {
+      lines.push({ level: "info", text: `Route "${setAside.label}" is back: ${setAside.command} is available again.` });
+    }
+  }
+  const declaredBefore = new Set((previous?.declaredOnly ?? []).map((route) => JSON.stringify(route)));
+  for (const route of availability.declaredOnly) {
+    if (declaredBefore.has(JSON.stringify(route))) {
+      continue;
+    }
+    lines.push({
+      level: "info",
+      text:
+        `Route "${route.label}": ${route.command} is not registered yet, but ${route.extension} declares it, ` +
+        "so the route is listened for.",
+    });
+  }
+
+  const nothingToListenFor = availability.listened.length === 0 && availability.setAside.length > 0;
+  if (nothingToListenFor) {
+    lines.push({
+      level: "warn",
+      text: "Not listening: none of the routes' commands are available in this editor. " +
+        "Listening starts once a route's command is available.",
+    });
+  }
+
+  const toldBefore = toldEntries(told);
+  const untold = availability.setAside.filter((setAside) => !toldBefore.has(entryOf(setAside)));
+  let notification: string | null = null;
+  if (nothingToListenFor) {
+    if (explicit || untold.length > 0) {
+      notification = formatNothingToListenFor(availability.setAside);
+    }
+  } else if (untold.length > 0) {
+    notification = formatSetAsideNotification(untold);
+  }
+
+  return {
+    lines,
+    notification,
+    told: sameEntries(toldBefore, now)
+      ? null
+      : availability.setAside.map((setAside): [string, string, string] => [
+          setAside.label,
+          setAside.command,
+          setAside.reason,
+        ]),
+  };
+}
+
 // -- Threshold ----------------------------------------------------------
 
 /**
@@ -124,12 +543,16 @@ export function describeThreshold(threshold: number, routes: readonly WakePhrase
 // -- Settings that decide what the engine listens for -------------------
 
 /**
- * Which of the settings a running engine cannot pick up on its own changed.
+ * What changed that decides what a running engine listens for, and that it
+ * cannot pick up on its own.
  *
- * Both are read in startListening() and sent in the engine's config line:
- * the routes become its keyword lines, and the threshold becomes every
- * line's trigger value. An engine already running was given the old ones,
- * so a change to either has to reach it through a start.
+ * The routes and the threshold are read in startListening() and sent in the
+ * engine's config line: the routes become its keyword lines, and the
+ * threshold becomes every line's trigger value. `availability` is a change
+ * in which routes' commands are available, found when an extension is
+ * installed, removed, enabled or disabled: it changes which routes become
+ * keyword lines. An engine already running was given the old ones, so any
+ * of the three has to reach it through a start.
  *
  * `wakeWord.audioDevice` is not here: the engine is built with the
  * microphone it listens on, so that setting replaces the engine itself.
@@ -137,9 +560,10 @@ export function describeThreshold(threshold: number, routes: readonly WakePhrase
 export interface ListenSettingsChange {
   routes: boolean;
   threshold: boolean;
+  availability: boolean;
 }
 
-/** What the extension is doing when a settings change arrives. */
+/** What the extension is doing when a change arrives. */
 export interface ListeningState {
   /** The engine holds the microphone. */
   listening: boolean;
@@ -151,6 +575,11 @@ export interface ListeningState {
   cooldown: boolean;
   /** A manual handoff is waiting for the user to resume. */
   manualPause: boolean;
+  /**
+   * None of the routes' commands was available at the last start, so no
+   * engine was started and the microphone is closed.
+   */
+  waiting: boolean;
 }
 
 /**
@@ -160,18 +589,21 @@ export interface ListeningState {
  * `apply-on-resume` holds them until the paused engine resumes, which then
  * goes through a full start. `apply-when-started` holds them until the
  * start in flight reports READY, because that engine was given the old
- * ones. `none` leaves them for the next start to read.
+ * ones. `start` checks the routes again while nothing is listened for,
+ * which starts listening if a route's command is now available. `none`
+ * leaves them for the next start to read.
  */
-export type ListenSettingsAction = "none" | "restart" | "apply-on-resume" | "apply-when-started";
+export type ListenSettingsAction = "none" | "restart" | "apply-on-resume" | "apply-when-started" | "start";
 
 /**
- * Decide what a change to the listening settings does in the state the
+ * Decide what a change to what the engine listens for does in the state the
  * extension is in.
  *
  * The rule that shapes this: a paused engine must not take the microphone
- * back because a setting changed. Paused means a handoff, and a handoff
- * means an assistant has the microphone. So every paused state defers, and
- * only an engine that already holds the microphone restarts.
+ * back because something changed. Paused means a handoff, and a handoff
+ * means an assistant has the microphone. So every paused state defers, only
+ * an engine that already holds the microphone restarts, and only an
+ * extension waiting with no engine and no handoff starts one.
  *
  * A start in flight is checked before the paused flags because a resume
  * through startListening() leaves the engine paused until READY arrives:
@@ -183,7 +615,7 @@ export function decideListenSettingsChange(
   change: ListenSettingsChange,
   state: ListeningState
 ): ListenSettingsAction {
-  if (!change.routes && !change.threshold) {
+  if (!change.routes && !change.threshold && !change.availability) {
     return "none";
   }
   if (state.listening) {
@@ -195,20 +627,32 @@ export function decideListenSettingsChange(
   if (state.paused || state.cooldown || state.manualPause) {
     return "apply-on-resume";
   }
+  if (state.waiting) {
+    return "start";
+  }
   // Off, in the error state, or standing by while another window listens.
   // The next start reads the settings itself.
   return "none";
 }
 
 /**
- * Which settings changed, as the subject of a log line. At least one of them
- * has, since a line is only written for a change the extension acts on.
+ * What changed, as the subject of a log line. At least one of them has,
+ * since a line is only written for a change the extension acts on.
  */
 export function describeListenSettingsChange(change: ListenSettingsChange): string {
-  if (change.routes && change.threshold) {
-    return "Routes and confidence threshold";
+  const subjects: string[] = [];
+  if (change.routes) {
+    subjects.push("routes");
   }
-  return change.routes ? "Routes" : "Confidence threshold";
+  if (change.threshold) {
+    subjects.push("confidence threshold");
+  }
+  if (change.availability) {
+    subjects.push("command availability");
+  }
+  const last = subjects.pop() ?? "";
+  const text = subjects.length > 0 ? `${subjects.join(", ")} and ${last}` : last;
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /**
@@ -229,6 +673,9 @@ export function formatListenSettingsChange(
   }
   if (action === "apply-on-resume") {
     return `${subject} changed while listening was paused: applied when listening resumes`;
+  }
+  if (action === "start") {
+    return `${subject} changed while waiting for a route's command: checking the routes again`;
   }
   return `${subject} changed while the engine was starting: applied as soon as it is listening`;
 }
@@ -861,9 +1308,12 @@ export interface DiagnosticsInput {
   confirmationMode: boolean;
   pauseOnFocusLoss: boolean;
   enableOnStartup: boolean;
+  /** The routes listened for. */
   routes: readonly WakePhrase[];
+  /** The routes set aside, listed apart from the ones listened for. */
+  setAside: readonly SetAsideRoute[];
   usingDefaultRoutes: boolean;
-  /** Lines from formatPhraseChecks(). */
+  /** Lines from formatPhraseChecks(), for the routes listened for. */
   phraseChecks: readonly string[];
   /** Line from describeLock(). */
   lock: string;
@@ -902,10 +1352,10 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     `Confirmation mode: ${onOff(input.confirmationMode)}`,
     `Pause on focus loss: ${onOff(input.pauseOnFocusLoss)}`,
     `Enable on startup: ${onOff(input.enableOnStartup)}`,
-    `Routes: ${input.routes.length}${input.usingDefaultRoutes ? " (defaults)" : ""}`,
+    `Routes: ${input.routes.length + input.setAside.length}${input.usingDefaultRoutes ? " (defaults)" : ""}`,
   ];
 
-  for (const route of input.routes) {
+  const describeRoute = (route: WakePhrase): string => {
     const handoff = resolveHandoff(route.handoff);
     const cooldown =
       handoff === "timer" && typeof route.cooldownSeconds === "number" ? `, ${route.cooldownSeconds}s` : "";
@@ -916,10 +1366,23 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
       route.confidenceThreshold === undefined
         ? ""
         : `, threshold ${clampThreshold(route.confidenceThreshold, input.threshold)}`;
-    lines.push(
+    return (
       `  "${route.label}" [${normalizePhrases(route.phrase).join(", ")}] -> ${route.command} ` +
-        `(${handoff}${cooldown}${threshold})`
+      `(${handoff}${cooldown}${threshold})`
     );
+  };
+
+  for (const route of input.routes) {
+    lines.push(describeRoute(route));
+  }
+
+  if (input.setAside.length === 0) {
+    lines.push("Set aside: none");
+  } else {
+    lines.push(`Set aside: ${plural(input.setAside.length, "route")}, not listened for`);
+    for (const setAside of input.setAside) {
+      lines.push(`${describeRoute(setAside.route)}: ${setAside.reason}, ${describeMissingCommand(setAside)}`);
+    }
   }
 
   if (input.phraseChecks.length === 0) {

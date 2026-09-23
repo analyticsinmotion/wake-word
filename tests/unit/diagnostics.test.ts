@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DiagnosticsInput,
+  SetAsideRoute,
   createSessionStats,
   formatDiagnostics,
   recordDetection,
@@ -54,6 +55,7 @@ function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
     pauseOnFocusLoss: true,
     enableOnStartup: true,
     routes: ROUTES,
+    setAside: [],
     usingDefaultRoutes: false,
     phraseChecks: [],
     lock: "held by this window (pid 4242, since 2026-09-15T09:00:00.000Z)",
@@ -91,10 +93,62 @@ describe("formatDiagnostics", () => {
       '  "Claude" [hey claude] -> claude-vscode.focus (manual)',
       '  "Terminal" [hey computer, open terminal] -> workbench.action.terminal.focus (timer, 10s)',
       '  "Chat" [hey chat] -> workbench.action.chat.open (timer)',
+      "Set aside: none",
       "Phrase checks: no warnings",
       "Lock: held by this window (pid 4242, since 2026-09-15T09:00:00.000Z)",
       "Session: 12min, 1 detection (Claude: 1), 0 errors, 2 engine starts, 0 cooldowns",
       "=== End Diagnostics ===",
+    ]);
+  });
+
+  it("lists a route set aside apart from the ones listened for, with its status and reason", () => {
+    const setAside: SetAsideRoute = {
+      route: ROUTES[0],
+      label: "Claude",
+      isDefault: true,
+      command: "claude-vscode.focus",
+      reason: "action-missing",
+      provider: { kind: "extension", id: "anthropic.claude-code", name: "Claude Code", installed: false },
+    };
+    const lines = formatDiagnostics(input({ routes: ROUTES.slice(1), setAside: [setAside], usingDefaultRoutes: true }));
+    const at = lines.indexOf("Routes: 3 (defaults)");
+    expect(lines.slice(at, at + 5)).toEqual([
+      "Routes: 3 (defaults)",
+      '  "Terminal" [hey computer, open terminal] -> workbench.action.terminal.focus (timer, 10s)',
+      '  "Chat" [hey chat] -> workbench.action.chat.open (timer)',
+      "Set aside: 1 route, not listened for",
+      '  "Claude" [hey claude] -> claude-vscode.focus (manual): action-missing, ' +
+        "claude-vscode.focus needs Claude Code (anthropic.claude-code), which is not installed or is disabled",
+    ]);
+  });
+
+  it("counts several routes set aside, whatever provides their commands", () => {
+    const search: WakePhrase = { label: "Search", phrase: "search files", command: "example.search" };
+    const setAside: SetAsideRoute[] = [
+      {
+        route: search,
+        label: "Search",
+        isDefault: false,
+        command: "example.search",
+        reason: "action-missing",
+        provider: { kind: "unknown" },
+      },
+      {
+        route: ROUTES[2],
+        label: "Chat",
+        isDefault: false,
+        command: "workbench.action.chat.open",
+        reason: "action-missing",
+        provider: { kind: "editor" },
+      },
+    ];
+    const lines = formatDiagnostics(input({ routes: ROUTES.slice(0, 2), setAside }));
+    expect(lines).toContain("Routes: 4");
+    const at = lines.indexOf("Set aside: 2 routes, not listened for");
+    expect(lines.slice(at + 1, at + 3)).toEqual([
+      '  "Search" [search files] -> example.search (timer): action-missing, no installed extension provides example.search',
+      '  "Chat" [hey chat] -> workbench.action.chat.open (timer): action-missing, ' +
+        "workbench.action.chat.open is not available in this editor",
     ]);
   });
 
