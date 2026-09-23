@@ -10,19 +10,22 @@ jobs:
     # other tag, one that hosts the speech model or the engine archives, must
     # not build, upload, or publish the extension.
     if: startsWith(github.event.release.tag_name, 'v')
+    # The same checks as ci.yml, all before anything is uploaded or published.
+    # lint marks the one leg that runs the checks whose answer does not depend
+    # on the platform: ESLint and rustfmt.
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             target: win32-x64
-            lint: true
+            lint: false
           - os: macos-latest
             target: darwin-arm64
             lint: false
           - os: ubuntu-latest
             target: linux-x64
-            lint: false
+            lint: true
           # GitHub's public ARM runner label is ubuntu-24.04-arm, not a
           # variant of ubuntu-latest, which is x64.
           - os: ubuntu-24.04-arm
@@ -44,6 +47,14 @@ jobs:
         if: matrix.lint
         run: npm run lint
 
+      - name: Check the engine's formatting
+        if: matrix.lint
+        shell: bash
+        working-directory: engine-rs
+        run: |
+          cargo fmt --version
+          cargo fmt --check
+
       # Packaging compiles too; this is earlier because the model fetch below
       # uses the extension's own archive extraction from dist/.
       - name: Compile
@@ -53,6 +64,12 @@ jobs:
       # bin/ with ONNX Runtime and the Silero model.
       - name: Build the native engine
         uses: ./.github/actions/engine-rs
+        with:
+          target: ${{ matrix.target }}
+
+      # Clippy and the engine's unit tests, as in ci.yml.
+      - name: Check the native engine
+        uses: ./.github/actions/engine-rs-checks
         with:
           target: ${{ matrix.target }}
 
@@ -85,6 +102,12 @@ jobs:
           out=$(node scripts/fetch-model.mjs --dir "$RUNNER_TEMP/kws-model")
           echo "$out"
           echo "$out" | grep '^model-dir=' >> "$GITHUB_OUTPUT"
+
+      # With the model, as in ci.yml, so the tokeniser tests run against it.
+      - name: Test
+        run: npm test
+        env:
+          WAKE_WORD_MODEL_DIR: ${{ steps.model.outputs.model-dir }}
 
       - name: Drive the packaged engine
         shell: bash

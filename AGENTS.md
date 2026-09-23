@@ -25,7 +25,9 @@ it report a missing inference runtime. CI runs it on all four platforms, from
 the unpacked package.
 
 Run `npm run lint`, `npm run compile`, and `npm test` before committing. All
-three must pass cleanly.
+three must pass cleanly. For a change under `engine-rs/`, also run
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
+`cargo test` there; CI fails on any of them too.
 
 Press F5 in VS Code to launch the Extension Development Host for manual testing.
 
@@ -84,9 +86,10 @@ wake-word/
   .github/
     dependabot.yml     # Dependency updates for / and /engine-rs
     actions/engine-rs/action.yml  # Builds and stages the engine for one target; used by both workflows
+    actions/engine-rs-checks/action.yml  # Clippy and the engine's unit tests for one target, after the build; used by both workflows
     workflows/
-      ci.yml           # CI: lint, compile, test with the model, engine build, .vsix package and check, drive script
-      release.yml      # CI: engine build, build and check .vsix, drive script, publish to Marketplace and Open VSX
+      ci.yml           # CI: lint and rustfmt once; compile, test with the model, engine build, Clippy and cargo test, .vsix package and check, drive script
+      release.yml      # CI: the same checks, build, .vsix check and drive script as ci.yml, then attach the .vsix and publish to Marketplace and Open VSX
       engine-archives.yml  # Manual: the sherpa-onnx archives without text-to-speech for the four targets, checked and uploaded
 ```
 
@@ -257,6 +260,26 @@ with the extension's own `buildKeywordSpec()`, so it measures the lines that
 ship. It is a manual tool, not a CI step, and `tests/**` is excluded from the
 `.vsix`.
 
+CI runs these checks on each push and pull request, and `release.yml` runs the
+same ones before it uploads or publishes anything:
+
+| Check | Where |
+| --- | --- |
+| `npm run lint` | once, on the `linux-x64` leg |
+| `cargo fmt --check` in `engine-rs/` | once, on the `linux-x64` leg |
+| `npm run compile` | every leg |
+| `npm test`, with the keyword spotting model | every leg |
+| `cargo clippy --locked --all-targets -- -D warnings` in `engine-rs/` | every leg, after the engine build |
+| `cargo test --locked` in `engine-rs/` | every leg, after the engine build |
+| engine build, `.vsix` package and check, drive script | every leg |
+
+Lint and formatting give the same answer on every platform, so they run once.
+Clippy and the Rust tests run on every leg because some of the engine's code
+is compiled for one platform only, and so are its tests: `library_model_dir()`
+in `spotter.rs` has a Windows-only test and a test for everywhere else. Vitest
+runs on every leg because some tests exercise the platform's path rules and
+file behaviour, and the suite takes seconds.
+
 Manual testing checklist:
 
 1. F5 to launch Extension Development Host
@@ -315,6 +338,9 @@ Both workflows run on Node 22 and build the engine on each target's own runner t
 - The self-test exits 0 when ONNX Runtime or the Silero model is missing. Check what it reports, as `verify-vsix.mjs` does, never only its exit code.
 - The runtime files set floors of their own: the macOS ONNX Runtime needs macOS 14.0. The Windows one imports the Visual C++ runtime (`msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`), which is not part of Windows. Those libraries are **not** packaged: the Microsoft Visual C++ Redistributable is a requirement on Windows, stated in the README. **NEVER** start shipping them beside the binary. A copy there is resolved before the installed one, so it, and not the serviced copy, is what every user would load, and it would only change when this repository re-pinned it. `verify-vsix.mjs` fails a package that carries one. The same check pins the list above against the imports of the packaged files, so an ONNX Runtime bump that needs another library fails the package rather than a user's machine, and the README is revisited with the pin. Every CI runner has the redistributable, so no CI check shows what a machine without it does. The engine binary itself links the C runtime statically and imports none of them, which `verify-vsix.mjs` also checks.
 - CI has no microphone: the drive script runs with `--no-microphone`, which skips the scenarios that open one.
+- After the build, both workflows run the engine's Clippy lints and unit tests on every target through `.github/actions/engine-rs-checks`, in the target directory the build used. The sherpa-onnx build script links libraries already unpacked there rather than unpacking again, so the tests link the libraries the build unpacked from the verified archive, and the action runs `prebuilt.mjs check` afterwards as the build does. The rules above apply to these checks too: run from `engine-rs/`, no `RUSTFLAGS` (Clippy's `-D warnings` goes after `--`), and `SHERPA_ONNX_ARCHIVE_DIR` set. On Linux they run in the same `manylinux_2_28` image as the build, so the tests link with the compiler and C++ library the shipped binary is linked with. `cargo fmt --check` and ESLint run once, on the `linux-x64` leg.
+- There is no `rust-toolchain` file, and adding one changes the compiler of the release build as well as of the checks. Windows and macOS build and check with the Rust release the runner image carries; the Linux image installs the current stable Rust each time. A new stable release can therefore add a Clippy lint that fails code nobody changed: fix the code, or allow that one lint where it is wrong with a comment saying why, rather than dropping `-D warnings`.
+- `rust-version` in `engine-rs/Cargo.toml` is 1.88, the same as decibri 6.3.0's. No job compiles with it, because nothing that ships is compiled with it. Clippy's `incompatible_msrv` lint reads it and fails a standard library API newer than it; a dependency that raises its own minimum is not caught, so check decibri's `rust-version` when bumping it.
 - `engine-archives.yml` builds Linux in a dated `manylinux_2_28` image, so its archives keep the engine's floors. Its runner images and that container image are pinned, and `build.sh` fixes the version of the Linux toolset it installs: a static library links only with a toolchain at least as new as the one that compiled it. Windows builds on `windows-2022` (MSVC 14.44), because objects from the Visual Studio 2026 toolset on `windows-latest` call standard library helpers that the 14.44 runtime library lacks. The engine may be linked with the same toolset or a newer one. `LINK_LIST` and `PLACEHOLDERS` in `engine-rs/archives/verify.mjs`, and `PLACEHOLDERS` in `build.sh`, follow the `sherpa-onnx-sys` build script's link list: check them whenever sherpa-onnx is bumped.
 - **NEVER** compile the Linux archives with the image's default toolset, and never add or remove `-D_GLIBCXX_USE_CXX11_ABI=0` in `build.sh` for an architecture without reading the ONNX Runtime in that architecture's official archive. The libraries are linked into one executable with upstream's prebuilt ONNX Runtime, so they must match its compiler generation (GCC 11) and its `std::string` ABI, and the ABI differs by architecture: pre-C++11 on x64, hence the flag, and C++11 on aarch64, hence no flag. Libraries of the other ABI link without a message, and the engine then aborts with a corrupted heap whenever it loads the keyword spotting model; the self-test does not load that model, so it and `verify-vsix.mjs` still pass. A newer GCC changes what the keyword spotter detects. `verify.mjs` fails any archive whose libraries need a name from the linking toolchain that the official archive's do not, and a Linux archive whose libraries use another `std::string` ABI than its ONNX Runtime or record another compiler generation than the official archive's.
 

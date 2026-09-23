@@ -145,6 +145,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+CI runs the last three too, and fails on any of them: Clippy and the tests on
+every package target, against the same archives the release build links, and
+the formatting check once; see [Release builds](#release-builds).
+
 Building on Linux needs the ALSA development package (`libasound2-dev` on
 Debian and Ubuntu), which the audio backend links against.
 
@@ -305,6 +309,25 @@ Silero session in one process, which puts both ONNX Runtimes in it. On Linux
 the workflow also fails if `nm -D --defined-only` finds a symbol matching
 `ort` or `onnx` in the engine. An exported symbol could be bound by the loaded
 ONNX Runtime in place of its own.
+
+**The unit tests and lints.** After the build, and before packaging,
+`.github/actions/engine-rs-checks` runs these on every target:
+
+```bash
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
+
+They run as the build does: from this directory, with no `RUSTFLAGS`, and with
+`SHERPA_ONNX_ARCHIVE_DIR` set. They use the build's target directory, where
+the build script finds the libraries it unpacked from the verified archive and
+links them again, and the action then runs `scripts/prebuilt.mjs check` as the
+build does. On Linux they run in the build's `manylinux_2_28` image, so the
+tests link with the same compiler and C++ library as the binary that ships.
+Some of the engine's code is compiled for one platform only, and its tests with
+it, which is why they run on every target. `cargo fmt --check` runs once, on
+the Linux x64 runner. The release workflow runs all of them before it uploads
+or publishes anything.
 
 ## The keyword spotting model
 
