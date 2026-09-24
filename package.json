@@ -2,7 +2,7 @@
   "name": "wake-word",
   "displayName": "Wake Word",
   "description": "Say a wake phrase to open Claude Code, the chat panel, the terminal, or any command. Runs locally, no accounts, zero config.",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",

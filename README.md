@@ -84,7 +84,7 @@ Say a wake phrase and the right AI assistant opens -- no clicking required.
 
 Say **"Hey Claude"** and Claude opens. Say **"Hey Chat"** and the chat panel opens. Say **"Hey Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
 
-**Zero config. No API keys. No accounts. Nothing to install alongside it.** Install and go.
+**Zero config. No API keys. No accounts.** Install and go. On Windows it needs the Visual C++ Redistributable, which most machines already have.
 
 All audio processing happens locally on your machine. Nothing is recorded or transmitted.
 
@@ -92,12 +92,12 @@ https://github.com/user-attachments/assets/fb007095-5c4c-4927-aaa6-fa76550d7cb2
 
 ## How It Works
 
-1. Install the extension. A local speech model (~17MB) is downloaded on first use and cached.
+1. Install the extension. A local speech model (~17MB) is downloaded on first use and cached. The download can be cancelled from its notification, and one that receives nothing for 30 seconds stops and says so.
 2. When your editor opens, the extension starts listening on your microphone
 3. Audio is processed locally -- through voice activity detection and keyword spotting -- and matched against your configured wake phrases
 4. If a phrase is detected, the extension **releases the mic**, waits for the speech engine to confirm it is closed, and then fires the mapped command
 5. The assistant the route opens takes over the microphone with no contention
-6. Wake word listening resumes after a configurable cooldown, or, for routes set to manual handoff, when you click the status bar
+6. Wake word listening resumes after a configurable cooldown, or, for routes set to manual handoff, when you click the status bar or press the toggle shortcut
 
 ## Installation
 
@@ -143,7 +143,9 @@ These work out of the box with no configuration:
 | "Hey Chat" or "Open Chat" | The editor's chat panel | `workbench.action.chat.open` |
 | "Hey Computer" or "Open Terminal" | Terminal | `workbench.action.terminal.focus` |
 
-The Claude route uses manual handoff (see [Handoff mode](#handoff-mode)): after it fires, listening stays paused until you click **Wake: Paused** in the status bar. The other two resume after the cooldown.
+The Claude route uses manual handoff (see [Handoff mode](#handoff-mode)): after it fires, listening stays paused until you click **Wake: Paused** in the status bar or press the toggle shortcut. The other two resume after the cooldown.
+
+The Claude route needs the Claude Code extension. Without it, that route is set aside and the other two still work: see [Routes whose command is not available](#routes-whose-command-is-not-available).
 
 ### Custom routes
 
@@ -204,6 +206,12 @@ When listening starts, Wake Word checks your phrases. Anything likely to detect 
 
 Warnings never block a phrase. They are shown once per session, and again when you change your routes' phrases.
 
+### Routes whose command is not available
+
+When listening starts, Wake Word checks that each route's command exists in your editor. A route whose command is not available, such as the default Claude route when Claude Code is not installed, is not listened for. A notification names the route, its command, and the extension to install. It appears once, not every time the editor starts, and **Wake Word: Show Diagnostics** lists these routes under "Set aside".
+
+A command counts as available as soon as an installed extension provides it, even before that extension has started. Install or enable the extension a route needs and the route is listened for again, without restarting the editor. If none of your routes' commands are available, the microphone is not opened, and the status bar shows **Wake: No commands** until one is.
+
 ### Per-route cooldown
 
 Override the global cooldown for individual routes with `cooldownSeconds`:
@@ -237,7 +245,7 @@ The range is 0.01 to 0.9, the same as `wakeWord.confidenceThreshold`. It applies
 `handoff` chooses how listening comes back after a route fires:
 
 - `"timer"` (default): listening resumes after `cooldownSeconds`.
-- `"manual"`: listening stays paused until you click the status bar or run **Wake Word: Enable Listening**. Use this for assistants whose voice sessions run longer than the cooldown, so Wake Word does not restart under them and compete for the microphone.
+- `"manual"`: listening stays paused until you click the status bar, press the toggle shortcut, or run **Wake Word: Enable Listening**. Use this for assistants whose voice sessions run longer than the cooldown, so Wake Word does not restart under them and compete for the microphone.
 
 ```json
 {
@@ -268,6 +276,28 @@ If you have more than one editor window open, only one listens at a time. The fi
 
 The lock lives in the extension's global storage, which windows of the same editor share. Windows of different editor products do not see each other's lock.
 
+### Remote windows
+
+Wake Word works in remote windows: SSH, WSL, dev containers, and Codespaces opened in the desktop editor. It runs on your own machine, beside your microphone, and the commands it runs reach extensions on the remote side, such as Claude Code installed there. It does not run in the editor in a web browser, which cannot run its speech engine.
+
+If you installed Wake Word from a remote window before version 0.16.0, it was installed on the remote host. After updating, open Wake Word in the Extensions view and choose **Install Locally**.
+
+### Status bar
+
+| Status bar | Meaning |
+| --- | --- |
+| Wake: Starting | Loading the speech model and opening the microphone. Wake phrases are not heard yet |
+| Wake: Listening | Listening for wake phrases |
+| Wake: Confirm | Confirmation mode heard a phrase once, and is waiting to hear it again |
+| Wake: Active, Wake: 30s, Wake: Paused | A wake phrase handed the microphone to the assistant it opened |
+| Wake: Unfocused | Paused while the window is not focused (`wakeWord.pauseOnFocusLoss`). Focusing the window resumes it |
+| Wake: Restarting | The speech engine stopped and is being restarted |
+| Wake: Calibrating | A **Wake Word: Calibrate** run is listening |
+| Wake: Error | Listening stopped; the tooltip says why. Click to try again |
+| Wake: Off | Not listening. Click, or press the toggle shortcut, to start |
+| Wake: Other window | Another window of the same editor is listening |
+| Wake: No commands | None of the routes' commands are available in this editor |
+
 ## Settings
 
 | Setting | Default | Description |
@@ -276,7 +306,7 @@ The lock lives in the extension's global storage, which windows of the same edit
 | `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming. Routes with `handoff: "manual"` wait for you instead |
 | `wakeWord.enableOnStartup` | `true` | Start listening when the editor opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
-| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, resume on regain |
+| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, and resume when it is focused again. The status bar shows `Wake: Unfocused` meanwhile |
 | `wakeWord.confidenceThreshold` | `0.05` | Trigger threshold (0.01 to 0.9) for wake phrase detection. Lower detects more easily, higher gives fewer false positives |
 | `wakeWord.confirmationMode` | `false` | Require the wake phrase twice within 5 seconds before triggering. Reduces false positives in noisy environments. |
 | `wakeWord.audioDevice` | `""` | Microphone to use: a case-insensitive substring of the device name (e.g. `"USB"`) or a device index. Empty for the system default. |
@@ -287,11 +317,25 @@ The lock lives in the extension's global storage, which windows of the same edit
 
 ```json
 {
-  "wakeWord.audioDevice": "Blue Yeti"
+  "wakeWord.audioDevice": "Headset"
 }
 ```
 
-Changing it restarts the engine. If the value matches no device, or more than one, the error notification says so and names the value.
+Changing it restarts the engine. If the value matches no device, or more than one, the error notification says so and names the value. **Wake Word: Show Diagnostics** lists your input devices with their names and index numbers.
+
+## Commands
+
+Every command is in the Command Palette under **Wake Word**. Toggle Listening also has a shortcut, **Shift+Alt+W** (**Ctrl+Cmd+W** on macOS), which works from the editor, the terminal, and an assistant's panel, and from a foot pedal that sends a key combination. Change it in Keyboard Shortcuts.
+
+| Command | What it does |
+| --- | --- |
+| Wake Word: Enable Listening | Start listening, or resume after a handoff |
+| Wake Word: Disable Listening | Stop listening and release the microphone |
+| Wake Word: Toggle Listening | The status bar click: turn listening off or on, or resume after a manual handoff |
+| Wake Word: Calibrate | Listen for 15 seconds and report each phrase heard, without running any route |
+| Wake Word: Show Diagnostics | Write a report to the Wake Word output channel, with Show Log, Copy to Clipboard, and Report Issue |
+| Wake Word: Open Settings | Open the Settings editor at Wake Word's settings |
+| Wake Word: Reset Microphone Consent | Forget the consent given, so the next start asks again |
 
 ## Common command IDs
 
@@ -307,6 +351,22 @@ Useful values for the `command` field in your routes. Command IDs listed are for
 | Quick Open | `workbench.action.quickOpen` |
 | Toggle Sidebar | `workbench.action.toggleSidebarVisibility` |
 | New File | `workbench.action.files.newUntitledFile` |
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| The status bar shows **Wake: Error** | Hover over it for the reason, or open the **Wake Word** output channel. Fix what it names, then click the status bar to try again |
+| Nothing is heard | Run **Wake Word: Show Diagnostics**: it lists your input devices and marks the one in use. Choose another with `wakeWord.audioDevice`, then run **Wake Word: Calibrate** to see what is heard |
+| macOS: nothing is heard | Allow your editor in System Settings > Privacy & Security > Microphone, then quit and reopen it |
+| Windows: nothing is heard | In Settings > Privacy & security > Microphone, turn on microphone access and "Let desktop apps access your microphone" |
+| Windows: **Wake: Error** as soon as listening starts | Install the [Microsoft Visual C++ Redistributable (x64)](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist), then enable listening again |
+| A Bluetooth headset sounds worse while listening | Keeping its microphone open switches the headset to its lower-quality call mode. Set `wakeWord.audioDevice` to your computer's built-in microphone |
+| A remote window (SSH, WSL, dev container) | Wake Word runs on your own machine, beside the microphone. If it was installed on the remote host, open it in the Extensions view and choose **Install Locally** |
+| The shortcut does nothing in the terminal | Add `wakeWord.toggle` to `terminal.integrated.commandsToSkipShell` in your settings |
+| Reporting a problem | Run **Developer: Set Log Level**, choose **Wake Word**, then **Debug**, and repeat what went wrong: the output channel now shows the engine's detail. Then run **Wake Word: Show Diagnostics** and choose **Report Issue**: the report is copied and a new issue opens for you to paste it into, check, and submit |
+
+The log and the report never contain audio or anything you said, and device names that look like a person's are shortened in the report.
 
 ## Privacy
 
