@@ -66,7 +66,16 @@ Capture errors are reported by `src/mic_errors.rs`,
 switching on decibri's stable error codes, and naming `wakeWord.audioDevice`
 when the user chose a device. A stream that fails while running, such as a
 device that is unplugged, is fatal: `ERROR:` and exit 1, so the extension
-restarts the engine.
+restarts the engine, and the new process opens whatever device is the default
+by then. An error before the engine has said `READY` in a listening session,
+such as no microphone or a device name that matches nothing, is also `ERROR:`
+and exit 1, but the extension reports it once and does not restart the engine:
+a new process would fail the same way.
+
+The permission message names the editor that started the engine, from
+`editorName` in the config line, because the operating system grants
+microphone access to that application; without the field it says "your
+editor". decibri 6.3.0 does not raise its permission error yet.
 
 ### Keyword spotting
 
@@ -453,6 +462,7 @@ The first line is a JSON config object:
   "modelDir": "<path>",
   "debugMode": false,
   "audioDevice": "",
+  "editorName": "<the editor's product name>",
   "keywordLines": ["▁HE Y ▁C LA U DE :3.0 #0.05"],
   "phraseMap": { "HEY CLAUDE": "hey claude" }
 }
@@ -474,8 +484,11 @@ catches any such line that arrives anyway.
 spotter-wide threshold; each line carries its own. `modelDir` is the keyword
 spotting model directory described above. `audioDevice` is a device index when
 it is nothing but digits, otherwise a case-insensitive name substring; empty
-means the system default. `vadModelPath` and `ortLibraryPath` are described
-above; the extension does not send them.
+means the system default. `editorName` is the editor's product name as the
+editor reports it, named in the permission message; control characters in it
+become spaces, and a blank or missing value means "your editor".
+`vadModelPath` and `ortLibraryPath` are described above; the extension does
+not send them.
 
 Every line after the config is a command:
 
@@ -502,7 +515,7 @@ command is never dropped.
 | `DETECTED:<phrase>` | a wake phrase was heard; the phrase is as configured, lower-cased |
 | `PAUSED` | microphone closed, everything else still loaded |
 | `RELEASED` | microphone closed for good, the process is exiting |
-| `ERROR:<msg>` | fatal; the process exits 1 |
+| `ERROR:<msg>` | fatal; the process exits 1. Before a `READY` in the listening session the extension reports it once; after one, it restarts the engine |
 | `DEBUG:<msg>` | diagnostics, only when `debugMode` is true |
 | `SELF-TEST:<line>` | `--self-test` only |
 

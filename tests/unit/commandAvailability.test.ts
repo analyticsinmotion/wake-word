@@ -479,3 +479,70 @@ describe("formatSetAsideNotification", () => {
     expect(formatSetAsideNotification(setAside)).toContain("needs Claude Code (anthropic.claude-code)");
   });
 });
+
+describe("a remote window", () => {
+  // Wake Word runs on the local machine; extensions on the remote host are
+  // not among the ones this host lists, and their commands are registered
+  // only once those extensions start.
+  function remote(registered: string[], extensions: InstalledExtension[] = []) {
+    return commandSources(registered, extensions, "wsl");
+  }
+
+  it("counts a command it cannot see as unverified rather than missing", () => {
+    expect(commandStatus("claude-vscode.focus", remote(WORKBENCH))).toBe("unverified");
+    expect(commandStatus("example.search", remote(WORKBENCH))).toBe("unverified");
+  });
+
+  it("still counts an editor command that is missing as missing: the editor's commands are seen from every host", () => {
+    expect(commandStatus("workbench.action.nothing", remote(WORKBENCH))).toBe("missing");
+  });
+
+  it("still sees what is registered, and what this host's extensions declare", () => {
+    expect(commandStatus("workbench.action.chat.open", remote(WORKBENCH))).toBe("registered");
+    expect(commandStatus("claude-vscode.focus", remote(WORKBENCH, [CLAUDE_CODE]))).toBe("declared");
+  });
+
+  it("listens for the Claude route when Claude Code may be on the remote host, and sets nothing aside", () => {
+    const availability = checkRouteAvailability(defaults(), DEFAULT_ROUTES, remote(WORKBENCH));
+    expect(labels(availability.listened)).toEqual(["Claude", "Chat", "Terminal"]);
+    expect(availability.setAside).toEqual([]);
+    expect(availability.unverified).toEqual([{ label: "Claude", command: "claude-vscode.focus", remote: "wsl" }]);
+  });
+
+  it("logs the unverified route once in a session, and tells the user nothing", () => {
+    const first = checkRouteAvailability(defaults(), DEFAULT_ROUTES, remote(WORKBENCH));
+    const report = planAvailabilityReport(first, null, [], false);
+    expect(report).toEqual({
+      lines: [
+        {
+          level: "info",
+          text:
+            'Route "Claude": claude-vscode.focus is not registered yet. This is a remote window (wsl), and ' +
+            "extensions on the remote host cannot be checked from here, so the route is listened for.",
+        },
+      ],
+      notification: null,
+      told: null,
+    });
+    const again = planAvailabilityReport(checkRouteAvailability(defaults(), DEFAULT_ROUTES, remote(WORKBENCH)), first, [], false);
+    expect(again.lines).toEqual([]);
+  });
+
+  it("forgets that the user was told about a route that is unverified now", () => {
+    // Told locally that Claude Code is missing; in a remote window it may not be.
+    const report = planAvailabilityReport(
+      checkRouteAvailability(defaults(), DEFAULT_ROUTES, remote(WORKBENCH)),
+      null,
+      [["Claude", "claude-vscode.focus", "action-missing"]],
+      false
+    );
+    expect(report.told).toEqual([]);
+    expect(report.notification).toBeNull();
+  });
+
+  it("gives an unverified route keyword lines like any route listened for", () => {
+    const availability = checkRouteAvailability(defaults(), DEFAULT_ROUTES, remote(WORKBENCH));
+    const spec = buildKeywordSpec(availability.listened, (text) => text.split(" ").map((w) => "▁" + w), 0.05);
+    expect(Object.values(spec.phraseMap)).toContain("hey claude");
+  });
+});

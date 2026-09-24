@@ -437,7 +437,7 @@ describe("route availability in the extension host", () => {
     expect(session.warnings).toHaveLength(1);
     expect(session.warnings[0]).toMatch(/^Wake Word is not listening: none of the routes' commands are available/);
     expect(session.warnings[0]).toContain("no installed extension provides example.search");
-    expect(session.status.text).toBe("$(mic-off) Wake: No commands");
+    expect(session.status.text).toBe("$(circle-slash) Wake: No commands");
     expect(lock.held).toBe(false);
 
     // Asking again says so again: the request would otherwise do nothing.
@@ -470,7 +470,7 @@ describe("route availability in the extension host", () => {
       vi.useRealTimers();
       await settle();
       expect(second.warnings).toEqual([]);
-      expect(second.status.text).toBe("$(mic-off) Wake: No commands");
+      expect(second.status.text).toBe("$(circle-slash) Wake: No commands");
     } finally {
       vi.useRealTimers();
     }
@@ -508,7 +508,7 @@ describe("route availability in the extension host", () => {
 
     expect(session.engine().startedWith).toEqual([]);
     expect(lock.held).toBe(false);
-    expect(session.status.text).toBe("$(mic-off) Wake: Off");
+    expect(session.status.text).toBe("$(circle-slash) Wake: Off");
   });
 
   it("lists the routes set aside in Show Diagnostics", async () => {

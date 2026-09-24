@@ -26,6 +26,16 @@ export enum ProgressLocation {
   Notification = 15,
 }
 
+export enum ExtensionKind {
+  UI = 1,
+  Workspace = 2,
+}
+
+export enum UIKind {
+  Desktop = 1,
+  Web = 2,
+}
+
 export class ThemeColor {
   constructor(public readonly id: string) {}
 }
@@ -42,8 +52,14 @@ export class MarkdownString {
   constructor(public value = "") {}
 }
 
+/**
+ * A local desktop window. A test of a remote window sets `remoteName` on the
+ * instance it imported.
+ */
 export const env = {
   appName: "Test Editor",
+  remoteName: undefined as string | undefined,
+  uiKind: UIKind.Desktop,
 };
 
 function notImplemented(name: string): never {
@@ -62,6 +78,9 @@ export const window = {
   showErrorMessage: () => notImplemented("window.showErrorMessage"),
   withProgress: () => notImplemented("window.withProgress"),
   onDidChangeWindowState: () => notImplemented("window.onDidChangeWindowState"),
+  get state(): never {
+    return notImplemented("window.state");
+  },
 };
 
 export const workspace = {

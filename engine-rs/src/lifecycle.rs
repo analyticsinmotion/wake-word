@@ -207,6 +207,8 @@ impl Ctx {
 /// How every microphone in this session is opened.
 struct CaptureOptions {
     device: AudioDevice,
+    /// The editor that started the engine, named in a permission error.
+    editor: Option<String>,
     vad_model: PathBuf,
     ort_library: Option<PathBuf>,
     debug: bool,
@@ -341,6 +343,7 @@ impl CaptureSession {
                         &error,
                         "Failed to open microphone",
                         &self.options.device,
+                        self.options.editor.as_deref(),
                     ));
                 }
             }
@@ -390,6 +393,7 @@ impl CaptureSession {
                     &error,
                     "Microphone error",
                     &self.options.device,
+                    self.options.editor.as_deref(),
                 ));
             }
         }
@@ -600,6 +604,7 @@ impl Lifecycle {
 
         let options = CaptureOptions {
             device: config.audio_device.clone(),
+            editor: config.editor_name.clone(),
             vad_model: assets::vad_model_path(config.vad_model_path.as_deref()),
             ort_library: config.ort_library_path.as_ref().map(PathBuf::from),
             debug: config.debug_mode,
@@ -1244,9 +1249,44 @@ mod tests {
         harness.fail_open_with("PERMISSION_DENIED", "Microphone permission denied.");
         assert_eq!(
             harness.sent(),
-            ["ERROR:Microphone access denied. Enable microphone access for VS Code in your system privacy settings."]
+            ["ERROR:Microphone access denied. Enable microphone access for your editor in your system privacy settings."]
         );
         assert_eq!(harness.lifecycle.exit_code(), Some(1));
+    }
+
+    #[test]
+    fn names_the_editor_from_the_config_when_microphone_access_is_denied() {
+        let mut harness = Harness::new();
+        harness.line(&config_with(r#""editorName":"Example Editor""#));
+        harness.complete_prepare();
+        harness.fail_open_with("PERMISSION_DENIED", "Microphone permission denied.");
+        assert_eq!(
+            harness.sent(),
+            ["ERROR:Microphone access denied. Enable microphone access for Example Editor in your system privacy settings."]
+        );
+    }
+
+    #[test]
+    fn names_the_editor_when_access_is_withdrawn_while_listening() {
+        let mut harness = Harness::new();
+        harness.line(&config_with(r#""editorName":"Example Editor""#));
+        harness.complete_prepare();
+        harness.complete_open(0);
+        let id = harness.last_open_id();
+        harness.report(
+            id,
+            CaptureReport::Failed(CaptureError {
+                code: Some("PERMISSION_DENIED"),
+                message: "Microphone permission denied.".to_string(),
+            }),
+        );
+        assert_eq!(
+            harness.protocol(),
+            [
+                "READY",
+                "ERROR:Microphone access denied. Enable microphone access for Example Editor in your system privacy settings."
+            ]
+        );
     }
 
     #[test]

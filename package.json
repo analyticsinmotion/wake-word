@@ -17,6 +17,9 @@
   "engines": {
     "vscode": "^1.85.0"
   },
+  "extensionKind": [
+    "ui"
+  ],
   "categories": [
     "Other"
   ],
@@ -166,7 +169,7 @@
         "wakeWord.audioDevice": {
           "type": "string",
           "default": "",
-          "description": "Microphone to listen on. Leave empty for the system default. Use a case-insensitive substring of the device name (e.g. 'USB' or 'Blue Yeti') or the device index number."
+          "description": "Microphone to listen on. Leave empty for the system default. Use a case-insensitive substring of the device name (e.g. 'USB' or 'Headset') or the device index number."
         }
       }
     }

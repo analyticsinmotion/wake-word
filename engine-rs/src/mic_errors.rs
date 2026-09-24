@@ -47,10 +47,16 @@ impl From<decibri::DecibriError> for CaptureError {
 /// a device, a lookup failure names the setting and the value: "no microphone
 /// found" is the wrong diagnosis on a machine with three microphones where the
 /// name simply matched none of them.
+///
+/// `editor` is the editor that started the engine, as the config line names
+/// it. Microphone permission is granted to that application, on macOS to the
+/// editor that launched the engine, so the permission message names it rather
+/// than any one editor; without a name it says "your editor".
 pub fn mic_error_message(
     error: &CaptureError,
     fallback_prefix: &str,
     device: &AudioDevice,
+    editor: Option<&str>,
 ) -> String {
     let chosen = match device {
         AudioDevice::Default => None,
@@ -85,21 +91,26 @@ pub fn mic_error_message(
             None => "The selected audio device is not a microphone. Check your audio device settings."
                 .to_string(),
         },
-        Some("PERMISSION_DENIED") => "Microphone access denied. Enable microphone access for VS Code in your system privacy settings.".to_string(),
+        Some("PERMISSION_DENIED") => format!(
+            "Microphone access denied. Enable microphone access for {} in your system privacy settings.",
+            editor.unwrap_or("your editor")
+        ),
         Some("DEVICE_FAILED") => format!("The microphone stopped responding: {message}"),
         // Every ONNX Runtime and Silero failure is the detector failing to
-        // start or to run. The threads and tensor codes are raised by the same
-        // load and inference paths as the others.
+        // start or to run. decibri raises these while loading the runtime and
+        // opening the model's session.
         Some(
             "ORT_INIT_FAILED"
             | "ORT_LOAD_FAILED"
             | "ORT_SESSION_BUILD_FAILED"
             | "ORT_THREADS_CONFIG_FAILED"
-            | "ORT_INFERENCE_FAILED"
-            | "ORT_TENSOR_CREATE_FAILED"
-            | "ORT_TENSOR_EXTRACT_FAILED"
             | "VAD_MODEL_LOAD_FAILED",
         ) => format!("Failed to start voice activity detection: {message}"),
+        // And these while scoring a chunk, which is after the microphone has
+        // opened, so the detector started and then failed.
+        Some("ORT_INFERENCE_FAILED" | "ORT_TENSOR_CREATE_FAILED" | "ORT_TENSOR_EXTRACT_FAILED") => {
+            format!("Voice activity detection failed: {message}")
+        }
         _ => format!("{fallback_prefix}: {message}"),
     }
 }
@@ -122,7 +133,16 @@ mod tests {
     }
 
     fn message(code: &'static str, device: &AudioDevice) -> String {
-        mic_error_message(&coded(code, "raw message"), PREFIX, device)
+        mic_error_message(&coded(code, "raw message"), PREFIX, device, None)
+    }
+
+    fn message_in(code: &'static str, editor: &str) -> String {
+        mic_error_message(
+            &coded(code, "raw message"),
+            PREFIX,
+            &AudioDevice::Default,
+            Some(editor),
+        )
     }
 
     #[test]
@@ -192,11 +212,43 @@ mod tests {
     }
 
     #[test]
-    fn points_at_the_privacy_settings_when_access_is_denied() {
+    fn names_the_editor_that_started_the_engine_when_access_is_denied() {
+        for editor in ["Example Editor", "Another Editor - Insiders"] {
+            assert_eq!(
+                message_in("PERMISSION_DENIED", editor),
+                format!("Microphone access denied. Enable microphone access for {editor} in your system privacy settings.")
+            );
+        }
+    }
+
+    #[test]
+    fn says_your_editor_when_access_is_denied_and_no_editor_is_named() {
         for device in [AudioDevice::Default, name("Desk Mic 2")] {
             assert_eq!(
                 message("PERMISSION_DENIED", &device),
-                "Microphone access denied. Enable microphone access for VS Code in your system privacy settings."
+                "Microphone access denied. Enable microphone access for your editor in your system privacy settings."
+            );
+        }
+    }
+
+    #[test]
+    fn names_the_editor_in_no_message_but_the_permission_one() {
+        // The other messages are about the device or the detector, which
+        // belong to the machine rather than to the editor.
+        for code in [
+            "MICROPHONE_NOT_FOUND",
+            "NO_MICROPHONE_FOUND",
+            "MULTIPLE_DEVICES_MATCH",
+            "NOT_AN_INPUT_DEVICE",
+            "DEVICE_FAILED",
+            "ORT_LOAD_FAILED",
+            "VAD_MODEL_LOAD_FAILED",
+            "STREAM_OPEN_FAILED",
+        ] {
+            assert_eq!(
+                message_in(code, "Example Editor"),
+                message(code, &AudioDevice::Default),
+                "{code}"
             );
         }
     }
@@ -216,14 +268,28 @@ mod tests {
             "ORT_LOAD_FAILED",
             "ORT_SESSION_BUILD_FAILED",
             "ORT_THREADS_CONFIG_FAILED",
-            "ORT_INFERENCE_FAILED",
-            "ORT_TENSOR_CREATE_FAILED",
-            "ORT_TENSOR_EXTRACT_FAILED",
             "VAD_MODEL_LOAD_FAILED",
         ] {
             assert_eq!(
                 message(code, &name("Desk Mic 2")),
                 "Failed to start voice activity detection: raw message",
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_call_a_failure_while_scoring_audio_a_failure_to_start() {
+        // These are raised by the inference run on each chunk, so they can
+        // arrive long after the detector started, while listening.
+        for code in [
+            "ORT_INFERENCE_FAILED",
+            "ORT_TENSOR_CREATE_FAILED",
+            "ORT_TENSOR_EXTRACT_FAILED",
+        ] {
+            assert_eq!(
+                message(code, &name("Desk Mic 2")),
+                "Voice activity detection failed: raw message",
                 "{code}"
             );
         }
@@ -239,7 +305,8 @@ mod tests {
             mic_error_message(
                 &coded("SOMETHING_NEW", "odd"),
                 "Microphone error",
-                &name("x")
+                &name("x"),
+                None
             ),
             "Microphone error: odd"
         );
@@ -251,7 +318,8 @@ mod tests {
             mic_error_message(
                 &CaptureError::uncoded("no device"),
                 PREFIX,
-                &AudioDevice::Default
+                &AudioDevice::Default,
+                None
             ),
             "Failed to open microphone: no device"
         );
@@ -379,7 +447,7 @@ mod tests {
             "No microphone found matching \"Desk Mic\""
         );
         assert_eq!(
-            mic_error_message(&converted, PREFIX, &name("Desk Mic")),
+            mic_error_message(&converted, PREFIX, &name("Desk Mic"), None),
             "No microphone matching \"Desk Mic\" was found. Check wakeWord.audioDevice against the input devices on this machine."
         );
     }

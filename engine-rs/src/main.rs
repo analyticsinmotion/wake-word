@@ -237,10 +237,13 @@ mod self_test {
                 ("not found".to_string(), model_line)
             }
             Err(error) => {
+                // The self-test runs from a terminal or CI, with no editor
+                // behind it to name.
                 return Err(mic_error_message(
                     &CaptureError::from(error),
                     "decibri failed to initialise",
                     &AudioDevice::Default,
+                    None,
                 ));
             }
         };

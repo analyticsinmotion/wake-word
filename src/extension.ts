@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as os from "os";
-import { WakePhrase, ISpeechEngine } from "./speechEngineInterface";
+import { EngineRestart, WakePhrase, ISpeechEngine } from "./speechEngineInterface";
 import {
   MODEL_NAME,
   MODEL_SHA256,
@@ -21,22 +21,27 @@ import {
   PendingConfirmation,
   RouteAvailability,
   SessionStats,
+  StatusBarState,
+  StatusFacts,
   checkRouteAvailability,
   clampThreshold,
   commandSources,
   createSessionStats,
   decideListenSettingsChange,
+  deriveStatus,
+  describeStatus,
   describeThreshold,
+  describeWindow,
   detectPhraseCollisions,
   evaluateConfirmation,
   filterValidRoutes,
   formatCalibrationReport,
   formatConfidence,
-  formatConfirmationStatus,
   formatDiagnostics,
   formatListenSettingsChange,
   formatPhraseChecks,
   formatPhraseChecksSummary,
+  formatRestart,
   formatSessionStats,
   phraseChecksKey,
   planAvailabilityReport,
@@ -46,6 +51,7 @@ import {
   resolveRoutes,
   setAsideKey,
   shouldDebounce,
+  statusBarView,
   validatePhraseQuality,
 } from "./wakeWordCore";
 import {
@@ -58,7 +64,6 @@ import {
 } from "./lockFile";
 
 let statusBarItem: vscode.StatusBarItem;
-let statusBarState: StatusBarState = "off";
 let outputChannel: vscode.OutputChannel;
 let countdownTimer: ReturnType<typeof setInterval> | null = null;
 let countdownRemaining = 0;
@@ -84,11 +89,29 @@ let listenSettingsChangedWhilePaused = false;
  * listening restarts as soon as it reports READY.
  */
 let listenSettingsChangedWhileStarting = false;
-/** A start is in flight: speechEngine.start() has been called, no `started` yet. */
+/**
+ * A start or a resume is in flight: speechEngine.start() or resume() has
+ * been called, or a resume is reading the commands first, and there is no
+ * `started` yet. Calibrate starts the engine itself and does not set it.
+ */
 let engineStarting = false;
 let calibration: CalibrationRun | null = null;
 /** Advanced by each detection's handoff and by cancelPendingHandoff(). */
 let handoffGeneration = 0;
+/**
+ * A detection's handoff is releasing the microphone and running the route's
+ * command. The only thing that shows the handoff in the status bar before
+ * its cooldown or manual pause begins.
+ */
+let handingOff = false;
+/** The engine's message when it failed and was not restarted; null otherwise. */
+let engineFailure: string | null = null;
+/**
+ * Where this extension runs in a remote window: UI, on the machine the window
+ * is shown on, as the manifest asks, unless `remote.extensionKind` overrides
+ * it. Undefined only where the editor does not say.
+ */
+let extensionKind: vscode.ExtensionKind | undefined;
 /** phraseChecksKey() of the routes whose phrase checks were last reported. */
 let lastPhraseChecksKey = "";
 /** The extension's global state: where the set-aside routes the user was told about are kept. */
@@ -176,7 +199,9 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
  */
 function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
   const config = vscode.workspace.getConfiguration("wakeWord");
-  return new SherpaEngine(context, readAudioDevice(config));
+  // The editor's own name, for a message about microphone permission, which
+  // the operating system grants to the editor that started the engine.
+  return new SherpaEngine(context, readAudioDevice(config), vscode.env.appName);
 }
 
 /**
@@ -200,27 +225,42 @@ function wireEngine(engine: ISpeechEngine, context: vscode.ExtensionContext): vo
   engine.on("started", () => {
     sessionStats.engineStarts++;
     engineStarting = false;
-    setStatusBar("listening");
+    engineFailure = null;
+    refreshStatusBar();
     calibration?.onEngineStarted?.();
     applyListenSettingsChangedWhileStarting(context);
   });
-  engine.on("paused", () => setStatusBar("handed-off"));
+  // Whoever paused the engine has already recorded why: a detection's
+  // handoff, the window losing focus, or Calibrate putting a handoff back.
+  engine.on("paused", () => refreshStatusBar());
   engine.on("stopped", () => {
     engineStarting = false;
-    setStatusBar("off");
+    refreshStatusBar();
+  });
+  engine.on("cancelled", () => {
+    log("info", "Model download cancelled: listening is off. Enable listening to download the speech model again.");
+    stopListening();
+  });
+  // The engine stopped on its own and is being brought back: logged, and
+  // shown in the status bar, but not raised as an error, because it may
+  // recover. The error event follows if it does not.
+  engine.on("restarting", (restart: EngineRestart) => {
+    log("warn", formatRestart(restart));
+    refreshStatusBar();
   });
   engine.on("debug", (info: string) => log("info", info));
   engine.on("warning", (msg: string) => log("warn", msg));
   engine.on("error", (err: Error) => {
     sessionStats.errors++;
     engineStarting = false;
+    engineFailure = err.message;
     log("error", err.message);
     vscode.window.showErrorMessage(`Wake Word error: ${err.message}`, "Show Log").then((choice) => {
       if (choice === "Show Log") {
         outputChannel.show();
       }
     });
-    setStatusBar("error");
+    refreshStatusBar();
     calibration?.finish("error");
   });
 }
@@ -239,6 +279,7 @@ export function activate(context: vscode.ExtensionContext) {
   lockPath = lockFilePath(context.globalStorageUri.fsPath);
   sessionStats = createSessionStats();
   extensionState = context.globalState;
+  extensionKind = context.extension?.extensionKind;
 
   speechEngine = createEngine(context);
   wireEngine(speechEngine, context);
@@ -253,7 +294,7 @@ export function activate(context: vscode.ExtensionContext) {
   statusBarItem.command = "wakeWord.toggle";
   context.subscriptions.push(statusBarItem);
 
-  setStatusBar("off");
+  refreshStatusBar();
   statusBarItem.show();
 
   // Register commands. Enable and a click that enables are the user asking
@@ -269,7 +310,9 @@ export function activate(context: vscode.ExtensionContext) {
         calibration.finish("cancelled");
       } else if (isManuallyPaused) {
         resumeFromManualHandoff();
-      } else if (speechEngine.isListening || speechEngine.isPaused) {
+      } else if (listeningWanted()) {
+        // Listening, handed off, paused, starting, or restarting: a click
+        // turns it off, as each of those tooltips says.
         stopListening();
       } else {
         return handleConsentThenStart(context, true);
@@ -312,7 +355,9 @@ export function activate(context: vscode.ExtensionContext) {
         // reports nothing and restores nothing; the rebuild below decides
         // what the new engine does.
         calibration?.finish("stopped");
-        const wasListening = speechEngine.isListening;
+        // A start or a restart under way was on its way to listening, and
+        // the new engine takes its place.
+        const wasListening = speechEngine.isListening || engineStarting || Boolean(speechEngine.restarting);
         // Whatever the old engine was doing, it is about to be disposed of.
         // A routes or threshold change in the same event needs nothing of
         // its own: every path out of here ends in a start, which reads the
@@ -338,6 +383,7 @@ export function activate(context: vscode.ExtensionContext) {
         } else if (wasListening) {
           void startListening();
         }
+        refreshStatusBar();
         return;
       }
 
@@ -364,24 +410,25 @@ export function activate(context: vscode.ExtensionContext) {
   // Pause when VS Code loses focus (opt-in)
   context.subscriptions.push(
     vscode.window.onDidChangeWindowState((state) => {
-      const config = vscode.workspace.getConfiguration("wakeWord");
-      if (!config.get<boolean>("pauseOnFocusLoss", false)) {
+      // A calibration run keeps the microphone whatever the focus does: it
+      // ends on its own timer, and then settles a focus pause itself.
+      if (calibration) {
         return;
       }
-
-      // A calibration run keeps the microphone: it ends on its own timer.
-      if (!state.focused && speechEngine.isListening && !calibration) {
-        isPausedByFocus = true;
-        clearConfirmation();
-        speechEngine.pause();
-        log("info", "Paused: window lost focus");
-      } else if (state.focused && isPausedByFocus) {
+      // A pause for focus ends when focus returns, even if the setting was
+      // turned off meanwhile: nothing else would end it, and the status bar
+      // says it resumes on focus.
+      if (state.focused && isPausedByFocus) {
         isPausedByFocus = false;
         log("info", "Resumed: window regained focus");
         // resumeListening(), not resume(): a routes change made while the
         // window was unfocused has to be applied, and resume() would bring
         // the engine back with the old phrases.
         void resumeListening();
+        return;
+      }
+      if (!state.focused && speechEngine.isListening && pausesOnFocusLoss()) {
+        pauseForFocus();
       }
     })
   );
@@ -423,7 +470,9 @@ async function handleConsentThenStart(
     void resumeListening();
     return;
   }
-  if (speechEngine.isListening || isStarting) {
+  // Already listening, or on the way: a second start would begin the model
+  // load again.
+  if (speechEngine.isListening || isStarting || engineStarting || speechEngine.isStarting) {
     return;
   }
 
@@ -454,7 +503,7 @@ async function handleConsentThenStart(
       await context.globalState.update(CONSENT_KEY, true);
       await startListening(explicit);
     } else {
-      setStatusBar("off");
+      refreshStatusBar();
     }
   } finally {
     isStarting = false;
@@ -498,6 +547,11 @@ async function startListening(explicit = false): Promise<void> {
     return;
   }
   waitingForCommands = false;
+  // This start decides afresh what the status bar says: a failure before it
+  // is behind it, and the engine is marked as starting only once it is asked
+  // to start, below.
+  engineFailure = null;
+  engineStarting = false;
 
   const config = vscode.workspace.getConfiguration("wakeWord");
   const routes = buildRoutes(config);
@@ -506,6 +560,7 @@ async function startListening(explicit = false): Promise<void> {
     vscode.window.showWarningMessage(
       "Wake Word: No wake phrases configured. Add phrases in settings."
     );
+    refreshStatusBar();
     return;
   }
 
@@ -514,8 +569,8 @@ async function startListening(explicit = false): Promise<void> {
   // no-op, so calling this on every start is safe.
   if (!acquireListenerLock()) {
     log("info", "Another editor window is listening. This window will take over if it stops.");
-    setStatusBar("other-window");
     startLockWatcher();
+    refreshStatusBar();
     return;
   }
   stopLockWatcher();
@@ -544,11 +599,16 @@ async function startListening(explicit = false): Promise<void> {
     `Starting: ${listened.length} routes${setAsideNote}, threshold=${describeThreshold(threshold, listened)}, ` +
       `devMode=${isDevMode}${deviceNote}`
   );
-  log("info", `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version}`);
+  log(
+    "info",
+    `OS: ${process.platform} ${process.arch}, VS Code: ${vscode.version} (${vscode.env.appName}), ` +
+      `window: ${currentWindow()}`
+  );
   reportPhraseChecks(listened);
 
   engineStarting = true;
-  speechEngine.start(listened, threshold, isDevMode);
+  void speechEngine.start(listened, threshold, isDevMode);
+  refreshStatusBar();
 }
 
 /**
@@ -562,7 +622,7 @@ function waitForCommands(): void {
   speechEngine.stop();
   releaseLock(lockPath);
   waitingForCommands = true;
-  setStatusBar("no-commands");
+  refreshStatusBar();
 }
 
 /**
@@ -577,11 +637,16 @@ function restartListening(context: vscode.ExtensionContext): void {
   void handleConsentThenStart(context);
 }
 
-/** What the extension is doing, for decideListenSettingsChange(). */
+/**
+ * What the extension is doing, for decideListenSettingsChange(). A restart
+ * after the engine stopped on its own counts as a start in flight: the
+ * restart brings back the settings the engine was started with, so a change
+ * that arrives meanwhile is applied once it is listening again.
+ */
 function listeningState(): ListeningState {
   return {
     listening: speechEngine.isListening,
-    starting: engineStarting,
+    starting: engineStarting || Boolean(speechEngine.restarting),
     paused: speechEngine.isPaused,
     cooldown: countdownTimer !== null,
     manualPause: isManuallyPaused,
@@ -662,11 +727,12 @@ function stopListening() {
   listenSettingsChangedWhilePaused = false;
   listenSettingsChangedWhileStarting = false;
   engineStarting = false;
+  engineFailure = null;
   waitingForCommands = false;
   lastDetectionTime = 0;
   speechEngine.stop();
   releaseLock(lockPath);
-  setStatusBar("off");
+  refreshStatusBar();
 }
 
 // ── Multi-window coordination ───────────────────────────────
@@ -762,11 +828,16 @@ function reportPhraseChecks(routes: readonly WakePhrase[]): void {
  *
  * Null when the list cannot be read. Every route is then listened for,
  * rather than setting aside routes that may work.
+ *
+ * In a remote window `vscode.extensions.all` lists only the extensions that
+ * run where this one does, on the local machine, so the remote's name goes
+ * with the sources: a command the remote host may provide is not judged
+ * missing. See commandStatus().
  */
 async function readCommandSources(): Promise<CommandSources | null> {
   try {
     const registered = await vscode.commands.getCommands();
-    return commandSources(registered, vscode.extensions.all);
+    return commandSources(registered, vscode.extensions.all, vscode.env.remoteName ?? null);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     log("warn", `Could not read the editor's commands (${message}): every route is listened for`);
@@ -904,6 +975,9 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
   // process and models loaded for the resume. If listening is stopped or
   // started while the release is under way, the handoff is abandoned.
   const handoff = ++handoffGeneration;
+  // Recorded before the pause, so the status bar the pause refreshes shows
+  // the handoff.
+  handingOff = true;
   const outcome = await releaseThenFire(
     async () => {
       await speechEngine.pause();
@@ -916,12 +990,14 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
   );
 
   if (outcome.kind === "superseded") {
+    // Whatever overtook the handoff has already set the state it shows.
     log(
       "info",
       `Handoff abandoned: listening changed while the microphone was being released, so "${phrase.command}" was not run`
     );
     return;
   }
+  handingOff = false;
   if (outcome.kind === "failed") {
     console.error(
       `[Wake Word] Failed to execute command "${phrase.command}":`,
@@ -954,6 +1030,7 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
  */
 function cancelPendingHandoff(): void {
   handoffGeneration++;
+  handingOff = false;
 }
 
 // ── Phrase confirmation ─────────────────────────────────────
@@ -969,19 +1046,14 @@ function beginConfirmationWait(label: string, confidence?: number): void {
     "info",
     `Confirmation: heard "${label}" once${formatConfidence(confidence)}, waiting for a second detection`
   );
-  statusBarItem.text = formatConfirmationStatus(label);
-  statusBarItem.tooltip =
-    `Heard "${label}". Say it again within ${CONFIRMATION_WINDOW_MS / 1000} seconds to confirm.`;
-  statusBarItem.backgroundColor = undefined;
+  refreshStatusBar();
   confirmationTimer = setTimeout(() => {
     confirmationTimer = null;
     pendingConfirmation = null;
     log("info", `Confirmation: "${label}" expired, resuming`);
-    // Only put Listening back if that is still the state underneath. An
-    // error during the wait has already set the bar itself.
-    if (speechEngine.isListening) {
-      setStatusBar("listening");
-    }
+    // Whatever the state underneath is now, listening or an error during
+    // the wait, is what the status bar shows.
+    refreshStatusBar();
   }, CONFIRMATION_WINDOW_MS);
 }
 
@@ -1020,12 +1092,6 @@ function startCountdown(seconds: number) {
   isManuallyPaused = false;
   countdownRemaining = seconds;
 
-  statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
-  statusBarItem.tooltip = "Mic handed off to assistant. Resuming soon.";
-  statusBarItem.backgroundColor = new vscode.ThemeColor(
-    "statusBarItem.warningBackground"
-  );
-
   countdownTimer = setInterval(() => {
     countdownRemaining--;
 
@@ -1034,9 +1100,10 @@ function startCountdown(seconds: number) {
       void resumeListening();
       log("info", "Resumed: cooldown expired");
     } else {
-      statusBarItem.text = `$(clock) Wake: ${countdownRemaining}s`;
+      refreshStatusBar();
     }
   }, 1000);
+  refreshStatusBar();
 }
 
 /**
@@ -1048,12 +1115,28 @@ function startCountdown(seconds: number) {
 function enterManualPause(): void {
   clearResumeTimer();
   isManuallyPaused = true;
-  setStatusBar("paused");
+  refreshStatusBar();
 }
 
 function resumeFromManualHandoff(): void {
   log("info", "Resumed: user resumed after manual handoff");
   void resumeListening();
+}
+
+/** Whether listening pauses while the window is not focused (opt-in). */
+function pausesOnFocusLoss(): boolean {
+  return vscode.workspace.getConfiguration("wakeWord").get<boolean>("pauseOnFocusLoss", false);
+}
+
+/** Pause because the window is not focused. Focus returning resumes it. */
+function pauseForFocus(): void {
+  // Recorded before the pause, so the status bar the pause refreshes says
+  // why: a pause for focus, not a handoff.
+  isPausedByFocus = true;
+  clearConfirmation();
+  speechEngine.pause();
+  log("info", "Paused: window lost focus");
+  refreshStatusBar();
 }
 
 async function resumeListening(): Promise<void> {
@@ -1063,6 +1146,12 @@ async function resumeListening(): Promise<void> {
   clearConfirmation();
   isManuallyPaused = false;
   lastDetectionTime = 0;
+  engineFailure = null;
+  // From here until the engine says READY, listening is on its way back:
+  // the status bar says so, and a settings change that arrives meanwhile
+  // waits for READY, since the resume that would have applied it has begun.
+  engineStarting = true;
+  refreshStatusBar();
   // resume() replays the routes and the threshold the engine was paused
   // with. After a change to either those are the wrong settings, so go
   // through a full start instead. The same goes for which routes are set
@@ -1076,9 +1165,11 @@ async function resumeListening(): Promise<void> {
     if (
       speechEngine.isPaused &&
       !listenSettingsChangedWhilePaused &&
+      !listenSettingsChangedWhileStarting &&
       setAsideKey(availability.setAside) === appliedSetAsideKey
     ) {
       speechEngine.resume();
+      refreshStatusBar();
       return;
     }
   }
@@ -1103,9 +1194,13 @@ type PriorState =
   | { kind: "waiting" }
   | { kind: "off" };
 
-/** What the extension was doing when Calibrate was run, so it can be put back. */
+/**
+ * What the extension was doing when Calibrate was run, so it can be put back.
+ * A start or a restart under way counts as listening: that is where it was
+ * going.
+ */
 function capturePriorState(): PriorState {
-  if (speechEngine.isListening) {
+  if (speechEngine.isListening || engineStarting || speechEngine.restarting) {
     return { kind: "listening" };
   }
   if (countdownTimer !== null) {
@@ -1182,6 +1277,10 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
+  // The run starts the engine itself, if it has to: a start or resume it
+  // overtook is no longer in flight, and an earlier failure is behind it.
+  engineStarting = false;
+  engineFailure = null;
   log(
     "info",
     `Calibration: starting (${seconds}s, threshold=${describeThreshold(threshold, routes)}, was ${prior.kind})`
@@ -1211,6 +1310,7 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
             timer = null;
           }
           calibration = null;
+          refreshStatusBar();
           // A promise settles once, so a later outcome is ignored.
           resolve(result);
         };
@@ -1225,7 +1325,7 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
 
         const openWindow = () => {
           run.startedAt = Date.now();
-          setStatusBar("calibrating");
+          refreshStatusBar();
           progress.report({ message: `Say your wake phrases now (${seconds} seconds)` });
           timer = setTimeout(() => run.finish("completed"), CALIBRATION_DURATION_MS);
         };
@@ -1238,6 +1338,7 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
         // The window opens once the engine reports READY, so a slow start,
         // a model download on a first run included, does not eat into it.
         progress.report({ message: "Starting the speech engine..." });
+        refreshStatusBar();
         run.onEngineStarted = () => {
           run.onEngineStarted = null;
           if (timer) {
@@ -1342,8 +1443,19 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
   lastDetectionTime = 0;
   switch (prior.kind) {
     case "listening":
-      if (speechEngine.isListening) {
-        setStatusBar("listening");
+    case "focus-paused":
+      // The run ignored focus, so settle it now as the focus handler would
+      // have: a pause for focus if the window is unfocused and the setting
+      // is on, and listening otherwise. isPausedByFocus is as the run found
+      // it: nothing clears it during a run.
+      if (pausesOnFocusLoss() && !vscode.window.state.focused) {
+        pauseForFocus();
+      } else {
+        if (isPausedByFocus) {
+          isPausedByFocus = false;
+          log("info", "Resumed: after calibration, the focus pause no longer applies");
+        }
+        refreshStatusBar();
       }
       break;
     case "cooldown":
@@ -1355,9 +1467,6 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
       speechEngine.pause();
       enterManualPause();
       break;
-    case "focus-paused":
-      speechEngine.pause();
-      break;
     case "waiting":
       // Listening was waiting for a route's command. A start checks the
       // commands again and either listens or goes back to waiting.
@@ -1367,45 +1476,28 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
     case "off":
       speechEngine.stop();
       releaseLock(lockPath);
-      setStatusBar("off");
+      refreshStatusBar();
       break;
   }
 }
 
 // ── Diagnostics ─────────────────────────────────────────────
 
-/** What the extension is doing, in words, for Show Diagnostics. */
+/**
+ * What the extension is doing, in words, for Show Diagnostics: the state the
+ * status bar shows, so the report and the status bar never disagree.
+ */
 function describeState(): string {
-  if (calibration) {
-    return "calibrating";
-  }
-  if (lockWatchTimer !== null) {
-    return "standing by: another window is listening";
-  }
-  if (statusBarState === "error") {
-    return "error (see the error lines earlier in this channel)";
-  }
-  if (speechEngine.isListening) {
-    return pendingConfirmation
-      ? `listening, waiting to confirm "${pendingConfirmation.phrase}"`
-      : "listening";
-  }
-  if (countdownTimer !== null) {
-    return `handed off, resuming in ${countdownRemaining}s`;
-  }
-  if (isManuallyPaused) {
-    return "handed off, waiting for you to resume";
-  }
-  if (isPausedByFocus) {
-    return "paused while the window is unfocused";
-  }
-  if (speechEngine.isPaused) {
-    return "paused";
-  }
-  if (waitingForCommands) {
-    return "waiting: none of the routes' commands are available";
-  }
-  return "not listening";
+  return describeStatus(currentStatus());
+}
+
+/** Local or remote, and where this extension runs. See describeWindow(). */
+function currentWindow(): string {
+  return describeWindow(
+    vscode.env.remoteName,
+    extensionKind !== vscode.ExtensionKind.Workspace,
+    vscode.env.uiKind === vscode.UIKind.Web
+  );
 }
 
 /**
@@ -1430,6 +1522,7 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     osRelease: os.release(),
     editorName: vscode.env.appName,
     vscodeVersion: vscode.version,
+    window: currentWindow(),
     hostNodeVersion: process.version,
     engineBinaryPath,
     engineBinaryStatus,
@@ -1447,6 +1540,7 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     pauseOnFocusLoss: config.get<boolean>("pauseOnFocusLoss", false),
     enableOnStartup: config.get<boolean>("enableOnStartup", true),
     routes: availability.listened,
+    unverified: availability.unverified,
     setAside: availability.setAside,
     usingDefaultRoutes: filterValidRoutes(config.get<WakePhrase[]>("routes", [])).length === 0,
     phraseChecks: checkPhrases(availability.listened),
@@ -1490,75 +1584,60 @@ function tooltipWithSettingsLink(text: string): vscode.MarkdownString {
   return tooltip;
 }
 
-type StatusBarState =
-  | "off"
-  | "listening"
-  | "handed-off"
-  | "paused"
-  | "calibrating"
-  | "error"
-  | "other-window"
-  | "no-commands";
+/**
+ * What the extension knows now, for deriveStatus(). Every status bar state is
+ * derived from these, never set directly, so the status bar cannot say more
+ * than they do: it says Listening only while the engine says it is, and
+ * shows a handoff only while a detection's handoff is under way.
+ */
+function statusFacts(): StatusFacts {
+  const calibrationOpen = calibration !== null && calibration.startedAt !== 0;
+  return {
+    listening: speechEngine.isListening,
+    calibrating: calibrationOpen,
+    confirming: pendingConfirmation?.phrase ?? null,
+    handingOff,
+    cooldownSeconds: countdownTimer !== null ? countdownRemaining : null,
+    manualPause: isManuallyPaused,
+    focusPaused: isPausedByFocus,
+    restarting: speechEngine.restarting ?? null,
+    // A calibration run waiting for its engine is a start as well.
+    starting: engineStarting || Boolean(speechEngine.isStarting) || (calibration !== null && !calibrationOpen),
+    error: engineFailure,
+    standingBy: lockWatchTimer !== null,
+    waitingForCommands,
+  };
+}
 
-function setStatusBar(state: StatusBarState) {
-  statusBarState = state;
-  switch (state) {
-    case "off":
-      statusBarItem.text = "$(mic-off) Wake: Off";
-      statusBarItem.tooltip = tooltipWithSettingsLink("Click to enable wake word listening.");
-      statusBarItem.backgroundColor = undefined;
-      break;
-    case "listening":
-      statusBarItem.text = "$(mic) Wake: Listening";
-      statusBarItem.tooltip = tooltipWithSettingsLink(
-        "Listening for wake words. Click to disable."
-      );
-      statusBarItem.backgroundColor = undefined;
-      break;
-    case "handed-off":
-      statusBarItem.text = "$(mic-filled) Wake: Active";
-      statusBarItem.tooltip =
-        "Mic handed off to assistant. Will resume listening automatically.";
-      statusBarItem.backgroundColor = new vscode.ThemeColor(
-        "statusBarItem.warningBackground"
-      );
-      break;
-    case "paused":
-      statusBarItem.text = "$(debug-pause) Wake: Paused";
-      statusBarItem.tooltip = "Mic handed to assistant. Click to resume listening.";
-      statusBarItem.backgroundColor = new vscode.ThemeColor(
-        "statusBarItem.warningBackground"
-      );
-      break;
-    case "calibrating":
-      statusBarItem.text = "$(pulse) Wake: Calibrating";
-      statusBarItem.tooltip =
-        "Listening for wake phrases without acting on them. Click to cancel.";
-      statusBarItem.backgroundColor = undefined;
-      break;
-    case "error":
-      statusBarItem.text = "$(error) Wake: Error";
-      statusBarItem.tooltip = "Wake word encountered an error. Click to retry.";
-      statusBarItem.backgroundColor = new vscode.ThemeColor(
-        "statusBarItem.errorBackground"
-      );
-      break;
-    case "other-window":
-      statusBarItem.text = "$(mic-off) Wake: Other window";
-      statusBarItem.tooltip =
-        "Another editor window is already listening. Only one instance listens " +
-        "at a time. This window takes over automatically when that one stops.";
-      statusBarItem.backgroundColor = undefined;
-      break;
-    case "no-commands":
-      // Route labels and commands are the user's text and never go in this
-      // trusted tooltip; the notification and Show Diagnostics name them.
-      statusBarItem.text = "$(mic-off) Wake: No commands";
-      statusBarItem.tooltip = tooltipWithSettingsLink(
-        "None of the routes' commands are available in this editor, so the microphone is off. " +
-          "Listening starts once one is available. Click to check again."
-      );
-      statusBarItem.backgroundColor = undefined;
-      break;
+function currentStatus(): StatusBarState {
+  return deriveStatus(statusFacts());
+}
+
+/** Show the state the facts give. Called after anything they are made of changes. */
+function refreshStatusBar(): void {
+  if (!statusBarItem) {
+    return;
   }
+  const view = statusBarView(currentStatus());
+  statusBarItem.text = view.text;
+  // Only the extension's own text goes into a trusted tooltip: a state that
+  // carries a route label or an engine message has no settings link.
+  statusBarItem.tooltip = view.settingsLink ? tooltipWithSettingsLink(view.tooltip) : view.tooltip;
+  statusBarItem.backgroundColor = view.background
+    ? new vscode.ThemeColor(`statusBarItem.${view.background}Background`)
+    : undefined;
+}
+
+/**
+ * Listening is on or on its way: listening, handed off, paused for focus,
+ * starting, or restarting. A status bar click then turns it off.
+ */
+function listeningWanted(): boolean {
+  return (
+    speechEngine.isListening ||
+    speechEngine.isPaused ||
+    engineStarting ||
+    Boolean(speechEngine.isStarting) ||
+    Boolean(speechEngine.restarting)
+  );
 }

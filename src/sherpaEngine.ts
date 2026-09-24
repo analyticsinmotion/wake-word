@@ -12,12 +12,13 @@ import {
   readFileSync,
   unlinkSync,
 } from "fs";
+import type { ClientRequest, IncomingMessage } from "http";
 import * as path from "path";
 import * as https from "https";
 import { pipeline } from "stream/promises";
 import * as vscode from "vscode";
 import { buildKeywordSpec, keywordTexts, skippedPhraseWarning } from "./keywords";
-import { ISpeechEngine, WakePhrase } from "./speechEngineInterface";
+import { EngineRestart, ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 import { extractTarGz } from "./tarExtract";
 import { Tokenised, readVocabulary, tokenise } from "./tokeniser";
 import {
@@ -46,6 +47,18 @@ import {
  * once per wake phrase. The process ends on stop(), dispose(), a crash, or a
  * pause the child does not acknowledge in time.
  *
+ * A child that fails is restarted only when a restart can help. Before the
+ * engine has listened in this session, a failure is one of configuration or
+ * environment: no microphone, a device name that matches nothing, microphone
+ * permission, a missing inference runtime, a model that does not load. The
+ * same child would fail the same way seconds later, so its ERROR is reported
+ * once and nothing is restarted. Once the engine has listened, a failure is
+ * the microphone going away under it, such as a device unplugged, and a new
+ * child opens whatever device is there now, so it is restarted after a
+ * backoff, and only when the restarts run out is the child's last message
+ * reported. A child that ends without an ERROR line, a crash, is restarted in
+ * either case.
+ *
  * Supports Windows, macOS, and Linux.
  */
 export class SherpaEngine extends EventEmitter implements ISpeechEngine {
@@ -53,11 +66,20 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   private currentPhrases: WakePhrase[] = [];
   private _isListening = false;
   private _isPaused = false;
+  private _isStarting = false;
   private _killedIntentionally = false;
   private currentThreshold = DEFAULT_THRESHOLD;
   private currentDebugMode = false;
   private retryCount = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The restart in progress after the child stopped on its own, or null. */
+  private restartState: EngineRestart | null = null;
+  /**
+   * A child has said READY since the last stop() or final failure: the
+   * engine has listened in this session. An ERROR before that is reported
+   * once; after it, the child is restarted. See the class comment.
+   */
+  private hasListened = false;
   private releaseTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Advanced by every start() and stop(). start() awaits the model check
@@ -121,10 +143,15 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    * system default, otherwise a device index or a case-insensitive name
    * substring. It is fixed for the life of the engine; the extension builds
    * a new engine when the setting changes.
+   *
+   * `editorName` is the editor's own name, `vscode.env.appName`. The child
+   * names it in a message about microphone permission, which the operating
+   * system grants to the editor that started it.
    */
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly audioDevice: string = ""
+    private readonly audioDevice: string = "",
+    private readonly editorName: string = ""
   ) {
     super();
   }
@@ -137,7 +164,33 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     return this._isPaused;
   }
 
+  get isStarting(): boolean {
+    return this._isStarting;
+  }
+
+  get restarting(): EngineRestart | null {
+    return this.restartState;
+  }
+
+  /**
+   * Start listening. A start supersedes a restart still pending from a
+   * crash: it carries the phrases, threshold, and debug mode to use now.
+   */
   async start(phrases: WakePhrase[], confidenceThreshold = DEFAULT_THRESHOLD, debugMode = false): Promise<void> {
+    if (this._isListening) {
+      return;
+    }
+    this.restartState = null;
+    this._isStarting = true;
+    return this.launch(phrases, confidenceThreshold, debugMode);
+  }
+
+  /**
+   * Check the model, tokenise the phrases, and spawn a child. Used by start()
+   * and by everything that brings the engine back on its own: a restart after
+   * a crash, and a resume whose child has gone.
+   */
+  private async launch(phrases: WakePhrase[], confidenceThreshold: number, debugMode: boolean): Promise<void> {
     if (this._isListening) {
       return;
     }
@@ -164,8 +217,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     try {
       modelDir = await ensureModel(this.context, debugMode ? (msg: string) => this.emit("debug", msg) : undefined);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.emit("error", new Error("Model unavailable: " + message));
+      if (generation !== this.startGeneration) {
+        // Stopped or superseded during the check: whatever the download
+        // came to is no longer this start's to report.
+        this.emit("debug", "Start abandoned: stopped during the model check");
+      } else if (err instanceof DownloadCancelledError) {
+        this.cancelStart();
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        this.fail(new Error("Model unavailable: " + message));
+      }
       return;
     }
 
@@ -188,7 +249,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     } catch (err: unknown) {
       if (generation === this.startGeneration) {
         const message = err instanceof Error ? err.message : String(err);
-        this.emit("error", new Error("Could not tokenise the wake phrases: " + message));
+        this.fail(new Error("Could not tokenise the wake phrases: " + message));
       } else {
         this.emit("debug", "Start abandoned: stopped while the phrases were tokenised");
       }
@@ -215,7 +276,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       this.emit("warning", skippedPhraseWarning(skipped));
     }
     if (spec.keywordLines.length === 0) {
-      this.emit("error", new Error("No valid phrases to detect"));
+      this.fail(new Error("No valid phrases to detect"));
       return;
     }
 
@@ -227,7 +288,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     // say which file was meant.
     const problem = prepareNativeEngine(binary);
     if (problem) {
-      this.emit("error", new Error(problem));
+      this.fail(new Error(problem));
       return;
     }
     this.emit("debug", `Spawning: ${binary}`);
@@ -256,6 +317,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       modelDir,
       debugMode,
       audioDevice: this.audioDevice,
+      editorName: this.editorName,
       keywordLines: spec.keywordLines,
       phraseMap: spec.phraseMap,
     };
@@ -275,6 +337,12 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     });
 
     proc.on("error", (err) => {
+      if (this.process !== proc) {
+        return;
+      }
+      // A process that never started cannot close later: its listeners go
+      // now, so a late event from it is not taken for a crash.
+      proc.removeAllListeners("close");
       this._isListening = false;
       this._isPaused = false;
       this.process = null;
@@ -282,17 +350,26 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
       // The binary was there a moment ago, checked by prepareNativeEngine():
       // say which file would not start, and why.
-      this.emit("error", new Error(`Failed to start the speech engine at ${binary}: ${err.message}`));
+      this.fail(new Error(`Failed to start the speech engine at ${binary}: ${err.message}`));
     });
 
-    proc.on("exit", (code) => {
+    // 'close', not 'exit': Node can report the exit before the last of the
+    // child's stdout has been read, and a child that failed prints its ERROR
+    // line just before it exits. 'close' comes once stdout has ended, so an
+    // ERROR line, if there was one, has been handled by then.
+    proc.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      if (this.process !== proc) {
+        return;
+      }
       const wasListening = this._isListening;
+      const wasStarting = this._isStarting || this.restartState !== null;
       const wasPaused = this.childPaused;
       this._isListening = false;
       this.process = null;
       this.resetChildState();
 
-      this.emit("debug", `Process exited: code=${code}, killed=${this._killedIntentionally}`);
+      const ended = signal ? `signal ${signal}` : `exit code ${code}`;
+      this.emit("debug", `Process exited: ${ended}, killed=${this._killedIntentionally}`);
 
       if (this._killedIntentionally) {
         if (wasListening && !this._isPaused) {
@@ -309,31 +386,111 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         return;
       }
 
+      // It ended without an ERROR line: a crash, which is restarted whether
+      // or not the engine had listened. See the class comment.
       if (code !== 0) {
-        const msg = `exit code ${code}`;
-        if (this.retryCount < SherpaEngine.MAX_RETRIES) {
-          const delay = SherpaEngine.RETRY_DELAYS[this.retryCount];
-          this.retryCount++;
-          this.emit(
-            "warning",
-            `Audio engine crashed: ${msg}. Retrying in ${delay / 1000}s ` +
-              `(attempt ${this.retryCount}/${SherpaEngine.MAX_RETRIES})...`
-          );
-          this.retryTimer = setTimeout(() => {
-            this.retryTimer = null;
-            this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
-          }, delay);
-          return;
-        }
-
-        this.emit("error", new Error(`${msg} (failed after ${SherpaEngine.MAX_RETRIES} retries)`));
+        this.scheduleRestart(null, ended);
         return;
       }
 
-      if (wasListening && !this._isPaused) {
+      // It exited cleanly without being asked to, as it does on a signal from
+      // outside. Nothing is restarted and nothing is starting any more.
+      this._isStarting = false;
+      this.restartState = null;
+      if ((wasListening || wasStarting) && !this._isPaused) {
         this.emit("stopped");
       }
     });
+  }
+
+  /**
+   * Give up and report why, once: a start that cannot go ahead, a child that
+   * failed before the engine had listened, or restarts that ran out. The
+   * engine is left stopped, and the next start begins a new session with the
+   * full number of restarts.
+   */
+  private fail(error: Error): void {
+    this._isStarting = false;
+    this.restartState = null;
+    this.hasListened = false;
+    this.retryCount = 0;
+    this.emit("error", error);
+  }
+
+  /**
+   * The user cancelled the start from the model download's progress
+   * notification. Nothing failed: `cancelled` tells the extension, which
+   * turns listening off, and the next start is free to download again.
+   */
+  private cancelStart(): void {
+    this._isStarting = false;
+    this.restartState = null;
+    this.hasListened = false;
+    this.retryCount = 0;
+    this.emit("cancelled");
+  }
+
+  /**
+   * The child printed ERROR, which it does only for a fatal error, just
+   * before it exits 1.
+   *
+   * The child is killed at once, so nothing it holds outlives the line and
+   * its exit is not taken for a crash. Whether it is then restarted depends
+   * on whether the engine has listened in this session: see the class
+   * comment. A child paused for a handoff is not restarted, for the reason a
+   * crash while paused is not.
+   */
+  private onChildError(proc: ChildProcess, message: string): void {
+    const wasPaused = this.childPaused;
+    this._isListening = false;
+    this.forceKill(proc);
+
+    if (wasPaused) {
+      this.emit("warning", `Speech engine error while paused: ${message}. The next resume starts it again.`);
+      return;
+    }
+    if (!this.hasListened) {
+      this.fail(new Error(message));
+      return;
+    }
+    this.scheduleRestart(message, "exit code 1");
+  }
+
+  /**
+   * The child stopped on its own: restart it after the next backoff delay,
+   * or give up once MAX_RETRIES restarts have been made since it last said
+   * READY.
+   *
+   * `message` is the child's ERROR text, or null when it ended without one;
+   * `ended` is how the process ended. Giving up reports the child's own
+   * message where there was one, which says what is wrong, and otherwise
+   * that the engine kept stopping.
+   */
+  private scheduleRestart(message: string | null, ended: string): void {
+    if (this.retryCount >= SherpaEngine.MAX_RETRIES) {
+      this.fail(
+        new Error(
+          message ??
+            `The speech engine stopped unexpectedly (${ended}) and did not recover after ` +
+              `${SherpaEngine.MAX_RETRIES} restarts.`
+        )
+      );
+      return;
+    }
+    const delayMs = SherpaEngine.RETRY_DELAYS[this.retryCount];
+    this.retryCount++;
+    this._isStarting = false;
+    this.restartState = {
+      attempt: this.retryCount,
+      attempts: SherpaEngine.MAX_RETRIES,
+      delayMs,
+      reason: message ?? ended,
+    };
+    this.emit("restarting", this.restartState);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.launch(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
+    }, delayMs);
   }
 
   /** Act on one line of the current child's stdout. */
@@ -358,6 +515,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         this.childReady = true;
         this._isListening = true;
         this._isPaused = false;
+        this._isStarting = false;
+        this.restartState = null;
+        this.hasListened = true;
         this.retryCount = 0;
         this.emit("started");
         break;
@@ -376,7 +536,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         this.emit("debug", event.message);
         break;
       case "error":
-        this.emit("error", new Error(event.message));
+        if (this.process) {
+          this.onChildError(this.process, event.message);
+        }
         break;
       case "detected":
         // Listening ended when pause() was called. A detection the child made
@@ -407,6 +569,10 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     // a privacy defect, so this runs unconditionally.
     this.clearRetryTimer();
     this.retryCount = 0;
+    this.restartState = null;
+    this._isStarting = false;
+    // The session ends here: an error in the next one is judged afresh.
+    this.hasListened = false;
     // Likewise a start() still awaiting the model check: see startGeneration.
     this.startGeneration++;
 
@@ -454,6 +620,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       // engine resumable, so it becomes a paused engine with no process.
       if (this.retryTimer) {
         this.clearRetryTimer();
+        this.restartState = null;
         this._isPaused = true;
         this.emit("paused");
       }
@@ -482,6 +649,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
 
     this.retryCount = 0;
+    this._isStarting = true;
 
     // The usual case: the paused child is alive with its models loaded and
     // only the microphone has to reopen. Its READY sets the engine listening,
@@ -501,7 +669,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       this.forceKill(proc);
     }
     this.emit("debug", "Resume: no engine process to resume, starting a new one");
-    this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
+    void this.launch(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
   }
 
   dispose(): void {
@@ -602,7 +770,8 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       if (resumeRequested && this._isPaused) {
         this.emit("debug", "Resume: the engine did not pause in time, starting a new one");
         this.retryCount = 0;
-        this.start(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
+        this._isStarting = true;
+        void this.launch(this.currentPhrases, this.currentThreshold, this.currentDebugMode);
       }
     }, SherpaEngine.PAUSE_TIMEOUT_MS);
     return acknowledged;
@@ -636,6 +805,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     proc.stdout?.removeAllListeners("data");
     proc.stderr?.removeAllListeners("data");
     proc.removeAllListeners("exit");
+    proc.removeAllListeners("close");
     proc.removeAllListeners("error");
     proc.on("error", () => {
       /* the child is going away */
@@ -872,6 +1042,177 @@ export function redirectLimitExceeded(hops: number, max: number = MAX_REDIRECTS)
 }
 
 /**
+ * How long the model download waits for data before it gives up: from the
+ * request to the response, and between one chunk of the body and the next.
+ *
+ * It is a limit on silence, not on the whole download, so a slow connection
+ * that keeps delivering is never cut off, however long the 17 MB takes. A
+ * working connection is not silent for this long: a request is answered in
+ * well under a second, and even a few kilobytes a second means a chunk every
+ * second or two. Half a minute leaves room for a slow first connection, a
+ * proxy, or a network switch mid-download, and is still short enough that a
+ * stalled download is reported while the progress notification is on screen.
+ */
+export const DOWNLOAD_INACTIVITY_MS = 30_000;
+
+/** The user cancelled the model download from its progress notification. */
+export class DownloadCancelledError extends Error {
+  constructor() {
+    super("The speech model download was cancelled.");
+    this.name = "DownloadCancelledError";
+  }
+}
+
+/** Where and how the model is downloaded from. Tests replace it with a local server. */
+export interface DownloadSource {
+  url: string;
+  /** `https.get`, or `http.get` for a server on the loopback interface. */
+  get: (url: string, callback: (res: IncomingMessage) => void) => ClientRequest;
+  /** See DOWNLOAD_INACTIVITY_MS. */
+  inactivityMs: number;
+}
+
+export const MODEL_SOURCE: DownloadSource = {
+  url: MODEL_URL,
+  get: (url, callback) => https.get(url, callback),
+  inactivityMs: DOWNLOAD_INACTIVITY_MS,
+};
+
+/** How downloadFile() reports progress, cancellation aside. */
+export interface DownloadOptions {
+  get: DownloadSource["get"];
+  inactivityMs: number;
+  /** Aborting it cancels the download: it rejects with DownloadCancelledError. */
+  signal?: AbortSignal;
+  /** Called for each chunk of the body, with the running total and the Content-Length, 0 if none. */
+  onData?: (received: number, total: number, chunk: number) => void;
+}
+
+/**
+ * Download `url` to `dest`, following redirects up to MAX_REDIRECTS.
+ *
+ * It gives up when no data arrives for `inactivityMs`, whether the server
+ * never answers or stops part way, and it stops when `signal` is aborted. Any
+ * failure removes what was written to `dest`, once the file is closed:
+ * Windows will not delete a file that is still open. A later download starts
+ * from nothing.
+ */
+export function downloadFile(url: string, dest: string, options: DownloadOptions): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new DownloadCancelledError());
+      return;
+    }
+
+    const file = createWriteStream(dest);
+    let request: ClientRequest | null = null;
+    let response: IncomingMessage | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+
+    const stopTimer = (): void => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const armTimer = (): void => {
+      stopTimer();
+      timer = setTimeout(() => {
+        const seconds = Math.max(1, Math.round(options.inactivityMs / 1000));
+        fail(
+          new Error(
+            `no data arrived for ${seconds} second${seconds === 1 ? "" : "s"}, so the download was stopped. ` +
+              "Check the network connection and enable listening to try again."
+          )
+        );
+      }, options.inactivityMs);
+    };
+
+    const onAbort = (): void => fail(new DownloadCancelledError());
+
+    function finish(): void {
+      stopTimer();
+      options.signal?.removeEventListener("abort", onAbort);
+    }
+
+    function fail(error: Error): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      finish();
+      response?.destroy();
+      request?.destroy();
+      const removePartial = (): void => {
+        try {
+          unlinkSync(dest);
+        } catch {
+          // Nothing was written, or it is already gone.
+        }
+        reject(error);
+      };
+      if (file.closed) {
+        removePartial();
+      } else {
+        file.once("close", removePartial);
+        file.destroy();
+      }
+    }
+
+    function get(target: string, hops: number): void {
+      armTimer();
+      const req = options.get(target, (res) => {
+        if (settled) {
+          res.resume();
+          return;
+        }
+        if (shouldFollowRedirect(res.statusCode, res.headers.location)) {
+          res.resume();
+          if (redirectLimitExceeded(hops)) {
+            fail(new Error(`Too many redirects (over ${MAX_REDIRECTS}) downloading model`));
+            return;
+          }
+          get(new URL(res.headers.location as string, target).toString(), hops + 1);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          fail(new Error(`HTTP ${res.statusCode} downloading model`));
+          return;
+        }
+        response = res;
+        armTimer();
+        const total = parseInt(res.headers["content-length"] || "0", 10);
+        let received = 0;
+        res.on("data", (chunk: Buffer) => {
+          armTimer();
+          received += chunk.length;
+          options.onData?.(received, total, chunk.length);
+        });
+        pipeline(res, file).then(
+          () => {
+            if (!settled) {
+              settled = true;
+              finish();
+              resolve();
+            }
+          },
+          (err: unknown) => fail(err instanceof Error ? err : new Error(String(err)))
+        );
+      });
+      request = req;
+      req.on("error", (err) => fail(err));
+    }
+
+    file.on("error", (err) => fail(err));
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    get(url, 0);
+  });
+}
+
+/**
  * Throw unless the downloaded archive matches the expected digest.
  *
  * Runs before extraction, so a tampered or truncated download never reaches
@@ -919,83 +1260,99 @@ export function modelStatus(storagePath: string): ModelStatus {
 }
 
 /**
+ * Downloads in flight, by storage directory. A second start while the first
+ * is still downloading, after a Disable and an Enable for instance, waits for
+ * the same download instead of writing a second copy over the first.
+ */
+const downloads = new Map<string, Promise<string>>();
+
+/**
  * Ensure the KWS model is downloaded to globalStorage.
  * Returns the path to the model directory.
+ *
+ * `source` is where the archive comes from; tests replace it with a server of
+ * their own.
  */
 export async function ensureModel(
   context: vscode.ExtensionContext,
-  debugLog?: (msg: string) => void
+  debugLog?: (msg: string) => void,
+  source: DownloadSource = MODEL_SOURCE
 ): Promise<string> {
-  const model = modelStatus(context.globalStorageUri.fsPath);
+  const storagePath = context.globalStorageUri.fsPath;
+  const model = modelStatus(storagePath);
 
   if (model.present) {
     debugLog?.("Model already present at " + model.dir);
     return model.dir;
   }
 
-  // Model missing or outdated — download
-  return downloadModel(context, model.dir, model.versionFile, debugLog);
+  const inFlight = downloads.get(storagePath);
+  if (inFlight) {
+    debugLog?.("Model download already in progress: waiting for it");
+    return inFlight;
+  }
+
+  // Model missing or outdated: download it.
+  const download = downloadModel(model.dir, model.versionFile, source, debugLog).finally(() => {
+    downloads.delete(storagePath);
+  });
+  downloads.set(storagePath, download);
+  return download;
 }
 
 async function downloadModel(
-  context: vscode.ExtensionContext,
   modelDir: string,
   versionFile: string,
+  source: DownloadSource,
   debugLog?: (msg: string) => void
 ): Promise<string> {
   return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
       title: "Wake Word: Downloading speech model (~17MB)...",
-      cancellable: false,
+      cancellable: true,
     },
-    async (progress) => {
+    async (progress, token) => {
       const storageDir = path.dirname(modelDir);
       mkdirSync(storageDir, { recursive: true });
 
-      debugLog?.("Downloading model from " + MODEL_URL);
+      debugLog?.("Downloading model from " + source.url);
       progress.report({ message: "Connecting..." });
 
       const tarballPath = path.join(storageDir, MODEL_NAME + ".tar.gz");
 
-      // Download tarball (following redirects — GitHub releases return 302 → CDN)
-      await new Promise<void>((resolve, reject) => {
-        const file = createWriteStream(tarballPath);
+      // Cancel on the notification stops the download where it is.
+      const abort = new AbortController();
+      const cancellation = token.onCancellationRequested(() => abort.abort());
+      try {
+        // GitHub answers a release asset with a redirect to a CDN host.
+        await downloadFile(source.url, tarballPath, {
+          get: source.get,
+          inactivityMs: source.inactivityMs,
+          signal: abort.signal,
+          onData: (received, total, chunk) => {
+            if (total > 0) {
+              progress.report({
+                message: `${Math.round((received / total) * 100)}%`,
+                increment: (chunk / total) * 100,
+              });
+            }
+          },
+        });
+      } finally {
+        cancellation.dispose();
+      }
 
-        function get(url: string, hops = 0): void {
-          https.get(url, (res) => {
-            if (shouldFollowRedirect(res.statusCode, res.headers.location)) {
-              if (redirectLimitExceeded(hops)) {
-                res.resume();
-                reject(
-                  new Error(`Too many redirects (over ${MAX_REDIRECTS}) downloading model`)
-                );
-                return;
-              }
-              get(res.headers.location as string, hops + 1);
-              return;
-            }
-            if (res.statusCode !== 200) {
-              reject(new Error(`HTTP ${res.statusCode} downloading model`));
-              return;
-            }
-            const total = parseInt(res.headers["content-length"] || "0", 10);
-            let received = 0;
-            res.on("data", (chunk: Buffer) => {
-              received += chunk.length;
-              if (total > 0) {
-                progress.report({
-                  message: `${Math.round((received / total) * 100)}%`,
-                  increment: (chunk.length / total) * 100,
-                });
-              }
-            });
-            pipeline(res, file).then(resolve).catch(reject);
-          }).on("error", reject);
+      // A Cancel that lands once the last byte is in still counts: nothing
+      // has been extracted yet, and the archive is removed with it.
+      if (token.isCancellationRequested) {
+        try {
+          unlinkSync(tarballPath);
+        } catch {
+          // non-fatal
         }
-
-        get(MODEL_URL);
-      });
+        throw new DownloadCancelledError();
+      }
 
       // Verify before extraction. The download followed redirects to a CDN
       // host and the files inside are loaded straight into the keyword

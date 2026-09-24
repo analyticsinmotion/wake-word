@@ -3,6 +3,7 @@ import {
   DiagnosticsInput,
   SetAsideRoute,
   createSessionStats,
+  describeWindow,
   formatDiagnostics,
   recordDetection,
   redactHome,
@@ -37,6 +38,7 @@ function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
     osRelease: "10.0.26200",
     editorName: "Visual Studio Code",
     vscodeVersion: "1.104.0",
+    window: "local",
     hostNodeVersion: "v22.19.0",
     engineBinaryPath: ENGINE_BINARY,
     engineBinaryStatus: "self-test OK, sherpa-onnx=1.13.8",
@@ -73,6 +75,7 @@ describe("formatDiagnostics", () => {
       "Version: 0.14.0",
       "Platform: win32 x64 (10.0.26200)",
       "VS Code: 1.104.0 (Visual Studio Code)",
+      "Window: local",
       "Node.js (extension host): v22.19.0",
       "Engine: sherpa-onnx",
       "Engine binary: ~\\.vscode\\extensions\\analytics-in-motion.wake-word\\bin\\wake-word-engine.exe " +
@@ -337,5 +340,47 @@ describe("describeLock", () => {
     expect(describeLock(state, 7, dead)).toBe(
       "stale (pid 8 is not running; the next window to start listening takes it over)"
     );
+  });
+});
+
+describe("describeWindow", () => {
+  it("says a local window is local", () => {
+    expect(describeWindow(undefined, true, false)).toBe("local");
+  });
+
+  it("names the remote and says Wake Word runs on the local machine, beside the microphone", () => {
+    expect(describeWindow("wsl", true, false)).toBe("remote (wsl); Wake Word runs on the local machine");
+    expect(describeWindow("ssh-remote", true, false)).toBe("remote (ssh-remote); Wake Word runs on the local machine");
+  });
+
+  it("says so when Wake Word has been made to run on the remote host", () => {
+    // Only the editor's remote.extensionKind setting can do this.
+    expect(describeWindow("dev-container", false, false)).toBe(
+      "remote (dev-container); Wake Word runs on the remote host, away from the local microphone"
+    );
+  });
+
+  it("says when the window is in a browser", () => {
+    expect(describeWindow("codespaces", false, true)).toBe(
+      "remote (codespaces), in a browser; Wake Word runs on the remote host, away from the local microphone"
+    );
+    expect(describeWindow(undefined, true, true)).toBe("local, in a browser");
+  });
+});
+
+describe("formatDiagnostics in a remote window", () => {
+  it("names the window, and marks a route whose command could not be checked there", () => {
+    const lines = formatDiagnostics(
+      input({
+        window: "remote (wsl); Wake Word runs on the local machine",
+        unverified: [{ label: "Claude", command: "claude-vscode.focus", remote: "wsl" }],
+      })
+    );
+    expect(lines).toContain("Window: remote (wsl); Wake Word runs on the local machine");
+    expect(lines).toContain(
+      '  "Claude" [hey claude] -> claude-vscode.focus (manual): not verified, remote window (wsl): ' +
+        "its command may be on the remote host"
+    );
+    expect(lines).toContain('  "Chat" [hey chat] -> workbench.action.chat.open (timer)');
   });
 });

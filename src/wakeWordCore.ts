@@ -1,5 +1,5 @@
 import { StringDecoder } from "string_decoder";
-import { WakePhrase } from "./speechEngineInterface";
+import { EngineRestart, WakePhrase } from "./speechEngineInterface";
 
 /**
  * Pure logic shared by the extension host and the speech engine.
@@ -163,31 +163,55 @@ export interface CommandSources {
   declared: ReadonlyMap<string, string>;
   /** Identifiers of the installed, enabled extensions, lower-cased. */
   installed: ReadonlySet<string>;
+  /**
+   * `vscode.env.remoteName` in a remote window, null in a local one. A remote
+   * window runs a second extension host on the remote machine, and
+   * `vscode.extensions.all` lists only the extensions running in the caller's
+   * own host, so the other host's extensions, and the commands they declare,
+   * are not in `declared` or `installed`. Their commands appear in
+   * `registered` once those extensions have started.
+   */
+  remote: string | null;
 }
 
 export function commandSources(
   registered: Iterable<string>,
-  extensions: readonly InstalledExtension[]
+  extensions: readonly InstalledExtension[],
+  remote: string | null = null
 ): CommandSources {
   return {
     registered: new Set(registered),
     declared: declaredCommands(extensions),
     installed: new Set(extensions.map((extension) => String(extension.id).toLowerCase())),
+    remote,
   };
 }
 
 /**
  * How a command is available: registered already, declared by an installed
- * extension that has not registered it yet, or neither. Command IDs are
- * compared exactly, as the editor compares them.
+ * extension that has not registered it yet, unverified, or missing. Command
+ * IDs are compared exactly, as the editor compares them.
+ *
+ * In a remote window a command that is neither registered nor declared here
+ * may still come from an extension on the other host, which has not started
+ * yet or registers the command only when it is first run, and which this check
+ * cannot see. Such a command is unverified, not missing. The editor's own
+ * commands are the exception: they are registered from startup and visible
+ * from every host, so one that is absent is missing.
  */
-export type CommandStatus = "registered" | "declared" | "missing";
+export type CommandStatus = "registered" | "declared" | "unverified" | "missing";
 
 export function commandStatus(command: string, sources: CommandSources): CommandStatus {
   if (sources.registered.has(command)) {
     return "registered";
   }
-  return sources.declared.has(command) ? "declared" : "missing";
+  if (sources.declared.has(command)) {
+    return "declared";
+  }
+  if (sources.remote !== null && commandProvider(command, sources.installed).kind !== "editor") {
+    return "unverified";
+  }
+  return "missing";
 }
 
 /** What provides a missing command, where that is known. */
@@ -263,6 +287,14 @@ export interface DeclaredOnlyRoute {
   extension: string;
 }
 
+/** A listened route whose command cannot be checked, because it may come from the remote host. */
+export interface UnverifiedRoute {
+  label: string;
+  command: string;
+  /** The remote, as `vscode.env.remoteName` names it. */
+  remote: string;
+}
+
 export interface RouteAvailability {
   /** The routes to listen for, in their configured order. */
   listened: WakePhrase[];
@@ -270,6 +302,8 @@ export interface RouteAvailability {
   setAside: SetAsideRoute[];
   /** Listened routes that count as available only through a declaration. */
   declaredOnly: DeclaredOnlyRoute[];
+  /** Listened routes whose command could not be checked, in a remote window. */
+  unverified: UnverifiedRoute[];
 }
 
 /**
@@ -284,6 +318,11 @@ export interface RouteAvailability {
  * the check runs. Running a declared command starts its extension first, so
  * such a route works and is listened for.
  *
+ * In a remote window, a route whose command may come from the remote host,
+ * which this check cannot see, is listened for as unverified: see
+ * commandStatus(). A command missing there fails when it is run, as it did
+ * before any check existed, rather than a working route being set aside.
+ *
  * `defaults` identifies the built-in routes, by identity: resolveRoutes()
  * returns those objects themselves. With no sources, because the command
  * list could not be read, every route is listened for rather than setting
@@ -294,7 +333,7 @@ export function checkRouteAvailability(
   defaults: readonly WakePhrase[],
   sources: CommandSources | null
 ): RouteAvailability {
-  const availability: RouteAvailability = { listened: [], setAside: [], declaredOnly: [] };
+  const availability: RouteAvailability = { listened: [], setAside: [], declaredOnly: [], unverified: [] };
   for (const route of routes) {
     const status = sources ? commandStatus(route.command, sources) : "registered";
     if (sources && status === "missing") {
@@ -315,6 +354,9 @@ export function checkRouteAvailability(
         command: route.command,
         extension: sources.declared.get(route.command) ?? "",
       });
+    }
+    if (sources && status === "unverified") {
+      availability.unverified.push({ label: route.label, command: route.command, remote: sources.remote ?? "" });
     }
   }
   return availability;
@@ -425,11 +467,12 @@ export function formatNothingToListenFor(setAside: readonly SetAsideRoute[]): st
  * Decide what to say about an availability check.
  *
  * The output channel gets a line for each route newly set aside and each one
- * back, and for each route newly counted as available only through a
- * declaration, compared with the previous check of this session (`previous`,
- * null before the first, so every session's log explains the routes set
- * aside at its first check). It also gets a line whenever nothing can be
- * listened for at all.
+ * back, for each route newly counted as available only through a
+ * declaration, and for each route newly listened for unverified in a remote
+ * window, compared with the previous check of this session (`previous`, null
+ * before the first, so every session's log explains the routes set aside at
+ * its first check). It also gets a line whenever nothing can be listened for
+ * at all.
  *
  * A notification is raised only for a route set aside that the user has not
  * already been told about (`told`, the value remembered in global state), so
@@ -440,7 +483,7 @@ export function formatNothingToListenFor(setAside: readonly SetAsideRoute[]): st
  */
 export function planAvailabilityReport(
   availability: RouteAvailability,
-  previous: Pick<RouteAvailability, "setAside" | "declaredOnly"> | null,
+  previous: (Pick<RouteAvailability, "setAside" | "declaredOnly"> & { unverified?: readonly UnverifiedRoute[] }) | null,
   told: unknown,
   explicit: boolean
 ): AvailabilityReport {
@@ -476,6 +519,18 @@ export function planAvailabilityReport(
       text:
         `Route "${route.label}": ${route.command} is not registered yet, but ${route.extension} declares it, ` +
         "so the route is listened for.",
+    });
+  }
+  const unverifiedBefore = new Set((previous?.unverified ?? []).map((route) => JSON.stringify(route)));
+  for (const route of availability.unverified ?? []) {
+    if (unverifiedBefore.has(JSON.stringify(route))) {
+      continue;
+    }
+    lines.push({
+      level: "info",
+      text:
+        `Route "${route.label}": ${route.command} is not registered yet. This is a remote window (${route.remote}), ` +
+        "and extensions on the remote host cannot be checked from here, so the route is listened for.",
     });
   }
 
@@ -1259,6 +1314,303 @@ export function formatPhraseChecksSummary(count: number): string {
   return `Wake Word: ${plural(count, "phrase warning")} found. Check the output channel for details.`;
 }
 
+// -- Status bar ---------------------------------------------------------
+
+/**
+ * What the status bar item shows. Each state makes a claim about the
+ * microphone:
+ *
+ * - `listening`, `confirming`, and `calibrating`: it is open and listening;
+ * - `handed-off`, `cooldown`, and `paused`: it was handed to the assistant a
+ *   wake phrase opened;
+ * - every other state: it is closed, and the state says why.
+ *
+ * deriveStatus() reaches a state only when its claim holds.
+ */
+export type StatusBarState =
+  | { kind: "off" }
+  | { kind: "starting" }
+  | { kind: "listening" }
+  | { kind: "confirming"; label: string }
+  | { kind: "calibrating" }
+  | { kind: "handed-off" }
+  | { kind: "cooldown"; seconds: number }
+  | { kind: "paused" }
+  | { kind: "focus-paused" }
+  | { kind: "restarting"; attempt: number; attempts: number }
+  | { kind: "error"; message: string }
+  | { kind: "other-window" }
+  | { kind: "no-commands" };
+
+/** What the extension knows, from which deriveStatus() picks the state. */
+export interface StatusFacts {
+  /** The engine holds the microphone: it said READY and has not paused or stopped since. */
+  listening: boolean;
+  /** A calibration run's listening window is open. */
+  calibrating: boolean;
+  /** The route label of a first hearing waiting for its confirmation, or null. */
+  confirming: string | null;
+  /** A detection is releasing the microphone and running its route's command. */
+  handingOff: boolean;
+  /** Seconds left in a timer handoff's cooldown, or null. */
+  cooldownSeconds: number | null;
+  /** A manual handoff is waiting for the user to resume. */
+  manualPause: boolean;
+  /** Listening is paused because the window lost focus. */
+  focusPaused: boolean;
+  /** The engine stopped on its own and is being restarted, or null. */
+  restarting: { attempt: number; attempts: number } | null;
+  /** A start or a resume is under way, and the engine has not said READY. */
+  starting: boolean;
+  /** The engine failed and is not being restarted: its message, or null. */
+  error: string | null;
+  /** Another window holds the listener lock, and this one stands by. */
+  standingBy: boolean;
+  /** No route's command is available, so nothing is listened for. */
+  waitingForCommands: boolean;
+}
+
+/**
+ * Pick the status bar state from what the extension knows.
+ *
+ * The order is what keeps the status bar true. The states that say the
+ * microphone is listening are reached only through `listening`, which follows
+ * the engine's own READY. The handoff states are reached only through the
+ * facts a detection's handoff sets, so a pause for any other reason, such as
+ * the window losing focus, can never read as a handoff. The states that say
+ * the microphone is closed follow, the one that explains the most first: a
+ * restart outranks a start because the start it runs is part of the restart;
+ * both outrank a focus pause, which a start can overlap only when Calibrate
+ * starts the engine and will put the pause back afterwards; and all of them
+ * outrank an earlier error, which a new start leaves behind.
+ */
+export function deriveStatus(facts: StatusFacts): StatusBarState {
+  if (facts.listening) {
+    if (facts.calibrating) {
+      return { kind: "calibrating" };
+    }
+    return facts.confirming !== null ? { kind: "confirming", label: facts.confirming } : { kind: "listening" };
+  }
+  if (facts.handingOff) {
+    return { kind: "handed-off" };
+  }
+  if (facts.cooldownSeconds !== null) {
+    return { kind: "cooldown", seconds: facts.cooldownSeconds };
+  }
+  if (facts.manualPause) {
+    return { kind: "paused" };
+  }
+  if (facts.restarting) {
+    return { kind: "restarting", attempt: facts.restarting.attempt, attempts: facts.restarting.attempts };
+  }
+  if (facts.starting) {
+    return { kind: "starting" };
+  }
+  if (facts.focusPaused) {
+    return { kind: "focus-paused" };
+  }
+  if (facts.error !== null) {
+    return { kind: "error", message: facts.error };
+  }
+  if (facts.standingBy) {
+    return { kind: "other-window" };
+  }
+  return facts.waitingForCommands ? { kind: "no-commands" } : { kind: "off" };
+}
+
+/** How the status bar item renders a state. */
+export interface StatusBarView {
+  text: string;
+  tooltip: string;
+  /**
+   * End the tooltip with a link to the extension's settings. A tooltip with a
+   * command link has to be trusted markdown, so a state whose tooltip carries
+   * text that is not the extension's own, a route label or an engine message,
+   * never has one.
+   */
+  settingsLink: boolean;
+  /** The theme background for a state that asks for attention, or null. */
+  background: "warning" | "error" | null;
+}
+
+/**
+ * The icon of the four states in which this window's microphone is simply
+ * closed: Off, Unfocused, Other window, and No commands. `mic-off` would say
+ * it better, but it is a recent icon: an editor built on an older VS Code
+ * release does not have it and draws nothing in its place.
+ */
+const MICROPHONE_CLOSED_ICON = "$(circle-slash)";
+
+/** The text, tooltip, and colour of each status bar state. */
+export function statusBarView(state: StatusBarState): StatusBarView {
+  switch (state.kind) {
+    case "off":
+      return {
+        text: `${MICROPHONE_CLOSED_ICON} Wake: Off`,
+        tooltip: "Click to enable wake word listening.",
+        settingsLink: true,
+        background: null,
+      };
+    case "starting":
+      return {
+        text: "$(loading~spin) Wake: Starting",
+        tooltip:
+          "Starting the speech engine and opening the microphone. Wake phrases are not heard until " +
+          "the status bar says Listening. Click to cancel.",
+        settingsLink: false,
+        background: null,
+      };
+    case "listening":
+      return {
+        text: "$(mic) Wake: Listening",
+        tooltip: "Listening for wake words. Click to disable.",
+        settingsLink: true,
+        background: null,
+      };
+    case "confirming":
+      return {
+        text: formatConfirmationStatus(state.label),
+        tooltip: `Heard "${state.label}". Say it again within ${CONFIRMATION_WINDOW_MS / 1000} seconds to confirm.`,
+        settingsLink: false,
+        background: null,
+      };
+    case "calibrating":
+      return {
+        text: "$(pulse) Wake: Calibrating",
+        tooltip: "Listening for wake phrases without acting on them. Click to cancel.",
+        settingsLink: false,
+        background: null,
+      };
+    case "handed-off":
+      return {
+        text: "$(mic-filled) Wake: Active",
+        tooltip: "Mic handed off to assistant. Running the wake phrase's command.",
+        settingsLink: false,
+        background: "warning",
+      };
+    case "cooldown":
+      return {
+        text: `$(clock) Wake: ${state.seconds}s`,
+        tooltip: "Mic handed off to assistant. Resuming soon.",
+        settingsLink: false,
+        background: "warning",
+      };
+    case "paused":
+      return {
+        text: "$(debug-pause) Wake: Paused",
+        tooltip: "Mic handed to assistant. Click to resume listening.",
+        settingsLink: false,
+        background: "warning",
+      };
+    case "focus-paused":
+      return {
+        text: `${MICROPHONE_CLOSED_ICON} Wake: Unfocused`,
+        tooltip:
+          "Listening is paused while this window is not focused, and resumes when it is focused again " +
+          "(wakeWord.pauseOnFocusLoss). Click to disable listening.",
+        settingsLink: true,
+        background: null,
+      };
+    case "restarting":
+      return {
+        text: "$(sync~spin) Wake: Restarting",
+        tooltip:
+          `The speech engine stopped and is being restarted (attempt ${state.attempt} of ${state.attempts}). ` +
+          "The microphone is closed until it is listening again. Click to disable listening.",
+        settingsLink: false,
+        background: "warning",
+      };
+    case "error":
+      return {
+        text: "$(error) Wake: Error",
+        tooltip: `Wake word encountered an error:\n${state.message}\n\nClick to retry.`,
+        settingsLink: false,
+        background: "error",
+      };
+    case "other-window":
+      return {
+        text: `${MICROPHONE_CLOSED_ICON} Wake: Other window`,
+        tooltip:
+          "Another editor window is already listening. Only one instance listens " +
+          "at a time. This window takes over automatically when that one stops.",
+        settingsLink: false,
+        background: null,
+      };
+    case "no-commands":
+      return {
+        text: `${MICROPHONE_CLOSED_ICON} Wake: No commands`,
+        tooltip:
+          "None of the routes' commands are available in this editor, so the microphone is off. " +
+          "Listening starts once one is available. Click to check again.",
+        settingsLink: true,
+        background: null,
+      };
+  }
+}
+
+/** A status bar state in words, for the `State:` line of Show Diagnostics. */
+export function describeStatus(state: StatusBarState): string {
+  switch (state.kind) {
+    case "off":
+      return "not listening";
+    case "starting":
+      return "starting: the microphone is not listening yet";
+    case "listening":
+      return "listening";
+    case "confirming":
+      return `listening, waiting to confirm "${state.label}"`;
+    case "calibrating":
+      return "calibrating";
+    case "handed-off":
+      return "handing off: the microphone is released and the route's command is running";
+    case "cooldown":
+      return `handed off, resuming in ${state.seconds}s`;
+    case "paused":
+      return "handed off, waiting for you to resume";
+    case "focus-paused":
+      return "paused while the window is unfocused";
+    case "restarting":
+      return `restarting after the speech engine stopped (attempt ${state.attempt} of ${state.attempts})`;
+    case "error":
+      return `error: ${state.message}`;
+    case "other-window":
+      return "standing by: another window is listening";
+    case "no-commands":
+      return "waiting: none of the routes' commands are available";
+  }
+}
+
+/** The output channel line for a restart after the engine stopped on its own. */
+export function formatRestart(restart: EngineRestart): string {
+  const reason = restart.reason.trim().replace(/\.+$/, "");
+  return (
+    `Speech engine stopped: ${reason}. Restarting in ${Math.round(restart.delayMs / 1000)}s ` +
+    `(attempt ${restart.attempt} of ${restart.attempts}).`
+  );
+}
+
+// -- Where the extension runs -------------------------------------------
+
+/**
+ * Where the window is and where Wake Word runs, for Show Diagnostics and the
+ * start's log line.
+ *
+ * `remoteName` is `vscode.env.remoteName`: undefined in a local window, and in
+ * a remote window, such as WSL, SSH, a dev container or a Codespace, the name
+ * of the remote in every extension host. `runsLocally` says this extension
+ * runs on the machine the window is shown on, which is where the microphone
+ * is; the manifest asks for that, and only the editor's `remote.extensionKind`
+ * setting can override it. `inBrowser` is `vscode.env.uiKind` being Web.
+ */
+export function describeWindow(remoteName: string | undefined, runsLocally: boolean, inBrowser: boolean): string {
+  const browser = inBrowser ? ", in a browser" : "";
+  if (!remoteName) {
+    return `local${browser}`;
+  }
+  const where = runsLocally ? "the local machine" : "the remote host, away from the local microphone";
+  return `remote (${remoteName})${browser}; Wake Word runs on ${where}`;
+}
+
 // -- Diagnostics --------------------------------------------------------
 
 /**
@@ -1288,6 +1640,8 @@ export interface DiagnosticsInput {
   /** `vscode.env.appName`: the editor product the extension is running in. */
   editorName: string;
   vscodeVersion: string;
+  /** Local or remote, and where Wake Word runs: see describeWindow(). */
+  window: string;
   hostNodeVersion: string;
   /** The packaged engine binary the extension spawns. */
   engineBinaryPath: string;
@@ -1310,6 +1664,8 @@ export interface DiagnosticsInput {
   enableOnStartup: boolean;
   /** The routes listened for. */
   routes: readonly WakePhrase[];
+  /** Of those, the ones whose command could not be checked, in a remote window. */
+  unverified?: readonly UnverifiedRoute[];
   /** The routes set aside, listed apart from the ones listened for. */
   setAside: readonly SetAsideRoute[];
   usingDefaultRoutes: boolean;
@@ -1337,6 +1693,7 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     `Version: ${input.extensionVersion}`,
     `Platform: ${input.platform} ${input.arch} (${input.osRelease})`,
     `VS Code: ${input.vscodeVersion} (${input.editorName})`,
+    `Window: ${input.window}`,
     `Node.js (extension host): ${input.hostNodeVersion}`,
     "Engine: sherpa-onnx",
     `Engine binary: ${input.engineBinaryPath} (${input.engineBinaryStatus})`,
@@ -1372,8 +1729,14 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     );
   };
 
+  const unverified = new Map((input.unverified ?? []).map((route) => [JSON.stringify([route.label, route.command]), route]));
   for (const route of input.routes) {
-    lines.push(describeRoute(route));
+    const check = unverified.get(JSON.stringify([route.label, route.command]));
+    lines.push(
+      check
+        ? `${describeRoute(route)}: not verified, remote window (${check.remote}): its command may be on the remote host`
+        : describeRoute(route)
+    );
   }
 
   if (input.setAside.length === 0) {
