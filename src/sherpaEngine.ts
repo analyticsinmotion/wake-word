@@ -23,9 +23,11 @@ import { extractTarGz } from "./tarExtract";
 import { Tokenised, readVocabulary, tokenise } from "./tokeniser";
 import {
   DEFAULT_THRESHOLD,
+  DeviceListing,
   clampThreshold,
   createLineReader,
   matchRoute,
+  parseDeviceListing,
   parseEngineLine,
 } from "./wakeWordCore";
 
@@ -58,6 +60,10 @@ import {
  * backoff, and only when the restarts run out is the child's last message
  * reported. A child that ends without an ERROR line, a crash, is restarted in
  * either case.
+ *
+ * The verbose log, `detail` events, follows setDebugMode() at once: the host's
+ * own detail stops or starts, and a running child is told with `debug on` or
+ * `debug off`, so it is neither restarted nor reloaded.
  *
  * Supports Windows, macOS, and Linux.
  */
@@ -173,6 +179,27 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   }
 
   /**
+   * Turn the verbose log on or off. A child already running is told, and one
+   * started later is configured with it.
+   */
+  setDebugMode(on: boolean): void {
+    if (on === this.currentDebugMode) {
+      return;
+    }
+    this.currentDebugMode = on;
+    if (this.process) {
+      this.writeCommand(this.process, on ? "debug on" : "debug off");
+    }
+  }
+
+  /** A line for the verbose log, dropped while it is off. */
+  private detail(message: string): void {
+    if (this.currentDebugMode) {
+      this.emit("detail", message);
+    }
+  }
+
+  /**
    * Start listening. A start supersedes a restart still pending from a
    * crash: it carries the phrases, threshold, and debug mode to use now.
    */
@@ -215,7 +242,7 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     // Ensure model is downloaded
     let modelDir: string;
     try {
-      modelDir = await ensureModel(this.context, debugMode ? (msg: string) => this.emit("debug", msg) : undefined);
+      modelDir = await ensureModel(this.context, (msg: string) => this.detail(msg));
     } catch (err: unknown) {
       if (generation !== this.startGeneration) {
         // Stopped or superseded during the check: whatever the download
@@ -265,11 +292,11 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     // every text it asks for was tokenised above.
     const pieces = new Map(texts.map((text, i) => [text, tokenised.pieces[i]]));
     const spec = buildKeywordSpec(phrases, (text) => pieces.get(text) ?? [], safeThreshold, vocabulary);
-    if (debugMode) {
-      this.emit("debug", `Timing: bpe-load ${Math.max(0, tokenised.loadedAt - tokenisingSince)}ms`);
-      this.emit("debug", `Timing: tokenise ${Math.max(0, Date.now() - tokenised.loadedAt)}ms`);
+    if (this.currentDebugMode) {
+      this.detail(`Timing: bpe-load ${Math.max(0, tokenised.loadedAt - tokenisingSince)}ms`);
+      this.detail(`Timing: tokenise ${Math.max(0, Date.now() - tokenised.loadedAt)}ms`);
       for (const d of spec.details) {
-        this.emit("debug", `phrase: ${d.phrase} -> tokens: ${d.tokens} -> decoded: ${d.decoded}`);
+        this.detail(`phrase: ${d.phrase} -> tokens: ${d.tokens} -> decoded: ${d.decoded}`);
       }
     }
     for (const skipped of spec.skipped) {
@@ -312,10 +339,13 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     });
 
     // Send config as JSON line then leave stdin open (child reads more commands).
+    // The debug mode is read now, not when the start began: the verbose log
+    // can have been switched while the model was checked and the phrases
+    // tokenised.
     const config = {
       threshold: safeThreshold,
       modelDir,
-      debugMode,
+      debugMode: this.currentDebugMode,
       audioDevice: this.audioDevice,
       editorName: this.editorName,
       keywordLines: spec.keywordLines,
@@ -503,14 +533,11 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     switch (event.type) {
       case "ready":
         // The same READY answers a start and a resume.
-        if (this.currentDebugMode) {
-          this.emit(
-            "debug",
-            this.resumeSentAt
-              ? `Timing: resume-to-ready ${Date.now() - this.resumeSentAt}ms`
-              : `Timing: start-to-ready ${Date.now() - startedAt}ms`
-          );
-        }
+        this.detail(
+          this.resumeSentAt
+            ? `Timing: resume-to-ready ${Date.now() - this.resumeSentAt}ms`
+            : `Timing: start-to-ready ${Date.now() - startedAt}ms`
+        );
         this.resumeSentAt = 0;
         this.childReady = true;
         this._isListening = true;
@@ -525,15 +552,15 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         // Only a pause this engine is waiting on counts.
         if (this.pauseSettled) {
           this.emit("debug", "Mic release: acknowledged by engine (paused)");
-          if (this.currentDebugMode) {
-            this.emit("debug", `Timing: pause-to-ack ${Date.now() - this.pauseSentAt}ms`);
-          }
+          this.detail(`Timing: pause-to-ack ${Date.now() - this.pauseSentAt}ms`);
           this.pauseSentAt = 0;
           this.settlePause();
         }
         break;
       case "debug":
-        this.emit("debug", event.message);
+        // Sent only while the child's debug mode is on; one already on its
+        // way when the verbose log was switched off is dropped here.
+        this.detail(event.message);
         break;
       case "error":
         if (this.process) {
@@ -844,7 +871,10 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   /**
    * Send one command line. Returns false when the child is already gone.
    */
-  private writeCommand(proc: ChildProcess, command: "pause" | "resume" | "stop"): boolean {
+  private writeCommand(
+    proc: ChildProcess,
+    command: "pause" | "resume" | "stop" | "debug on" | "debug off"
+  ): boolean {
     const stdin = proc.stdin;
     if (!stdin || !stdin.writable || proc.exitCode !== null) {
       return false;
@@ -964,6 +994,24 @@ export function probeNativeEngine(binary: string, timeoutMs = 5000): Promise<str
       } else {
         resolve(err ? `could not run: ${err.message}` : "self-test printed nothing");
       }
+    });
+  });
+}
+
+/**
+ * The input devices, from the packaged binary's `--list-devices`, for Show
+ * Diagnostics. Listing opens no microphone. Never rejects: a binary that is
+ * missing, fails, or has not answered within `timeoutMs` gives a `failed`
+ * listing that says why.
+ */
+export function listInputDevices(binary: string, timeoutMs = 5000): Promise<DeviceListing> {
+  return new Promise((resolve) => {
+    if (!existsSync(binary)) {
+      resolve({ kind: "failed", reason: "the speech engine is missing from this installation" });
+      return;
+    }
+    execFile(binary, ["--list-devices"], { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+      resolve(parseDeviceListing(String(stdout), err ? `the engine could not list them: ${err.message}` : undefined));
     });
   });
 }

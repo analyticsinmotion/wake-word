@@ -116,6 +116,8 @@ interface Captured {
   warnings: string[];
   errors: Error[];
   debug: string[];
+  /** The verbose log. */
+  detail: string[];
 }
 
 /** Subscribe to everything. An unhandled 'error' would throw inside the engine. */
@@ -130,6 +132,7 @@ function capture(engine: SherpaEngine): Captured {
     warnings: [],
     errors: [],
     debug: [],
+    detail: [],
   };
   engine.on("started", () => c.started++);
   engine.on("stopped", () => c.stopped++);
@@ -140,6 +143,7 @@ function capture(engine: SherpaEngine): Captured {
   engine.on("warning", (msg) => c.warnings.push(msg));
   engine.on("error", (err) => c.errors.push(err));
   engine.on("debug", (info) => c.debug.push(info));
+  engine.on("detail", (info) => c.detail.push(info));
   return c;
 }
 
@@ -555,15 +559,15 @@ describe("tokenising the phrases", () => {
   it("logs the tokenising phases and each phrase's pieces in debug mode", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, true);
-    const lines = events.debug.filter((d) => !d.startsWith("Model already present"));
-    expect(lines.slice(0, 5)).toEqual([
+    const lines = events.detail.filter((d) => !d.startsWith("Model already present"));
+    expect(lines).toEqual([
       expect.stringMatching(/^Timing: bpe-load \d+ms$/),
       expect.stringMatching(/^Timing: tokenise \d+ms$/),
       "phrase: hey claude -> tokens: ▁HEY ▁CLAUDE -> decoded: HEY CLAUDE",
       "phrase: hey computer -> tokens: ▁HEY ▁COMPUTER -> decoded: HEY COMPUTER",
       "phrase: open terminal -> tokens: ▁OPEN ▁TERMINAL -> decoded: OPEN TERMINAL",
     ]);
-    expect(lines[5]).toMatch(/^Spawning: /);
+    expect(events.debug.find((d) => d.startsWith("Spawning: "))).toBeDefined();
   });
 
   it("times the model load from the start of tokenising", async () => {
@@ -574,17 +578,18 @@ describe("tokenising the phrases", () => {
     }));
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, true);
-    const bpeLoad = events.debug.find((d) => d.startsWith("Timing: bpe-load"));
+    const bpeLoad = events.detail.find((d) => d.startsWith("Timing: bpe-load"));
     const elapsed = Number(/(\d+)ms$/.exec(bpeLoad ?? "")?.[1]);
     expect(elapsed).toBeGreaterThanOrEqual(59_000);
     expect(elapsed).toBeLessThanOrEqual(60_000);
     // A load time in the future leaves nothing for the tokenise phase.
-    expect(events.debug).toContain("Timing: tokenise 0ms");
+    expect(events.detail).toContain("Timing: tokenise 0ms");
   });
 
   it("logs no tokenising lines outside debug mode", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, false);
+    expect(events.detail).toEqual([]);
     expect(events.debug.filter((d) => d.startsWith("Timing:") || d.startsWith("phrase:"))).toEqual([]);
   });
 
@@ -624,12 +629,13 @@ describe("stdout protocol", () => {
   it("reassembles lines split across chunks", async () => {
     const { engine, events } = makeEngine();
     await startAndReady(engine);
+    engine.setDebugMode(true);
     const proc = latest();
     proc.sendRaw("DETEC");
     proc.sendRaw("TED:hey claude\nDEB");
     expect(events.detected).toHaveLength(1);
     proc.sendRaw("UG:half a line\n");
-    expect(events.debug).toContain("half a line");
+    expect(events.detail).toContain("half a line");
   });
 
   it("handles several lines in one chunk", async () => {
@@ -639,12 +645,14 @@ describe("stdout protocol", () => {
     expect(events.detected.map((d) => d.phrase.label)).toEqual(["Claude", "Terminal"]);
   });
 
-  it("forwards DEBUG lines and stderr as debug events", async () => {
+  it("forwards DEBUG lines to the verbose log, and stderr as debug events", async () => {
     const { engine, events } = makeEngine();
-    await startAndReady(engine);
+    await engine.start(ROUTES, 0.3, true);
+    latest().sendLine("READY");
     latest().sendLine("DEBUG:VAD: speech");
     latest().sendStderr("  warning from a dependency \n");
-    expect(events.debug).toContain("VAD: speech");
+    expect(events.detail).toContain("VAD: speech");
+    expect(events.debug).not.toContain("VAD: speech");
     expect(events.debug).toContain("stderr: warning from a dependency");
   });
 
@@ -1147,9 +1155,10 @@ describe("pause", () => {
   it("sees a PAUSED that arrives behind other output in one chunk", async () => {
     const { engine, events } = makeEngine();
     const proc = await startAndReady(engine);
+    engine.setDebugMode(true);
     engine.pause();
     proc.sendRaw("DEBUG:VAD: silence\nPAUSED\n");
-    expect(events.debug).toContain("VAD: silence");
+    expect(events.detail).toContain("VAD: silence");
     expect(events.debug).toContain("Mic release: acknowledged by engine (paused)");
   });
 
@@ -1669,7 +1678,7 @@ describe("debug timing", () => {
     proc.sendLine("PAUSED");
     engine.resume();
     proc.sendLine("READY");
-    const timing = events.debug.filter((d) => d.startsWith("Timing:"));
+    const timing = events.detail.filter((d) => d.startsWith("Timing:"));
     expect(timing).toHaveLength(5);
     expect(timing[0]).toMatch(/^Timing: bpe-load \d+ms$/);
     expect(timing[1]).toMatch(/^Timing: tokenise \d+ms$/);
@@ -1683,14 +1692,99 @@ describe("debug timing", () => {
     const proc = await pausedEngine(engine);
     engine.resume();
     proc.sendLine("READY");
+    expect(events.detail.filter((d) => d.startsWith("Timing:"))).toEqual([]);
     expect(events.debug.filter((d) => d.startsWith("Timing:"))).toEqual([]);
   });
 
   it("forwards the child's own timing lines", async () => {
     const { engine, events } = makeEngine();
-    const proc = await startAndReady(engine);
+    await engine.start(ROUTES, 0.3, true);
+    const proc = latest();
+    proc.sendLine("READY");
     proc.sendLine("DEBUG:Timing: model-load 487ms");
-    expect(events.debug).toContain("Timing: model-load 487ms");
+    expect(events.detail).toContain("Timing: model-load 487ms");
+  });
+});
+
+// ── verbose log ─────────────────────────────────────────────
+
+describe("the verbose log switched while the engine runs", () => {
+  it("tells a listening child with debug on and debug off, and nothing else", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    expect(configLine(proc).debugMode).toBe(false);
+
+    engine.setDebugMode(true);
+    engine.setDebugMode(true);
+    engine.setDebugMode(false);
+    expect(commands(proc)).toEqual(["debug on", "debug off"]);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(engine.isListening).toBe(true);
+  });
+
+  it("starts and stops passing the child's DEBUG lines on at once", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    proc.sendLine("DEBUG:VAD: speech");
+    expect(events.detail).toEqual([]);
+
+    engine.setDebugMode(true);
+    proc.sendLine("DEBUG:debug lines on");
+    proc.sendLine("DEBUG:VAD: silence");
+    expect(events.detail).toEqual(["debug lines on", "VAD: silence"]);
+
+    engine.setDebugMode(false);
+    // Already on its way when the child was told.
+    proc.sendLine("DEBUG:VAD: speech");
+    expect(events.detail).toEqual(["debug lines on", "VAD: silence"]);
+  });
+
+  it("tells a child paused for a handoff, which keeps it for the resume", async () => {
+    const { engine } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.setDebugMode(true);
+    engine.resume();
+    expect(commands(proc)).toEqual(["pause", "debug on", "resume"]);
+  });
+
+  it("configures a child spawned after a switch made during the model check and tokenising", async () => {
+    const pending = deferred<{ pieces: string[][]; loadedAt: number }>();
+    mocks.tokenise.mockReturnValueOnce(pending.promise);
+    const { engine, events } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    await flush();
+    engine.setDebugMode(true);
+    pending.resolve({ pieces: [["▁HEY", "▁CLAUDE"], ["▁HEY", "▁COMPUTER"], ["▁OPEN", "▁TERMINAL"]], loadedAt: Date.now() });
+    await starting;
+    const proc = latest();
+    expect(configLine(proc).debugMode).toBe(true);
+    expect(commands(proc)).toEqual([]);
+    expect(events.detail.some((d) => d.startsWith("Timing: tokenise"))).toBe(true);
+  });
+
+  it("gives a child restarted after a crash the mode switched to since", async () => {
+    const { engine } = makeEngine();
+    await startAndReady(engine);
+    engine.setDebugMode(true);
+    await crashAndRetry(2000);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(configLine(latest()).debugMode).toBe(true);
+  });
+
+  it("passes on nothing for a phrase no route has, in the verbose log or anywhere else", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, true);
+    const proc = latest();
+    proc.sendLine("READY");
+    proc.sendLine("DETECTED:open the pod bay doors");
+    expect(events.detected).toEqual([]);
+    expect([...events.debug, ...events.detail, ...events.warnings].join("\n")).not.toContain("pod bay");
+  });
+
+  it("writes nothing when there is no child", () => {
+    const { engine } = makeEngine();
+    engine.setDebugMode(true);
+    expect(mocks.spawn).not.toHaveBeenCalled();
   });
 });
 
@@ -1953,6 +2047,7 @@ describe("dispose", () => {
       "error",
       "warning",
       "debug",
+      "detail",
     ]) {
       expect(engine.listenerCount(event)).toBe(0);
     }

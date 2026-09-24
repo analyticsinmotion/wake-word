@@ -35,8 +35,15 @@ export interface EngineRestart {
 }
 
 export interface ISpeechEngine {
+  /** `debugMode` turns the verbose log on for this start: see setDebugMode(). */
   start(phrases: WakePhrase[], threshold: number, debugMode: boolean): void | Promise<void>;
   stop(): void;
+  /**
+   * Turn the verbose log on or off: the engine's and the extension's detail,
+   * sent as `detail` events. Takes effect at once, a running engine included,
+   * which is told without being restarted, and holds for the next start.
+   */
+  setDebugMode(on: boolean): void;
   /**
    * Stop listening at once and release the microphone. The promise settles
    * once the microphone is known to be closed, whether the engine confirmed
@@ -65,7 +72,13 @@ export interface ISpeechEngine {
    */
   on(event: "error", cb: (err: Error) => void): this;
   on(event: "warning", cb: (msg: string) => void): this;
+  /** What the engine is doing: spawning, releasing the microphone, exiting. */
   on(event: "debug", cb: (info: string) => void): this;
+  /**
+   * The verbose log, sent only while it is on: timings, the tokenised
+   * phrases, the model check, and the engine's own `DEBUG:` lines.
+   */
+  on(event: "detail", cb: (info: string) => void): this;
   readonly isListening: boolean;
   readonly isPaused: boolean;
   /**

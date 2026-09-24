@@ -14,16 +14,20 @@
 //! | `ERROR:<msg>` | fatal, the process exits 1 |
 //! | `DEBUG:<msg>` | diagnostics, debug mode only |
 //! | `SELF-TEST:<line>` | `--self-test` only |
+//! | `DEVICES:<json>` | `--list-devices` only |
 
 use std::io::{self, Write};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::config::Config;
 
 /// Splits a byte stream into complete lines, carrying a trailing partial line
-/// into the next chunk. Mirrors `drainLines()`.
+/// into the next chunk, as `createLineReader()` in `src/wakeWordCore.ts` does
+/// for the engine's stdout.
 ///
 /// stdin arrives in chunks, not lines: one chunk can hold several commands,
 /// none at all, or half of one. Handling only the first line of a chunk loses
@@ -72,13 +76,16 @@ pub enum ControlLine {
     Resume,
     /// Close everything and exit.
     Stop,
+    /// `debug on` or `debug off`: start or stop writing `DEBUG:` lines, from
+    /// the next line on, microphones already open included.
+    Debug(bool),
     /// A blank line, which is ignored.
     Empty,
     /// Neither a command nor parsable JSON. Fatal.
     Invalid(String),
 }
 
-/// Parse one stdin line, matching `parseControlLine()`.
+/// Parse one stdin line.
 ///
 /// Commands match exactly once surrounding whitespace is trimmed: not by
 /// prefix and not case-insensitively, so `PAUSE` and `resume now` are invalid
@@ -90,6 +97,8 @@ pub fn parse_control_line(line: &str) -> ControlLine {
         "stop" => ControlLine::Stop,
         "pause" => ControlLine::Pause,
         "resume" => ControlLine::Resume,
+        "debug on" => ControlLine::Debug(true),
+        "debug off" => ControlLine::Debug(false),
         "" => ControlLine::Empty,
         _ => match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => ControlLine::Config(Config::from_json(&value)),
@@ -134,23 +143,63 @@ impl Sink for StdoutSink {
     }
 }
 
+/// Whether `DEBUG:` lines are written.
+///
+/// One switch is shared by the reporter and every microphone's capture
+/// thread, which drops its debug reports at the source while it is off. The
+/// config line sets it, and `debug on` and `debug off` change it later, so a
+/// microphone that is already open follows the change without being reopened.
+#[derive(Debug, Clone, Default)]
+pub struct DebugSwitch(Arc<AtomicBool>);
+
+impl DebugSwitch {
+    pub fn new(on: bool) -> DebugSwitch {
+        DebugSwitch(Arc::new(AtomicBool::new(on)))
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, on: bool) {
+        self.0.store(on, Ordering::Relaxed);
+    }
+}
+
+/// Two switches are equal when they are in the same position, so a request
+/// that carries one can still be compared in a test.
+impl PartialEq for DebugSwitch {
+    fn eq(&self, other: &DebugSwitch) -> bool {
+        self.is_on() == other.is_on()
+    }
+}
+
+impl Eq for DebugSwitch {}
+
 /// The stdout half of the protocol.
 pub struct Reporter {
     sink: Box<dyn Sink>,
-    debug_enabled: bool,
+    debug: DebugSwitch,
 }
 
 impl Reporter {
     pub fn new(sink: Box<dyn Sink>) -> Reporter {
         Reporter {
             sink,
-            debug_enabled: false,
+            // Off until the config line says otherwise.
+            debug: DebugSwitch::new(false),
         }
     }
 
-    /// Turn `DEBUG:` lines on, once the config line has said whether to.
+    /// Turn `DEBUG:` lines on or off: from the config line, then from `debug
+    /// on` and `debug off`.
     pub fn set_debug(&mut self, enabled: bool) {
-        self.debug_enabled = enabled;
+        self.debug.set(enabled);
+    }
+
+    /// The switch this reporter reads, for a capture thread to share.
+    pub fn debug_switch(&self) -> DebugSwitch {
+        self.debug.clone()
     }
 
     pub fn line(&mut self, line: &str) {
@@ -188,7 +237,7 @@ impl Reporter {
 
     /// Diagnostics, written only in debug mode.
     pub fn debug(&mut self, message: &str) {
-        if self.debug_enabled {
+        if self.debug.is_on() {
             self.line(&format!("DEBUG:{message}"));
         }
     }
@@ -202,6 +251,12 @@ impl Reporter {
     /// CI is the reader.
     pub fn self_test(&mut self, message: &str) {
         self.line(&format!("SELF-TEST:{message}"));
+    }
+
+    /// The `--list-devices` line: the input devices as one JSON array. See
+    /// `crate::devices`.
+    pub fn devices(&mut self, json: &str) {
+        self.line(&format!("DEVICES:{json}"));
     }
 }
 
@@ -252,6 +307,8 @@ mod tests {
             ControlLine::Pause => "pause",
             ControlLine::Resume => "resume",
             ControlLine::Stop => "stop",
+            ControlLine::Debug(true) => "debug on",
+            ControlLine::Debug(false) => "debug off",
             ControlLine::Empty => "empty",
             ControlLine::Invalid(_) => "invalid",
         }
@@ -372,6 +429,23 @@ mod tests {
         assert_eq!(kind("pause"), "pause");
         assert_eq!(kind("resume"), "resume");
         assert_eq!(kind("stop"), "stop");
+        assert_eq!(kind("debug on"), "debug on");
+        assert_eq!(kind("debug off"), "debug off");
+        assert_eq!(kind(" debug on\r"), "debug on");
+    }
+
+    #[test]
+    fn matches_the_debug_commands_exactly() {
+        for line in [
+            "debug",
+            "debug  on",
+            "Debug on",
+            "debug ON",
+            "debug true",
+            "debug on now",
+        ] {
+            assert_eq!(kind(line), "invalid", "{line} should be fatal");
+        }
     }
 
     #[test]
@@ -451,6 +525,7 @@ mod tests {
         reporter.detected("hey claude");
         reporter.error("Failed to open microphone: no device");
         reporter.self_test("OK");
+        reporter.devices("[]");
         assert_eq!(
             sink.lines(),
             [
@@ -460,8 +535,23 @@ mod tests {
                 "DETECTED:hey claude",
                 "ERROR:Failed to open microphone: no device",
                 "SELF-TEST:OK",
+                "DEVICES:[]",
             ]
         );
+    }
+
+    #[test]
+    fn shares_one_debug_switch_with_whoever_holds_a_copy() {
+        let sink = RecordingSink::new();
+        let mut reporter = Reporter::new(Box::new(sink.clone()));
+        let shared = reporter.debug_switch();
+        assert!(!shared.is_on());
+
+        reporter.set_debug(true);
+        assert!(shared.is_on(), "a copy taken earlier follows the change");
+        reporter.set_debug(false);
+        assert!(!shared.is_on());
+        assert!(reporter.debug_switch() == DebugSwitch::new(false));
     }
 
     #[test]

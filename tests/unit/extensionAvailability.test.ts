@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventEmitter } from "events";
 import type { InstalledExtension } from "../../src/wakeWordCore";
+import { createLogChannel } from "../mocks/logChannel";
 import type { WakePhrase } from "../../src/speechEngineInterface";
 
 /**
@@ -26,6 +27,10 @@ interface FakeEngine extends EventEmitter {
 }
 
 const engines = vi.hoisted(() => [] as FakeEngine[]);
+/** What the engine's device listing answers, per test. */
+const deviceListing = vi.hoisted(() => ({
+  answer: { kind: "listed", devices: [] } as unknown,
+}));
 const lock = vi.hoisted(() => ({ held: false, releases: 0 }));
 
 vi.mock("../../src/sherpaEngine", async () => {
@@ -36,6 +41,8 @@ vi.mock("../../src/sherpaEngine", async () => {
     startedWith: WakePhrase[][] = [];
     resumes = 0;
     stops = 0;
+    /** Every setDebugMode() call, in order. */
+    debugModes: boolean[] = [];
     constructor() {
       super();
       engines.push(this as unknown as FakeEngine);
@@ -69,6 +76,9 @@ vi.mock("../../src/sherpaEngine", async () => {
         this.emit("stopped");
       }
     }
+    setDebugMode(on: boolean): void {
+      this.debugModes.push(on);
+    }
     dispose(): void {
       this.stop();
       this.removeAllListeners();
@@ -81,6 +91,7 @@ vi.mock("../../src/sherpaEngine", async () => {
     modelStatus: () => ({ dir: "model", versionFile: "version.txt", present: true }),
     nativeEnginePath: () => "wake-word-engine",
     probeNativeEngine: () => Promise.resolve("self-test OK"),
+    listInputDevices: () => Promise.resolve(deviceListing.answer),
   };
 });
 
@@ -195,11 +206,8 @@ async function startSession(memento: Memento, settings: Record<string, unknown> 
   };
   let onExtensions: () => void = () => undefined;
 
-  vi.spyOn(vscode.window, "createOutputChannel").mockReturnValue({
-    appendLine: (line: string) => logs.push(line),
-    show: () => undefined,
-    dispose: () => undefined,
-  } as never);
+  const logChannel = createLogChannel(logs);
+  vi.spyOn(vscode.window, "createOutputChannel").mockReturnValue(logChannel.channel as never);
   vi.spyOn(vscode.window, "createStatusBarItem").mockReturnValue({
     ...disposable,
     show: () => undefined,
@@ -274,6 +282,7 @@ beforeEach(() => {
   world.registered = [...WORKBENCH];
   world.installed = [];
   world.getCommands = null;
+  deviceListing.answer = { kind: "listed", devices: [] };
 });
 
 afterEach(() => {

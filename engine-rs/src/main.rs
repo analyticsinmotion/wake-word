@@ -1,9 +1,13 @@
 //! `wake-word-engine`: the child process the Wake Word extension talks to.
 //!
 //! The extension writes a JSON config line to stdin, then `pause`,
-//! `resume`, and `stop` commands; the engine answers on stdout with `READY`,
-//! `DETECTED:<phrase>`, `PAUSED`, `RELEASED`, `ERROR:<msg>`, and, in debug
-//! mode, `DEBUG:<msg>`.
+//! `resume`, `stop`, `debug on`, and `debug off` commands; the engine answers
+//! on stdout with `READY`, `DETECTED:<phrase>`, `PAUSED`, `RELEASED`,
+//! `ERROR:<msg>`, and, in debug mode, `DEBUG:<msg>`.
+//!
+//! Two flags run something else and exit without reading stdin:
+//! `--self-test` checks the runtime files, and `--list-devices` lists the
+//! input devices (see `devices`). Neither opens a microphone.
 //!
 //! The engine captures audio through decibri, gates it with Silero voice
 //! activity detection, and feeds what passes the gate to a sherpa-onnx keyword
@@ -27,6 +31,7 @@
 mod assets;
 mod capture;
 mod config;
+mod devices;
 mod gate;
 mod hysteresis;
 mod lifecycle;
@@ -63,13 +68,15 @@ const SHUTDOWN_DRAIN_MS: u64 = 250;
 const PREPARE_DRAIN_MS: u64 = 3000;
 
 fn main() {
-    // --self-test runs before the stdin wiring below, which would otherwise
-    // hold the process open waiting for a config line that CI never sends.
-    if std::env::args()
-        .skip(1)
-        .any(|argument| argument == "--self-test")
-    {
+    // --self-test and --list-devices run before the stdin wiring below, which
+    // would otherwise hold the process open waiting for a config line that
+    // neither CI nor Show Diagnostics sends.
+    let flag = |name: &str| std::env::args().skip(1).any(|argument| argument == name);
+    if flag("--self-test") {
         run_self_test();
+    }
+    if flag("--list-devices") {
+        run_list_devices();
     }
 
     let (events, incoming) = mpsc::channel::<Event>();
@@ -123,6 +130,22 @@ fn run_self_test() -> ! {
         }
         Err(message) => {
             out.self_test(&format!("FAIL:{message}"));
+            flush_and_exit(1)
+        }
+    }
+}
+
+/// List the input devices on one `DEVICES:` line and exit, or say why they
+/// could not be listed. See `devices` for the format.
+fn run_list_devices() -> ! {
+    let mut out = Reporter::new(Box::new(StdoutSink));
+    match devices::list() {
+        Ok(found) => {
+            out.devices(&devices::devices_json(&found));
+            flush_and_exit(0)
+        }
+        Err(message) => {
+            out.error(&message);
             flush_and_exit(1)
         }
     }

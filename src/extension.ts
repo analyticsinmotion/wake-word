@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
 import * as os from "os";
+import * as path from "path";
 import { EngineRestart, WakePhrase, ISpeechEngine } from "./speechEngineInterface";
 import {
   MODEL_NAME,
   MODEL_SHA256,
   SherpaEngine,
+  listInputDevices,
   modelStatus,
   nativeEnginePath,
   probeNativeEngine,
@@ -43,15 +45,21 @@ import {
   formatPhraseChecksSummary,
   formatRestart,
   formatSessionStats,
+  isVerboseLogLevel,
+  issueReportText,
+  issueReportUrl,
+  logLevelName,
   phraseChecksKey,
   planAvailabilityReport,
   recordDetection,
+  redactHome,
   releaseThenFire,
   resolveHandoff,
   resolveRoutes,
   setAsideKey,
   shouldDebounce,
   statusBarView,
+  terminalHandsOverToggle,
   validatePhraseQuality,
 } from "./wakeWordCore";
 import {
@@ -64,7 +72,16 @@ import {
 } from "./lockFile";
 
 let statusBarItem: vscode.StatusBarItem;
-let outputChannel: vscode.OutputChannel;
+/**
+ * The "Wake Word" output channel. A log channel, so the editor's own log
+ * levels apply to it: Developer: Set Log Level sets it to Debug or Trace for
+ * the verbose log. See applyVerboseLog().
+ */
+let outputChannel: vscode.LogOutputChannel;
+/** The verbose log is on: the channel's level is Debug or Trace. */
+let verboseLog = false;
+/** Replaced by `~` in every line written to the log. */
+let homeDir = "";
 let countdownTimer: ReturnType<typeof setInterval> | null = null;
 let countdownRemaining = 0;
 let speechEngine: ISpeechEngine;
@@ -201,7 +218,9 @@ function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
   const config = vscode.workspace.getConfiguration("wakeWord");
   // The editor's own name, for a message about microphone permission, which
   // the operating system grants to the editor that started the engine.
-  return new SherpaEngine(context, readAudioDevice(config), vscode.env.appName);
+  const engine = new SherpaEngine(context, readAudioDevice(config), vscode.env.appName);
+  engine.setDebugMode(verboseLog);
+  return engine;
 }
 
 /**
@@ -249,6 +268,7 @@ function wireEngine(engine: ISpeechEngine, context: vscode.ExtensionContext): vo
     refreshStatusBar();
   });
   engine.on("debug", (info: string) => log("info", info));
+  engine.on("detail", (info: string) => logDetail(info));
   engine.on("warning", (msg: string) => log("warn", msg));
   engine.on("error", (err: Error) => {
     sessionStats.errors++;
@@ -271,8 +291,13 @@ export function activate(context: vscode.ExtensionContext) {
   isDevMode = context.extensionMode === vscode.ExtensionMode.Development;
   console.log("[Wake Word] Activating, devMode:", isDevMode);
 
-  outputChannel = vscode.window.createOutputChannel("Wake Word");
+  homeDir = os.homedir();
+  outputChannel = vscode.window.createOutputChannel("Wake Word", { log: true });
   context.subscriptions.push(outputChannel);
+  verboseLog = isVerboseLogLevel(outputChannel.logLevel);
+  // A level the user set earlier can arrive just after the channel is made,
+  // so this is where the verbose log first goes on as well as later.
+  context.subscriptions.push(outputChannel.onDidChangeLogLevel(() => applyVerboseLog()));
 
   // Shared by every window of this editor, which is what lets them agree on
   // who holds the microphone. See lockFile.ts.
@@ -512,13 +537,49 @@ async function handleConsentThenStart(
 
 // ── Logging ──────────────────────────────────────────────────
 
+/**
+ * Write a line to the output channel, which adds the time and the level. The
+ * home directory is replaced by `~`, as in Show Diagnostics, because a log is
+ * pasted into an issue as often as the report is.
+ */
 function log(level: "info" | "warn" | "error", message: string) {
-  const timestamp = new Date().toISOString().substring(11, 23);
-  const line = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
-  outputChannel.appendLine(line);
+  const line = redactHome(message, homeDir, process.platform === "win32");
+  outputChannel[level](line);
   if (isDevMode) {
-    console.log("[Wake Word]", line);
+    console.log("[Wake Word]", `[${level}] ${line}`);
   }
+}
+
+/**
+ * A line for the verbose log, written at the debug level: shown only while
+ * the channel's level is Debug or Trace.
+ */
+function logDetail(message: string) {
+  const line = redactHome(message, homeDir, process.platform === "win32");
+  outputChannel.debug(line);
+  if (isDevMode) {
+    console.log("[Wake Word]", `[debug] ${line}`);
+  }
+}
+
+/**
+ * Follow the output channel's log level. At Debug or Trace the verbose log is
+ * on: the extension writes its detail, and the engine is told to send its
+ * own, which a running engine takes up at once, with no restart and without
+ * touching the microphone. Changing the level back turns both off.
+ *
+ * Nothing in the verbose log is audio or a transcript: the engine reports
+ * which configured phrase it matched and what its detectors did, never what
+ * was said.
+ */
+function applyVerboseLog(): void {
+  const on = isVerboseLogLevel(outputChannel.logLevel);
+  if (on === verboseLog) {
+    return;
+  }
+  verboseLog = on;
+  speechEngine?.setDebugMode(on);
+  log("info", `Verbose log ${on ? "on" : "off"} (log level: ${logLevelName(outputChannel.logLevel)})`);
 }
 
 function logSessionStats(): void {
@@ -597,7 +658,7 @@ async function startListening(explicit = false): Promise<void> {
   log(
     "info",
     `Starting: ${listened.length} routes${setAsideNote}, threshold=${describeThreshold(threshold, listened)}, ` +
-      `devMode=${isDevMode}${deviceNote}`
+      `verbose log=${verboseLog ? "on" : "off"}${deviceNote}`
   );
   log(
     "info",
@@ -607,7 +668,7 @@ async function startListening(explicit = false): Promise<void> {
   reportPhraseChecks(listened);
 
   engineStarting = true;
-  void speechEngine.start(listened, threshold, isDevMode);
+  void speechEngine.start(listened, threshold, verboseLog);
   refreshStatusBar();
 }
 
@@ -981,8 +1042,8 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
   const outcome = await releaseThenFire(
     async () => {
       await speechEngine.pause();
-      if (isDevMode) {
-        log("info", `Timing: detect-to-release ${Date.now() - now}ms`);
+      if (verboseLog) {
+        logDetail(`Timing: detect-to-release ${Date.now() - now}ms`);
       }
     },
     () => handoff === handoffGeneration,
@@ -1010,8 +1071,8 @@ async function onWakeWordDetected(phrase: WakePhrase, confidence?: number) {
     void resumeListening();
     return;
   }
-  if (isDevMode) {
-    log("info", `Timing: detect-to-command ${Date.now() - now}ms`);
+  if (verboseLog) {
+    logDetail(`Timing: detect-to-command ${Date.now() - now}ms`);
   }
 
   // Hand off: resume on the route's timer, or wait for the user.
@@ -1380,7 +1441,7 @@ async function startCalibrationEngine(
   }
   appliedSetAsideKey = setAsideKey(availability.setAside);
   try {
-    await speechEngine.start(availability.listened, threshold, isDevMode);
+    await speechEngine.start(availability.listened, threshold, verboseLog);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     log("error", `Calibration: the engine failed to start: ${message}`);
@@ -1501,15 +1562,35 @@ function currentWindow(): string {
 }
 
 /**
- * Write a diagnostics report to the output channel and offer to show it or
- * copy it for an issue. Local only: it reads settings, state, and files the
- * extension owns, and runs the engine's self-test. No audio, no network, and
- * the home directory is redacted from every line.
+ * The names a device may carry that belong to the person: the login name and
+ * the home directory's last segment. See redactDeviceName().
+ */
+function accountNames(): string[] {
+  const names = new Set<string>([path.basename(homeDir)]);
+  try {
+    names.add(os.userInfo().username);
+  } catch {
+    // No user record, as in some containers: the home directory still counts.
+  }
+  return [...names].filter((name) => name.length > 0);
+}
+
+/**
+ * Write a diagnostics report to the output channel and offer to show it, copy
+ * it, or take it to a new issue. Local only: it reads settings, state, and
+ * files the extension owns, runs the engine's self-test, and asks the engine
+ * for the input devices, which opens no microphone. No audio, no network,
+ * the home directory redacted from every line, and personal names from device
+ * names.
  */
 async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("wakeWord");
+  const terminal = vscode.workspace.getConfiguration("terminal.integrated");
   const engineBinaryPath = nativeEnginePath(context.extensionPath);
-  const engineBinaryStatus = await probeNativeEngine(engineBinaryPath);
+  const [engineBinaryStatus, devices] = await Promise.all([
+    probeNativeEngine(engineBinaryPath),
+    listInputDevices(engineBinaryPath),
+  ]);
   // Checked now, whatever the extension is doing: the report says which
   // routes a start would listen for, and why the others are set aside.
   const availability = await checkConfiguredRoutes();
@@ -1534,6 +1615,14 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     modelPresent: model.present,
     modelSha256: MODEL_SHA256,
     audioDevice: readAudioDevice(config),
+    devices,
+    accountNames: accountNames(),
+    logLevel: logLevelName(outputChannel.logLevel),
+    verboseLog,
+    terminalShortcut: terminalHandsOverToggle(
+      terminal.get<unknown>("commandsToSkipShell"),
+      terminal.get<unknown>("sendKeybindingsToShell")
+    ),
     threshold: clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD)),
     cooldownSeconds: config.get<number>("cooldownSeconds", 30),
     confirmationMode: config.get<boolean>("confirmationMode", false),
@@ -1547,7 +1636,7 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     lock: describeLock(readLock(lockPath)),
     sessionStats,
     now: Date.now(),
-    homeDir: os.homedir(),
+    homeDir,
   });
 
   for (const line of lines) {
@@ -1557,14 +1646,35 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const choice = await vscode.window.showInformationMessage(
     "Wake Word diagnostics written to the output channel.",
     "Show Log",
-    "Copy to Clipboard"
+    "Copy to Clipboard",
+    "Report Issue"
   );
   if (choice === "Show Log") {
     outputChannel.show();
   } else if (choice === "Copy to Clipboard") {
     await vscode.env.clipboard.writeText(lines.join("\n"));
     vscode.window.showInformationMessage("Wake Word: Diagnostics copied to the clipboard.");
+  } else if (choice === "Report Issue") {
+    await reportIssue(context, lines);
   }
+}
+
+/**
+ * Take the diagnostics report to a new issue on the extension's repository:
+ * put it on the clipboard and open the new-issue page in the browser. Nothing
+ * is sent from here. The page opens with fixed text asking for the report,
+ * and the user pastes it, reads and edits it, and submits it, or does not.
+ */
+async function reportIssue(context: vscode.ExtensionContext, lines: readonly string[]): Promise<void> {
+  const bugs = (context.extension.packageJSON as { bugs?: { url?: unknown } }).bugs;
+  const url = issueReportUrl(bugs?.url);
+  await vscode.env.clipboard.writeText(issueReportText(lines));
+  const opened = url ? await vscode.env.openExternal(vscode.Uri.parse(url)) : false;
+  vscode.window.showInformationMessage(
+    opened
+      ? "Wake Word: The diagnostics report is on your clipboard. Paste it into the new issue and read it before you submit."
+      : "Wake Word: The diagnostics report is on your clipboard. The issue page was not opened."
+  );
 }
 
 // ── Status bar ──────────────────────────────────────────────

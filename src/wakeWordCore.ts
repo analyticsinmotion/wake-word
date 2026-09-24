@@ -1611,6 +1611,299 @@ export function describeWindow(remoteName: string | undefined, runsLocally: bool
   return `remote (${remoteName})${browser}; Wake Word runs on ${where}`;
 }
 
+// -- Input devices ------------------------------------------------------
+
+/**
+ * One input device, as the engine's `--list-devices` line describes it. See
+ * `engine-rs/src/devices.rs` for the line's format.
+ */
+export interface InputDevice {
+  /** Its position in the list: what a digit-only `wakeWord.audioDevice` selects. */
+  index: number;
+  /** The operating system's name for it, which a name in `wakeWord.audioDevice` is matched against. */
+  name: string;
+  /** The platform's stable identifier, or "" when it gives none. */
+  id: string;
+  /** The system default input, which an empty `wakeWord.audioDevice` opens. */
+  isDefault: boolean;
+  /** Native channel count, 0 when unknown. */
+  channels: number;
+  /** Native sample rate in Hz, 0 when unknown. */
+  sampleRate: number;
+}
+
+/** The engine's device list, or why there is none. */
+export type DeviceListing = { kind: "listed"; devices: InputDevice[] } | { kind: "failed"; reason: string };
+
+/**
+ * Read what `wake-word-engine --list-devices` printed. `failure` is why the
+ * process did not finish cleanly, if it did not: a `DEVICES:` line is still
+ * used when there is one, and an `ERROR:` line says more than an exit code.
+ * An entry that is not an object with a numeric index and a string name is
+ * skipped; a field that is missing or of the wrong type reads as unknown.
+ */
+export function parseDeviceListing(stdout: string, failure?: string): DeviceListing {
+  const lines = stdout.split(/\r?\n/);
+  const listed = lines.find((line) => line.startsWith("DEVICES:"));
+  if (listed !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(listed.slice("DEVICES:".length));
+    } catch (err: unknown) {
+      return { kind: "failed", reason: `the device list could not be read (${errorMessage(err)})` };
+    }
+    if (!Array.isArray(parsed)) {
+      return { kind: "failed", reason: "the device list could not be read (not a list)" };
+    }
+    const devices: InputDevice[] = [];
+    for (const entry of parsed) {
+      if (typeof entry !== "object" || entry === null) {
+        continue;
+      }
+      const record = entry as Record<string, unknown>;
+      if (typeof record.index !== "number" || !Number.isInteger(record.index) || typeof record.name !== "string") {
+        continue;
+      }
+      devices.push({
+        index: record.index,
+        name: record.name,
+        id: typeof record.id === "string" ? record.id : "",
+        isDefault: record.default === true,
+        channels: typeof record.channels === "number" ? record.channels : 0,
+        sampleRate: typeof record.sampleRate === "number" ? record.sampleRate : 0,
+      });
+    }
+    return { kind: "listed", devices };
+  }
+  const error = lines.find((line) => line.startsWith("ERROR:"));
+  if (error !== undefined) {
+    return { kind: "failed", reason: error.slice("ERROR:".length) };
+  }
+  return { kind: "failed", reason: failure ?? "the engine printed no device list" };
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Which device `wakeWord.audioDevice` selects, decided the way the engine
+ * decides it: `resolve_audio_device()` in `engine-rs/src/config.rs` reads the
+ * setting, and decibri resolves it against the same list the engine prints.
+ *
+ * - `default`: the setting is empty, so the system default opens.
+ * - `index`: the setting is digits only, and names the device at that index,
+ *   if there is one. Digits too large for a device index are a name.
+ * - `name`: anything else, matched case-insensitively as a substring of each
+ *   device's name. Exactly one match opens; none, or more than one, opens
+ *   nothing and the engine reports an error.
+ */
+export type DeviceSelection =
+  | { kind: "default"; index: number | null }
+  | { kind: "index"; index: number; found: boolean }
+  | { kind: "name"; name: string; matches: number[] };
+
+const MAX_DEVICE_INDEX = 0xffff_ffff;
+
+export function selectDevice(devices: readonly InputDevice[], setting: string): DeviceSelection {
+  const value = setting.trim();
+  if (value === "") {
+    return { kind: "default", index: devices.find((device) => device.isDefault)?.index ?? null };
+  }
+  if (/^[0-9]+$/.test(value)) {
+    const index = Number(value);
+    if (index <= MAX_DEVICE_INDEX) {
+      return { kind: "index", index, found: devices.some((device) => device.index === index) };
+    }
+  }
+  const query = value.toLowerCase();
+  return {
+    kind: "name",
+    name: value,
+    matches: devices.filter((device) => device.name.toLowerCase().includes(query)).map((device) => device.index),
+  };
+}
+
+/** What replaces a person's name in a device name. */
+export const REDACTED_NAME = "<name>";
+
+/**
+ * A device name with anything that looks like a person's name taken out, for a
+ * report that is pasted into a public issue.
+ *
+ * Operating systems name a Bluetooth headset or a phone after its owner, as
+ * "Ann's Headphones", or "Headphones de Ann" and "Headphones von Ann" in other
+ * languages, and a device can carry the account's login name. Those parts are
+ * replaced with `<name>`; the rest, which says what kind of device it is, is
+ * kept, because that is what diagnosing a microphone needs. It cannot catch a
+ * name in every form, which is why the report says to check it.
+ *
+ * `accountNames` are the login name and the home directory's last segment;
+ * shorter than three characters, one is not used.
+ */
+export function redactDeviceName(name: string, accountNames: readonly string[]): string {
+  let text = name
+    // "Ann's", with a straight or a curly apostrophe
+    .replace(/[\p{L}][\p{L}\p{M}.-]*(['\u2019]s)(?=[\s)\]]|$)/gu, `${REDACTED_NAME}$1`)
+    // "James' Headset"
+    .replace(/[\p{L}][\p{L}\p{M}.-]*s(['\u2019])(?=\s)/gu, `${REDACTED_NAME}$1`)
+    // "Headphones de Ann", "von Ann", "van Ann", "di Ann"
+    .replace(/(^|[\s(])(de|von|van|di)\s+\p{Lu}[\p{L}\p{M}'\u2019-]*/gu, `$1$2 ${REDACTED_NAME}`);
+  for (const account of accountNames) {
+    if (account.length < 3) {
+      continue;
+    }
+    const escaped = account.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    text = text.replace(new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "giu"), REDACTED_NAME);
+  }
+  return text;
+}
+
+/**
+ * The input devices, for Show Diagnostics: one line per device with its index,
+ * its name with personal names taken out (see redactDeviceName()), its native
+ * format, and whether it is the system default and the one
+ * `wakeWord.audioDevice` selects, then a line when the setting selects none.
+ */
+export function formatDeviceLines(
+  listing: DeviceListing,
+  audioDevice: string,
+  accountNames: readonly string[]
+): string[] {
+  if (listing.kind === "failed") {
+    return [`Input devices: could not be listed (${listing.reason})`];
+  }
+  if (listing.devices.length === 0) {
+    return ["Input devices: none found"];
+  }
+  const selection = selectDevice(listing.devices, audioDevice);
+  const setting = `wakeWord.audioDevice "${redactDeviceName(audioDevice.trim(), accountNames)}"`;
+  const lines = [
+    `Input devices: ${listing.devices.length} (a name that looks like a person's is shown as ${REDACTED_NAME}; ` +
+      "check the names before posting)",
+  ];
+  for (const device of listing.devices) {
+    const marks: string[] = [];
+    if (device.isDefault) {
+      marks.push("system default");
+    }
+    if (
+      (selection.kind === "default" && selection.index === device.index) ||
+      (selection.kind === "index" && selection.index === device.index) ||
+      (selection.kind === "name" && selection.matches.length === 1 && selection.matches[0] === device.index)
+    ) {
+      marks.push("selected");
+    } else if (selection.kind === "name" && selection.matches.includes(device.index)) {
+      marks.push(`matches ${setting}`);
+    }
+    const format = [
+      device.channels > 0 ? `${device.channels} ch` : "",
+      device.sampleRate > 0 ? `${device.sampleRate} Hz` : "",
+    ].filter(Boolean);
+    lines.push(
+      `  ${device.index}: ${redactDeviceName(device.name, accountNames)}` +
+        (format.length > 0 ? `, ${format.join(", ")}` : "") +
+        (marks.length > 0 ? ` (${marks.join(", ")})` : "")
+    );
+  }
+  if (selection.kind === "default" && selection.index === null) {
+    lines.push("  No device is marked as the system default");
+  } else if (selection.kind === "index" && !selection.found) {
+    lines.push(`  ${setting} is not the index of any input device`);
+  } else if (selection.kind === "name" && selection.matches.length === 0) {
+    lines.push(`  ${setting} matches no input device`);
+  } else if (selection.kind === "name" && selection.matches.length > 1) {
+    lines.push(
+      `  ${setting} matches ${selection.matches.length} input devices, so none is opened: ` +
+        "use a longer part of the name or the device index"
+    );
+  }
+  return lines;
+}
+
+// -- Reporting an issue -------------------------------------------------
+
+/**
+ * The body a new issue starts with. Fixed text only: the diagnostics report
+ * is not put in the address, which the browser sends to the issue tracker as
+ * soon as it opens the page. The user pastes the report from the clipboard,
+ * where it can be read and edited before anything is submitted.
+ *
+ * It holds none of `? # & = + %`. `vscode.env.openExternal()` takes a Uri,
+ * whose query the editor decodes and encodes again on the way to the
+ * browser, and those characters do not survive that unchanged.
+ */
+export const ISSUE_BODY =
+  "**What happened**\n\n\n\n" +
+  "**What you expected to happen**\n\n\n\n" +
+  "**Diagnostics**\n\n" +
+  "<!-- Wake Word copied its diagnostics report to your clipboard. Paste it below this line, " +
+  "then read it before you submit: it lists your settings, wake phrases and input devices. -->\n";
+
+/**
+ * The new-issue page of the repository whose tracker `bugsUrl` is, with
+ * ISSUE_BODY filled in, or null when `bugsUrl` is not a GitHub issue tracker.
+ */
+export function issueReportUrl(bugsUrl: unknown): string | null {
+  if (typeof bugsUrl !== "string" || !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/?$/.test(bugsUrl)) {
+    return null;
+  }
+  return `${bugsUrl.replace(/\/$/, "")}/new?body=${encodeURIComponent(ISSUE_BODY)}`;
+}
+
+/** The report as it goes on the clipboard for an issue: in a fenced block, so it keeps its lines. */
+export function issueReportText(lines: readonly string[]): string {
+  return "```text\n" + lines.join("\n") + "\n```\n";
+}
+
+// -- The toggle shortcut in the terminal --------------------------------
+
+/**
+ * Whether the integrated terminal hands the `wakeWord.toggle` shortcut to
+ * the editor rather than to the shell.
+ *
+ * While the terminal has focus, a key reaches an editor command only when
+ * the command is in `terminal.integrated.commandsToSkipShell`, unless it uses
+ * the macOS Command key. The manifest puts the command in that setting's
+ * default; a value the user has set replaces the default, and another
+ * extension that contributes a default for the same setting can win over it.
+ * An entry `-<command>` takes a command out again, and
+ * `terminal.integrated.sendKeybindingsToShell` sends every key to the shell.
+ */
+export function terminalHandsOverToggle(commandsToSkipShell: unknown, sendKeybindingsToShell: unknown): boolean {
+  if (sendKeybindingsToShell === true || !Array.isArray(commandsToSkipShell)) {
+    return false;
+  }
+  let skipped = false;
+  for (const entry of commandsToSkipShell) {
+    if (entry === "wakeWord.toggle") {
+      skipped = true;
+    } else if (entry === "-wakeWord.toggle") {
+      skipped = false;
+    }
+  }
+  return skipped;
+}
+
+// -- Log level ----------------------------------------------------------
+
+/** `vscode.LogLevel`'s values, which the API fixes, by name. */
+const LOG_LEVEL_NAMES = ["off", "trace", "debug", "info", "warning", "error"];
+
+/** The name of a `vscode.LogLevel` value. */
+export function logLevelName(level: number): string {
+  return LOG_LEVEL_NAMES[level] ?? `level ${level}`;
+}
+
+/**
+ * Whether the verbose log is on: the output channel's level is Debug or
+ * Trace, set with Developer: Set Log Level. The engine's detail is written at
+ * the debug level, so it is asked for exactly when it would be shown.
+ */
+export function isVerboseLogLevel(level: number): boolean {
+  return level === 1 || level === 2;
+}
+
 // -- Diagnostics --------------------------------------------------------
 
 /**
@@ -1656,6 +1949,16 @@ export interface DiagnosticsInput {
   modelPresent: boolean;
   modelSha256: string;
   audioDevice: string;
+  /** The engine's `--list-devices` answer. */
+  devices: DeviceListing;
+  /** Names taken out of device names: see redactDeviceName(). */
+  accountNames: readonly string[];
+  /** The output channel's log level, by name. */
+  logLevel: string;
+  /** Whether the verbose log is on: the log level is Debug or Trace. */
+  verboseLog: boolean;
+  /** Whether the terminal hands the toggle shortcut over: see terminalHandsOverToggle(). */
+  terminalShortcut: boolean;
   /** The global wakeWord.confidenceThreshold, already clamped. */
   threshold: number;
   cooldownSeconds: number;
@@ -1682,8 +1985,9 @@ export interface DiagnosticsInput {
 /**
  * Render the Show Diagnostics report, one line per fact.
  *
- * The report holds versions, settings, routes, and state: no audio, and no
- * account name, because the home directory is redacted from every line.
+ * The report holds versions, settings, routes, input devices, and state: no
+ * audio, and no account name, because the home directory is redacted from
+ * every line and personal names from device names.
  */
 export function formatDiagnostics(input: DiagnosticsInput): string[] {
   const onOff = (value: boolean): string => (value ? "on" : "off");
@@ -1703,12 +2007,22 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     `Model: ${input.modelName} (${input.modelPresent ? "downloaded" : "not downloaded"})`,
     `Model dir: ${input.modelDir}`,
     `Model SHA-256: ${input.modelSha256.substring(0, 16)}...`,
-    `Audio device: ${input.audioDevice || "(system default)"}`,
+    `Audio device: ${
+      redactDeviceName(redactHome(input.audioDevice, input.homeDir, input.platform === "win32"), input.accountNames) ||
+      "(system default)"
+    }`,
+    ...formatDeviceLines(input.devices, input.audioDevice, input.accountNames),
     `Threshold: ${input.threshold}`,
     `Cooldown: ${input.cooldownSeconds}s`,
     `Confirmation mode: ${onOff(input.confirmationMode)}`,
     `Pause on focus loss: ${onOff(input.pauseOnFocusLoss)}`,
     `Enable on startup: ${onOff(input.enableOnStartup)}`,
+    `Log level: ${input.logLevel}${input.verboseLog ? " (verbose log on)" : ""}`,
+    `Toggle shortcut in the terminal: ${
+      input.terminalShortcut
+        ? "handled by Wake Word"
+        : "sent to the shell (wakeWord.toggle is not in terminal.integrated.commandsToSkipShell)"
+    }`,
     `Routes: ${input.routes.length + input.setAside.length}${input.usingDefaultRoutes ? " (defaults)" : ""}`,
   ];
 

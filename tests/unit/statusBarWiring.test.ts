@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventEmitter } from "events";
 import type { InstalledExtension } from "../../src/wakeWordCore";
+import { LEVEL, createLogChannel } from "../mocks/logChannel";
 import type { EngineRestart, WakePhrase } from "../../src/speechEngineInterface";
 
 /**
@@ -22,6 +23,10 @@ interface FakeEngine extends EventEmitter {
   restarting: EngineRestart | null;
   args: unknown[];
   startedWith: WakePhrase[][];
+  /** The debug mode each start was given. */
+  startedDebug: boolean[];
+  /** Every setDebugMode() call, in order. */
+  debugModes: boolean[];
   resumes: number;
   stops: number;
   /** Hold the next pause until release() is called, as the child's PAUSED would. */
@@ -34,6 +39,10 @@ interface FakeEngine extends EventEmitter {
 }
 
 const engines = vi.hoisted(() => [] as FakeEngine[]);
+/** What the engine's device listing answers, per test. */
+const deviceListing = vi.hoisted(() => ({
+  answer: { kind: "listed", devices: [] } as unknown,
+}));
 const lock = vi.hoisted(() => ({ held: false }));
 
 vi.mock("../../src/sherpaEngine", async () => {
@@ -44,8 +53,11 @@ vi.mock("../../src/sherpaEngine", async () => {
     isStarting = false;
     restarting: EngineRestart | null = null;
     startedWith: WakePhrase[][] = [];
+    startedDebug: boolean[] = [];
     resumes = 0;
     stops = 0;
+    /** Every setDebugMode() call, in order. */
+    debugModes: boolean[] = [];
     holdPause = false;
     args: unknown[];
     private released: (() => void) | null = null;
@@ -54,8 +66,9 @@ vi.mock("../../src/sherpaEngine", async () => {
       this.args = args;
       engines.push(this as unknown as FakeEngine);
     }
-    start(phrases: WakePhrase[]): Promise<void> {
+    start(phrases: WakePhrase[], _threshold: number, debugMode: boolean): Promise<void> {
       this.startedWith.push(phrases);
+      this.startedDebug.push(debugMode);
       this.isStarting = true;
       this.restarting = null;
       return Promise.resolve();
@@ -113,6 +126,9 @@ vi.mock("../../src/sherpaEngine", async () => {
       this.isStarting = false;
       this.emit("cancelled");
     }
+    setDebugMode(on: boolean): void {
+      this.debugModes.push(on);
+    }
     dispose(): void {
       this.stop();
       this.removeAllListeners();
@@ -125,6 +141,7 @@ vi.mock("../../src/sherpaEngine", async () => {
     modelStatus: () => ({ dir: "model", versionFile: "version.txt", present: true }),
     nativeEnginePath: () => "wake-word-engine",
     probeNativeEngine: () => Promise.resolve("self-test OK"),
+    listInputDevices: () => Promise.resolve(deviceListing.answer),
   };
 });
 
@@ -165,8 +182,20 @@ interface Session {
   logs: string[];
   errors: string[];
   warnings: string[];
+  /** Lines written at the debug level: the verbose log. */
+  details: string[];
+  /** What was put on the clipboard. */
+  clipboard: string[];
+  /** Pages opened in the browser. */
+  opened: string[];
+  /** Information messages shown. */
+  infos: string[];
+  /** The button the next information message with buttons is answered with. */
+  answer: string | undefined;
   status: { text: string; tooltip: unknown; backgroundColor: unknown };
   run(command: string): Promise<unknown>;
+  /** Change the output channel's log level, as Developer: Set Log Level does. */
+  logLevel(level: number): Promise<void>;
   focus(focused: boolean): Promise<void>;
   changeSettings(...keys: string[]): Promise<void>;
   /** Change a setting's value; changeSettings() then reports the change. */
@@ -184,7 +213,11 @@ async function settle(): Promise<void> {
   }
 }
 
-async function startSession(settings: Record<string, unknown> = {}, remoteName?: string): Promise<Session> {
+async function startSession(
+  settings: Record<string, unknown> = {},
+  remoteName?: string,
+  logLevel: number = LEVEL.Info
+): Promise<Session> {
   vi.resetModules();
   const vscode = await import("vscode");
   vscode.env.remoteName = remoteName;
@@ -209,11 +242,19 @@ async function startSession(settings: Record<string, unknown> = {}, remoteName?:
   let focused = true;
   let onConfiguration: (event: { affectsConfiguration: (key: string) => boolean }) => void = () => undefined;
 
-  vi.spyOn(vscode.window, "createOutputChannel").mockReturnValue({
-    appendLine: (line: string) => logs.push(line),
-    show: () => undefined,
-    dispose: () => undefined,
-  } as never);
+  const logChannel = createLogChannel(logs, logLevel);
+  const clipboard: string[] = [];
+  const opened: string[] = [];
+  const infos: string[] = [];
+  vi.spyOn(vscode.window, "createOutputChannel").mockReturnValue(logChannel.channel as never);
+  vi.spyOn(vscode.env.clipboard, "writeText").mockImplementation(((text: string) => {
+    clipboard.push(text);
+    return Promise.resolve();
+  }) as never);
+  vi.spyOn(vscode.env, "openExternal").mockImplementation(((target: { toString(): string }) => {
+    opened.push(target.toString());
+    return Promise.resolve(true);
+  }) as never);
   vi.spyOn(vscode.window, "createStatusBarItem").mockReturnValue({
     ...disposable,
     show: () => undefined,
@@ -240,7 +281,10 @@ async function startSession(settings: Record<string, unknown> = {}, remoteName?:
     warnings.push(message);
     return Promise.resolve(undefined);
   }) as never);
-  vi.spyOn(vscode.window, "showInformationMessage").mockImplementation((() => Promise.resolve(undefined)) as never);
+  vi.spyOn(vscode.window, "showInformationMessage").mockImplementation(((message: string, ...buttons: string[]) => {
+    infos.push(message);
+    return Promise.resolve(buttons.length > 0 ? session.answer : undefined);
+  }) as never);
   vi.spyOn(vscode.window, "showErrorMessage").mockImplementation(((message: string) => {
     errors.push(message);
     return Promise.resolve(undefined);
@@ -284,7 +328,10 @@ async function startSession(settings: Record<string, unknown> = {}, remoteName?:
       keys: () => [],
       setKeysForSync: () => undefined,
     },
-    extension: { packageJSON: { version: "0.0.0-test" }, extensionKind: vscode.ExtensionKind.UI },
+    extension: {
+      packageJSON: { version: "0.0.0-test", bugs: { url: "https://github.com/analyticsinmotion/wake-word/issues" } },
+      extensionKind: vscode.ExtensionKind.UI,
+    },
   } as never);
 
   const session: Session = {
@@ -293,11 +340,20 @@ async function startSession(settings: Record<string, unknown> = {}, remoteName?:
     logs,
     errors,
     warnings,
+    details: logChannel.details,
+    clipboard,
+    opened,
+    infos,
+    answer: undefined,
     status,
     async run(command) {
       const result = await handlers.get(command)?.();
       await settle();
       return result;
+    },
+    async logLevel(level) {
+      logChannel.setLevel(level);
+      await settle();
     },
     async focus(to) {
       focused = to;
@@ -333,6 +389,7 @@ beforeEach(() => {
   lock.held = false;
   world.registered = [...WORKBENCH, "claude-vscode.focus"];
   world.installed = [CLAUDE_CODE];
+  deviceListing.answer = { kind: "listed", devices: [] };
 });
 
 afterEach(() => {
@@ -406,7 +463,7 @@ describe("the status bar", () => {
     expect(
       session.logs.some((line) =>
         line.endsWith(
-          "[WARN] Speech engine stopped: The microphone stopped responding: device unplugged. " +
+          "[warning] Speech engine stopped: The microphone stopped responding: device unplugged. " +
             "Restarting in 2s (attempt 1 of 3)."
         )
       )
@@ -693,5 +750,155 @@ describe("a remote window", () => {
       )
     ).toBe(true);
     expect(session.logs.some((line) => line.endsWith("Set aside: none"))).toBe(true);
+  });
+});
+
+describe("the verbose log", () => {
+  it("is off at the default log level, and the engine is started without its detail", async () => {
+    const session = await startSession();
+    await session.run("wakeWord.enable");
+    expect(session.engine().debugModes).toEqual([false]);
+    expect(session.engine().startedDebug).toEqual([false]);
+    expect(session.logs.some((line) => line.includes("verbose log=off"))).toBe(true);
+  });
+
+  it("is on from the start when the level is already Debug", async () => {
+    const session = await startSession({}, undefined, LEVEL.Debug);
+    await session.run("wakeWord.enable");
+    expect(session.engine().debugModes).toEqual([true]);
+    expect(session.engine().startedDebug).toEqual([true]);
+    expect(session.logs.some((line) => line.includes("verbose log=on"))).toBe(true);
+  });
+
+  it("follows Developer: Set Log Level while listening, without a restart", async () => {
+    const session = await startSession();
+    await session.run("wakeWord.enable");
+    session.engine().ready();
+    const engine = session.engine();
+
+    await session.logLevel(LEVEL.Debug);
+    expect(engine.debugModes).toEqual([false, true]);
+    expect(session.logs.at(-1)).toBe("[info] Verbose log on (log level: debug)");
+
+    await session.logLevel(LEVEL.Trace);
+    expect(engine.debugModes).toEqual([false, true]);
+
+    await session.logLevel(LEVEL.Info);
+    expect(engine.debugModes).toEqual([false, true, false]);
+    expect(session.logs.at(-1)).toBe("[info] Verbose log off (log level: info)");
+
+    expect(engines).toHaveLength(1);
+    expect(engine.startedWith).toHaveLength(1);
+    expect(engine.stops).toBe(0);
+    expect(session.status.text).toBe("$(mic) Wake: Listening");
+  });
+
+  it("follows the level during a handoff too, without taking the microphone back", async () => {
+    const session = await startSession();
+    await session.run("wakeWord.enable");
+    session.engine().ready();
+    await session.engine().pause();
+    const before = { resumes: session.engine().resumes, starts: session.engine().startedWith.length };
+    await session.logLevel(LEVEL.Debug);
+    expect(session.engine().debugModes).toEqual([false, true]);
+    expect(session.engine().resumes).toBe(before.resumes);
+    expect(session.engine().startedWith).toHaveLength(before.starts);
+  });
+
+  it("writes the engine's detail at the debug level, only while the level shows it", async () => {
+    const session = await startSession();
+    await session.run("wakeWord.enable");
+    session.engine().emit("detail", "VAD: speech (5 pre-roll chunks)");
+    expect(session.details).toEqual([]);
+
+    await session.logLevel(LEVEL.Debug);
+    session.engine().emit("detail", "VAD: speech (5 pre-roll chunks)");
+    expect(session.details).toEqual(["[debug] VAD: speech (5 pre-roll chunks)"]);
+    expect(session.logs.some((line) => line.includes("VAD:"))).toBe(false);
+  });
+
+  it("keeps the home directory out of the log", async () => {
+    const os = await import("os");
+    const session = await startSession({}, undefined, LEVEL.Debug);
+    await session.run("wakeWord.enable");
+    session.engine().emit("debug", `Spawning: ${os.homedir()}/bin/wake-word-engine`);
+    session.engine().emit("detail", `Model already present at ${os.homedir()}/model`);
+    expect(session.logs).toContain("[info] Spawning: ~/bin/wake-word-engine");
+    expect(session.details).toContain("[debug] Model already present at ~/model");
+  });
+});
+
+describe("Show Diagnostics and reporting an issue", () => {
+  const LISTED = {
+    kind: "listed",
+    devices: [
+      { index: 0, name: "Microphone Array", id: "wasapi:{a}", isDefault: true, channels: 2, sampleRate: 48000 },
+      { index: 1, name: "Ann's Headphones", id: "wasapi:{b}", isDefault: false, channels: 1, sampleRate: 16000 },
+    ],
+  };
+
+  it("lists the input devices, the default marked and a person's name taken out", async () => {
+    deviceListing.answer = LISTED;
+    const session = await startSession({ audioDevice: "" });
+    await session.run("wakeWord.diagnostics");
+    const at = session.logs.findIndex((line) => line.includes("Input devices: 2"));
+    expect(at).toBeGreaterThan(0);
+    expect(session.logs[at + 1]).toBe("[info]   0: Microphone Array, 2 ch, 48000 Hz (system default, selected)");
+    expect(session.logs[at + 2]).toBe("[info]   1: <name>'s Headphones, 1 ch, 16000 Hz");
+    expect(session.logs.join("\n")).not.toContain("wasapi:");
+    expect(session.logs.some((line) => line.endsWith("Log level: info"))).toBe(true);
+  });
+
+  it("still writes the whole report when the devices cannot be listed", async () => {
+    deviceListing.answer = { kind: "failed", reason: "Could not list the input devices: no audio server" };
+    const session = await startSession();
+    await session.run("wakeWord.diagnostics");
+    expect(
+      session.logs.some((line) =>
+        line.endsWith("Input devices: could not be listed (Could not list the input devices: no audio server)")
+      )
+    ).toBe(true);
+    expect(session.logs.at(-1)).toBe("[info] === End Diagnostics ===");
+  });
+
+  it("says whether the terminal hands the toggle shortcut over", async () => {
+    const handed = await startSession({ commandsToSkipShell: ["wakeWord.toggle"] });
+    await handed.run("wakeWord.diagnostics");
+    expect(handed.logs.some((line) => line.endsWith("Toggle shortcut in the terminal: handled by Wake Word"))).toBe(true);
+
+    const replaced = await startSession({ commandsToSkipShell: ["other.command"] });
+    await replaced.run("wakeWord.diagnostics");
+    expect(replaced.logs.some((line) => line.includes("Toggle shortcut in the terminal: sent to the shell"))).toBe(true);
+  });
+
+  it("takes the report to a new issue: on the clipboard, and a page with fixed text, sending nothing", async () => {
+    deviceListing.answer = LISTED;
+    const session = await startSession();
+    session.answer = "Report Issue";
+    await session.run("wakeWord.diagnostics");
+
+    expect(session.clipboard).toHaveLength(1);
+    expect(session.clipboard[0].startsWith("```text\n=== Wake Word Diagnostics ===\n")).toBe(true);
+    expect(session.clipboard[0].endsWith("=== End Diagnostics ===\n```\n")).toBe(true);
+    expect(session.clipboard[0]).toContain("<name>'s Headphones");
+    expect(session.clipboard[0]).not.toContain("Ann's");
+
+    expect(session.opened).toHaveLength(1);
+    const url = new URL(session.opened[0]);
+    expect(`${url.origin}${url.pathname}`).toBe("https://github.com/analyticsinmotion/wake-word/issues/new");
+    expect([...url.searchParams.keys()]).toEqual(["body"]);
+    expect(url.searchParams.get("body")).not.toMatch(/Diagnostics ===|Microphone|Headphones|Version:/);
+    expect(session.infos.at(-1)).toBe(
+      "Wake Word: The diagnostics report is on your clipboard. Paste it into the new issue and read it before you submit."
+    );
+  });
+
+  it("copies the report as it is for Copy to Clipboard, and opens nothing", async () => {
+    const session = await startSession();
+    session.answer = "Copy to Clipboard";
+    await session.run("wakeWord.diagnostics");
+    expect(session.clipboard).toHaveLength(1);
+    expect(session.clipboard[0].startsWith("=== Wake Word Diagnostics ===\n")).toBe(true);
+    expect(session.opened).toEqual([]);
   });
 });

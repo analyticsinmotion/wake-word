@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DiagnosticsInput,
+  InputDevice,
   SetAsideRoute,
   createSessionStats,
   describeWindow,
@@ -23,6 +24,11 @@ const ROUTES: WakePhrase[] = [
 ];
 
 const STARTED = Date.UTC(2026, 8, 15, 9, 0, 0);
+
+const DEVICES: InputDevice[] = [
+  { index: 0, name: "Microphone Array", id: "wasapi:{a}", isDefault: true, channels: 2, sampleRate: 48000 },
+  { index: 1, name: "Ann's Headphones", id: "wasapi:{b}", isDefault: false, channels: 1, sampleRate: 16000 },
+];
 
 const ENGINE_BINARY =
   "C:\\Users\\Ann\\.vscode\\extensions\\analytics-in-motion.wake-word\\bin\\wake-word-engine.exe";
@@ -51,6 +57,11 @@ function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
     modelPresent: true,
     modelSha256: "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a",
     audioDevice: "",
+    devices: { kind: "listed", devices: DEVICES },
+    accountNames: ["Ann"],
+    logLevel: "info",
+    verboseLog: false,
+    terminalShortcut: true,
     threshold: 0.3,
     cooldownSeconds: 30,
     confirmationMode: false,
@@ -87,11 +98,16 @@ describe("formatDiagnostics", () => {
       "Model dir: ~\\AppData\\Roaming\\Code\\User\\globalStorage\\analytics-in-motion.wake-word\\sherpa-onnx\\sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
       "Model SHA-256: f170013b4716e41b...",
       "Audio device: (system default)",
+      "Input devices: 2 (a name that looks like a person's is shown as <name>; check the names before posting)",
+      "  0: Microphone Array, 2 ch, 48000 Hz (system default, selected)",
+      "  1: <name>'s Headphones, 1 ch, 16000 Hz",
       "Threshold: 0.3",
       "Cooldown: 30s",
       "Confirmation mode: off",
       "Pause on focus loss: on",
       "Enable on startup: on",
+      "Log level: info",
+      "Toggle shortcut in the terminal: handled by Wake Word",
       "Routes: 3",
       '  "Claude" [hey claude] -> claude-vscode.focus (manual)',
       '  "Terminal" [hey computer, open terminal] -> workbench.action.terminal.focus (timer, 10s)',

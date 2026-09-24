@@ -36,6 +36,15 @@ export enum UIKind {
   Web = 2,
 }
 
+export enum LogLevel {
+  Off = 0,
+  Trace = 1,
+  Debug = 2,
+  Info = 3,
+  Warning = 4,
+  Error = 5,
+}
+
 export class ThemeColor {
   constructor(public readonly id: string) {}
 }
@@ -44,6 +53,13 @@ export class Uri {
   private constructor(public readonly fsPath: string) {}
   static file(p: string): Uri {
     return new Uri(p);
+  }
+  /** Keeps the text it was given, which toString() returns. */
+  static parse(value: string): Uri {
+    return new Uri(value);
+  }
+  toString(): string {
+    return this.fsPath;
   }
 }
 
@@ -60,6 +76,10 @@ export const env = {
   appName: "Test Editor",
   remoteName: undefined as string | undefined,
   uiKind: UIKind.Desktop,
+  clipboard: {
+    writeText: (_text: string): Promise<void> => notImplemented("env.clipboard.writeText"),
+  },
+  openExternal: (_target: Uri): Promise<boolean> => notImplemented("env.openExternal"),
 };
 
 function notImplemented(name: string): never {
