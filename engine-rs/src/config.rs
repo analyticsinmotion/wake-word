@@ -5,6 +5,7 @@
 //! ```json
 //! { "threshold": 0.05, "modelDir": "<path>",
 //!   "debugMode": false, "audioDevice": "",
+//!   "editorName": "<the editor's product name>",
 //!   "keywordLines": ["▁HE Y ▁C LA U DE :3.0 #0.05"],
 //!   "phraseMap": { "HEY CLAUDE": "hey claude" } }
 //! ```
@@ -14,6 +15,11 @@
 //! threshold, and `phraseMap` maps the decoded text of each line's pieces,
 //! which is what the spotter reports on a hit, to the phrase as configured,
 //! lower-cased. The engine has no tokeniser and needs both.
+//!
+//! `editorName` is the name of the editor that started the engine, as the
+//! editor reports it (`vscode.env.appName`). A message that tells the user to
+//! change a setting of the editor itself, such as microphone permission, names
+//! it; without it, the message says "your editor".
 //!
 //! Two more optional fields, `vadModelPath` and `ortLibraryPath`, locate the
 //! Silero model and the ONNX Runtime library; the extension does not send
@@ -108,6 +114,8 @@ pub struct Config {
     pub debug_mode: bool,
     /// The resolved `wakeWord.audioDevice` setting.
     pub audio_device: AudioDevice,
+    /// `editorName`: the editor that started the engine, when given.
+    pub editor_name: Option<String>,
     /// `vadModelPath`: the Silero voice activity model file, when given.
     pub vad_model_path: Option<String>,
     /// `ortLibraryPath`: the ONNX Runtime shared library, when given.
@@ -131,6 +139,7 @@ impl Config {
                 .to_string(),
             debug_mode: is_truthy(value.get("debugMode")),
             audio_device: resolve_audio_device(value.get("audioDevice")),
+            editor_name: editor_name(value.get("editorName")),
             vad_model_path: optional_path(value.get("vadModelPath")),
             ort_library_path: optional_path(value.get("ortLibraryPath")),
         }
@@ -226,6 +235,26 @@ fn optional_path(value: Option<&Value>) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// Read `editorName`. The name goes into `ERROR:` lines, so a control
+/// character, a line break above all, is replaced with a space rather than
+/// allowed to split one line into two. A value that is blank once trimmed, or
+/// not a string, means no name was given.
+fn editor_name(value: Option<&Value>) -> Option<String> {
+    let text: String = value
+        .and_then(Value::as_str)?
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// JavaScript truthiness, which is what `if (debugMode)` applies.
 fn is_truthy(value: Option<&Value>) -> bool {
     match value {
@@ -280,6 +309,7 @@ mod tests {
         assert_eq!(parsed.model_dir, "");
         assert!(!parsed.debug_mode);
         assert_eq!(parsed.audio_device, AudioDevice::Default);
+        assert_eq!(parsed.editor_name, None);
         assert_eq!(parsed.vad_model_path, None);
         assert_eq!(parsed.ort_library_path, None);
     }
@@ -504,6 +534,43 @@ mod tests {
         assert_eq!(
             parsed.ort_library_path.as_deref(),
             Some("/opt/ort/libonnxruntime.so")
+        );
+    }
+
+    #[test]
+    fn reads_the_editor_name_when_given() {
+        assert_eq!(
+            config(r#"{"editorName":"  Example Editor  "}"#)
+                .editor_name
+                .as_deref(),
+            Some("Example Editor")
+        );
+    }
+
+    #[test]
+    fn has_no_editor_name_when_it_is_missing_blank_or_not_a_string() {
+        for json in [
+            "{}",
+            r#"{"editorName":""}"#,
+            r#"{"editorName":"   "}"#,
+            r#"{"editorName":null}"#,
+            r#"{"editorName":7}"#,
+            r#"{"editorName":["Example Editor"]}"#,
+        ] {
+            assert_eq!(config(json).editor_name, None, "{json}");
+        }
+    }
+
+    #[test]
+    fn replaces_control_characters_in_the_editor_name_with_spaces() {
+        // A line break would split the ERROR line the name is written into.
+        let json = format!(
+            r#"{{"editorName":"Example{}ERROR:Editor{}2"}}"#,
+            r"\n", r"\t"
+        );
+        assert_eq!(
+            config(&json).editor_name.as_deref(),
+            Some("Example ERROR:Editor 2")
         );
     }
 

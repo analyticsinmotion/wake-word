@@ -26,6 +26,25 @@ export enum ProgressLocation {
   Notification = 15,
 }
 
+export enum ExtensionKind {
+  UI = 1,
+  Workspace = 2,
+}
+
+export enum UIKind {
+  Desktop = 1,
+  Web = 2,
+}
+
+export enum LogLevel {
+  Off = 0,
+  Trace = 1,
+  Debug = 2,
+  Info = 3,
+  Warning = 4,
+  Error = 5,
+}
+
 export class ThemeColor {
   constructor(public readonly id: string) {}
 }
@@ -35,7 +54,33 @@ export class Uri {
   static file(p: string): Uri {
     return new Uri(p);
   }
+  /** Keeps the text it was given, which toString() returns. */
+  static parse(value: string): Uri {
+    return new Uri(value);
+  }
+  toString(): string {
+    return this.fsPath;
+  }
 }
+
+export class MarkdownString {
+  isTrusted = false;
+  constructor(public value = "") {}
+}
+
+/**
+ * A local desktop window. A test of a remote window sets `remoteName` on the
+ * instance it imported.
+ */
+export const env = {
+  appName: "Test Editor",
+  remoteName: undefined as string | undefined,
+  uiKind: UIKind.Desktop,
+  clipboard: {
+    writeText: (_text: string): Promise<void> => notImplemented("env.clipboard.writeText"),
+  },
+  openExternal: (_target: Uri): Promise<boolean> => notImplemented("env.openExternal"),
+};
 
 function notImplemented(name: string): never {
   throw new Error(
@@ -53,6 +98,9 @@ export const window = {
   showErrorMessage: () => notImplemented("window.showErrorMessage"),
   withProgress: () => notImplemented("window.withProgress"),
   onDidChangeWindowState: () => notImplemented("window.onDidChangeWindowState"),
+  get state(): never {
+    return notImplemented("window.state");
+  },
 };
 
 export const workspace = {
@@ -63,4 +111,12 @@ export const workspace = {
 export const commands = {
   registerCommand: () => notImplemented("commands.registerCommand"),
   executeCommand: () => notImplemented("commands.executeCommand"),
+  getCommands: () => notImplemented("commands.getCommands"),
+};
+
+export const extensions = {
+  get all(): never {
+    return notImplemented("extensions.all");
+  },
+  onDidChange: () => notImplemented("extensions.onDidChange"),
 };

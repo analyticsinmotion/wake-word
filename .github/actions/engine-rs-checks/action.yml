@@ -1,0 +1,81 @@
+name: Check the engine
+description: >-
+  Run Clippy and the unit tests of engine-rs for one package target, linked
+  against the same verified sherpa-onnx archive as the engine build. Use it
+  after ./.github/actions/engine-rs, so the checks reuse that build's target
+  directory and the libraries it unpacked.
+
+inputs:
+  target:
+    description: The package target, as vsce names it (win32-x64, darwin-arm64, linux-x64, linux-arm64)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # After the engine build this finds the archive that build fetched and
+    # checks it again, so nothing is downloaded twice. Without one it downloads
+    # the pinned archive, never the official one.
+    - name: Verify the sherpa-onnx archive
+      shell: bash
+      run: node engine-rs/scripts/prebuilt.mjs fetch --target "${{ inputs.target }}" --dir "$RUNNER_TEMP/sherpa-onnx-archives"
+
+    # Clippy and the tests run on every target, because some of the engine's
+    # code is compiled for one platform only, and so are its tests: the
+    # Windows handling of model paths of 260 characters or more, for one.
+    #
+    # On Linux they run in the image the engine is built in, from the same
+    # target directory, so the tests link the sherpa-onnx libraries with the
+    # compiler and C++ library the shipped binary is linked with. The tests do
+    # not ship, so the image's glibc floor does not matter to them; the link
+    # does. The target directory the build leaves is owned by the image's root
+    # user, so a check on the runner could not reuse it. Rust is installed as
+    # the engine build installs it, with Clippy added, which the minimal
+    # profile leaves out.
+    - name: Lint and test the engine (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        IMAGE: quay.io/pypa/manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+      run: |
+        docker run --rm \
+          --volume "$GITHUB_WORKSPACE:/work" \
+          --volume "$RUNNER_TEMP/sherpa-onnx-archives:/archives:ro" \
+          --env SHERPA_ONNX_ARCHIVE_DIR=/archives \
+          --workdir /work/engine-rs \
+          "$IMAGE" \
+          bash -euo pipefail -c '
+            dnf install --assumeyes --quiet alsa-lib-devel pkgconf-pkg-config
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --quiet --profile minimal --default-toolchain stable --component clippy
+            source "$HOME/.cargo/env"
+            cargo clippy --version
+            cargo clippy --locked --all-targets -- -D warnings
+            cargo test --locked
+          '
+
+    # Run from engine-rs/ with no RUSTFLAGS, as the engine build is, so the
+    # tests link with +crt-static on Windows, as the sherpa-onnx libraries
+    # require, and for the build's deployment target on macOS. -D warnings is
+    # given to Clippy after --, because RUSTFLAGS would replace the flags in
+    # .cargo/config.toml.
+    - name: Lint and test the engine
+      if: runner.os != 'Linux'
+      shell: bash
+      working-directory: engine-rs
+      env:
+        SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx-archives
+        MACOSX_DEPLOYMENT_TARGET: '11.0'
+      run: |
+        unset RUSTFLAGS
+        cargo clippy --version
+        cargo clippy --locked --all-targets -- -D warnings
+        cargo test --locked
+
+    # The build script links the libraries already unpacked in the target
+    # directory when there are any, and unpacks the archive only when there
+    # are none, so check the archive they were unpacked from, as the engine
+    # build does.
+    - name: Verify the archive the tests linked
+      shell: bash
+      run: node engine-rs/scripts/prebuilt.mjs check --target "${{ inputs.target }}"

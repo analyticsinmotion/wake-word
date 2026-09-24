@@ -889,6 +889,19 @@ mod tests {
     }
 
     #[test]
+    fn a_segment_in_which_no_keyword_completes_writes_nothing_at_all() {
+        // The spotter only ever completes one of the configured keywords, and
+        // says nothing otherwise, debug lines included: what was heard is never
+        // written out, only which configured phrase was matched.
+        let mut rig = Rig::new(&[""; 40]);
+        for step in 0..20 {
+            rig.accept(step as f32 / 100.0);
+        }
+        rig.end_segment();
+        assert!(rig.reports.is_empty(), "{:?}", rig.reports);
+    }
+
+    #[test]
     fn reports_each_keyword_of_several_and_resets_after_each() {
         let mut rig = Rig::new(&["HEY CLAUDE", "", "OPEN CHAT"]);
         rig.accept(0.1);

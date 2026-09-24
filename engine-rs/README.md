@@ -66,7 +66,16 @@ Capture errors are reported by `src/mic_errors.rs`,
 switching on decibri's stable error codes, and naming `wakeWord.audioDevice`
 when the user chose a device. A stream that fails while running, such as a
 device that is unplugged, is fatal: `ERROR:` and exit 1, so the extension
-restarts the engine.
+restarts the engine, and the new process opens whatever device is the default
+by then. An error before the engine has said `READY` in a listening session,
+such as no microphone or a device name that matches nothing, is also `ERROR:`
+and exit 1, but the extension reports it once and does not restart the engine:
+a new process would fail the same way.
+
+The permission message names the editor that started the engine, from
+`editorName` in the config line, because the operating system grants
+microphone access to that application; without the field it says "your
+editor". decibri 6.3.0 does not raise its permission error yet.
 
 ### Keyword spotting
 
@@ -144,6 +153,10 @@ cargo test                     # unit tests; no microphone, no ONNX Runtime
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+CI runs the last three too, and fails on any of them: Clippy and the tests on
+every package target, against the same archives the release build links, and
+the formatting check once; see [Release builds](#release-builds).
 
 Building on Linux needs the ALSA development package (`libasound2-dev` on
 Debian and Ubuntu), which the audio backend links against.
@@ -306,6 +319,25 @@ the workflow also fails if `nm -D --defined-only` finds a symbol matching
 `ort` or `onnx` in the engine. An exported symbol could be bound by the loaded
 ONNX Runtime in place of its own.
 
+**The unit tests and lints.** After the build, and before packaging,
+`.github/actions/engine-rs-checks` runs these on every target:
+
+```bash
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
+
+They run as the build does: from this directory, with no `RUSTFLAGS`, and with
+`SHERPA_ONNX_ARCHIVE_DIR` set. They use the build's target directory, where
+the build script finds the libraries it unpacked from the verified archive and
+links them again, and the action then runs `scripts/prebuilt.mjs check` as the
+build does. On Linux they run in the build's `manylinux_2_28` image, so the
+tests link with the same compiler and C++ library as the binary that ships.
+Some of the engine's code is compiled for one platform only, and its tests with
+it, which is why they run on every target. `cargo fmt --check` runs once, on
+the Linux x64 runner. The release workflow runs all of them before it uploads
+or publishes anything.
+
 ## The keyword spotting model
 
 `modelDir` in the config line is the extracted
@@ -378,6 +410,42 @@ is safe to run anywhere. Neither file being present is reported as `not found`
 with exit 0. A library or model that is present but unusable is
 `SELF-TEST:FAIL:<message>` with exit 1.
 
+## Listing the input devices
+
+```bash
+bin/wake-word-engine.exe --list-devices
+```
+
+prints the input devices on one line and exits 0, without reading stdin:
+
+```text
+DEVICES:[{"index":0,"name":"Microphone Array","id":"wasapi:{0.0.1.00000000}.{...}","default":true,"channels":2,"sampleRate":48000},{"index":1,"name":"Headset Microphone","id":"wasapi:{0.0.1.00000000}.{...}","default":false,"channels":1,"sampleRate":16000}]
+```
+
+The line is `DEVICES:` and a JSON array, one object per device in decibri's
+order, with these fields:
+
+| Field | What it is |
+| --- | --- |
+| `index` | the device's position in the list: what a digit-only `audioDevice` selects |
+| `name` | the operating system's name for it, which any other `audioDevice` is matched against as a case-insensitive substring; two devices can share a name |
+| `id` | the platform's stable identifier: `wasapi:`, `coreaudio:` or `alsa:` and the platform's own id, or `""` when there is none |
+| `default` | `true` for the system default input, which an empty `audioDevice` opens; at most one device, and none when the platform reports no default |
+| `channels` | the native channel count, or 0 when it could not be read |
+| `sampleRate` | the native sample rate in Hz, or 0 when it could not be read |
+
+No devices is `DEVICES:[]`. A failure to list them is
+`ERROR:Could not list the input devices: <detail>` with exit 1. Fields are only
+ever added, never renamed or removed, so a reader should ignore one it does not
+know. Names go through a JSON encoder, so a quote, a backslash, or a line break
+in one cannot split the line.
+
+Listing opens no microphone and loads nothing: decibri enumerates the devices
+and reads each one's default format, with no stream opened and neither ONNX
+Runtime nor a model loaded. The extension runs it for Show Diagnostics, where
+it marks the default device and the one `wakeWord.audioDevice` selects, and
+keeps `id` out of the report.
+
 ## Driving the binary
 
 ```bash
@@ -430,6 +498,7 @@ The first line is a JSON config object:
   "modelDir": "<path>",
   "debugMode": false,
   "audioDevice": "",
+  "editorName": "<the editor's product name>",
   "keywordLines": ["▁HE Y ▁C LA U DE :3.0 #0.05"],
   "phraseMap": { "HEY CLAUDE": "hey claude" }
 }
@@ -451,8 +520,11 @@ catches any such line that arrives anyway.
 spotter-wide threshold; each line carries its own. `modelDir` is the keyword
 spotting model directory described above. `audioDevice` is a device index when
 it is nothing but digits, otherwise a case-insensitive name substring; empty
-means the system default. `vadModelPath` and `ortLibraryPath` are described
-above; the extension does not send them.
+means the system default. `editorName` is the editor's product name as the
+editor reports it, named in the permission message; control characters in it
+become spaces, and a blank or missing value means "your editor".
+`vadModelPath` and `ortLibraryPath` are described above; the extension does
+not send them.
 
 Every line after the config is a command:
 
@@ -461,6 +533,16 @@ Every line after the config is a command:
 | `pause` | close the microphone, keep everything else loaded: `PAUSED` |
 | `resume` | reopen the microphone: `READY` |
 | `stop` | close everything, answer `RELEASED`, exit 0 |
+| `debug on` | start writing `DEBUG:` lines, beginning with `DEBUG:debug lines on`; no other answer |
+| `debug off` | stop writing them; no answer |
+
+`debug on` and `debug off` change what `debugMode` set, from the next line on,
+for a microphone that is already open as well as for one opened later: the
+event loop and every microphone's capture thread share one switch, and a
+capture thread drops its debug reports at the source while it is off. Nothing
+else changes; the microphone stays as it is and nothing is reloaded. They are
+accepted while the model loads and while paused. The extension sends them when
+the user changes the log level of its output channel.
 
 Blank lines are ignored. Surrounding whitespace, `\r` included, is trimmed, so
 a parent writing CRLF is handled. Anything else is fatal:
@@ -479,9 +561,10 @@ command is never dropped.
 | `DETECTED:<phrase>` | a wake phrase was heard; the phrase is as configured, lower-cased |
 | `PAUSED` | microphone closed, everything else still loaded |
 | `RELEASED` | microphone closed for good, the process is exiting |
-| `ERROR:<msg>` | fatal; the process exits 1 |
-| `DEBUG:<msg>` | diagnostics, only when `debugMode` is true |
+| `ERROR:<msg>` | fatal; the process exits 1. Before a `READY` in the listening session the extension reports it once; after one, it restarts the engine |
+| `DEBUG:<msg>` | diagnostics, only while debug mode is on: `debugMode`, then `debug on` and `debug off` |
 | `SELF-TEST:<line>` | `--self-test` only |
+| `DEVICES:<json>` | `--list-devices` only |
 
 `DETECTED` carries no confidence suffix: the keyword spotter applies its own
 threshold and returns no usable score. The extension's parser accepts an
@@ -496,6 +579,12 @@ mode also reports each speech and silence transition, the spotter's full
 result for each detection, and, every 30 seconds, decibri's overrun count when
 it has changed since the last report: a rising count means the capture loop,
 keyword spotting included, is falling behind the microphone.
+
+Nothing in debug mode is audio or a transcript. The spotter only ever completes
+one of the configured keywords, and a decode step that completes none writes
+nothing; a hit is written as the spotter's result for that keyword, its tokens
+and timestamps. Every other line is fixed text, a count, a timing, a path, or
+the configured phrases.
 
 A failure before the microphone opens is one of three lines. `ERROR:Startup
 error: <detail>` means the config has no `keywordLines` or no `phraseMap`.
@@ -530,8 +619,9 @@ engine-rs/
   Cargo.lock
   .cargo/config.toml   links the static C runtime on Windows, as the sherpa-onnx libraries require
   src/
-    main.rs        argument handling, the self-test, the stdin reader, signals, the event loop
-    protocol.rs    chunk-safe line splitting, control-line parsing, stdout lines
+    main.rs        argument handling, the self-test, the device list, the stdin reader, signals, the event loop
+    protocol.rs    chunk-safe line splitting, control-line parsing, stdout lines, the shared debug switch
+    devices.rs     the input devices and the line --list-devices prints
     config.rs      the config JSON shape, its defaults, and the decoded-to-phrase map
     lifecycle.rs   the state machine and the capture session
     capture.rs     decibri microphone and Silero setup, the capture loop, the capture and preparation threads

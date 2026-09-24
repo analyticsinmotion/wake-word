@@ -242,6 +242,70 @@ const scenarios = [
     exit: 1,
   },
   {
+    // A runner may have no audio devices, or no audio service to ask, so an
+    // empty list and an error are both answers; what is checked is that the
+    // answer is one line in the documented shape, and that nothing is opened.
+    name: 'list-devices prints one DEVICES line, or one ERROR line, and exits',
+    args: ['--list-devices'],
+    async drive() {},
+    expect: (lines) => {
+      if (lines.length !== 1) return `expected one line, got ${JSON.stringify(lines)}`;
+      if (lines[0].startsWith('ERROR:Could not list the input devices: ')) return null;
+      if (!lines[0].startsWith('DEVICES:')) return `line was ${lines[0]}`;
+      let devices;
+      try {
+        devices = JSON.parse(lines[0].slice('DEVICES:'.length));
+      } catch (err) {
+        return `the list is not JSON: ${err.message}`;
+      }
+      if (!Array.isArray(devices)) return 'the list is not an array';
+      const wrong = devices.find(
+        (d) =>
+          JSON.stringify(Object.keys(d)) !==
+            JSON.stringify(['index', 'name', 'id', 'default', 'channels', 'sampleRate']) ||
+          !Number.isInteger(d.index) ||
+          typeof d.name !== 'string' ||
+          typeof d.id !== 'string' ||
+          typeof d.default !== 'boolean' ||
+          !Number.isInteger(d.channels) ||
+          !Number.isInteger(d.sampleRate)
+      );
+      if (wrong) return `a device is not in the documented shape: ${JSON.stringify(wrong)}`;
+      if (devices.filter((d) => d.default).length > 1) return 'more than one default device';
+      return null;
+    },
+    exit: [0, 1],
+    // The platform's audio library can print its own notices while it
+    // enumerates, as ALSA does for a PCM it cannot open.
+    stderrAllowed: /./,
+  },
+  {
+    name: 'debug on and debug off switch the DEBUG lines of a loaded engine',
+    needs: ['model'],
+    async drive(engine) {
+      // Paused before the microphone opens, so no microphone is needed.
+      engine.write(config() + '\npause\ndebug on\n');
+      await engine.waitFor('PAUSED');
+      await engine.waitFor('DEBUG:debug lines on');
+      await engine.waitFor(
+        'DEBUG:models loaded; paused before the microphone opened, waiting for resume'
+      );
+      // A second config line is ignored, and says so in debug mode only.
+      engine.write(config() + '\n');
+      await engine.waitFor('DEBUG:ignoring a second config line: the engine is already configured');
+      engine.write('debug off\n' + config() + '\n' + 'stop\n');
+    },
+    expect: (lines) => {
+      const protocolLines = lines.filter((line) => !line.startsWith('DEBUG:'));
+      if (protocolLines.join('|') !== 'PAUSED|RELEASED') {
+        return `expected PAUSED, RELEASED, got ${protocolLines.join(', ')}`;
+      }
+      const ignored = lines.filter((line) => line.startsWith('DEBUG:ignoring a second config line'));
+      return ignored.length === 1 ? null : `expected the second config line reported once, got ${ignored.length}`;
+    },
+    exit: 0,
+  },
+  {
     name: 'config, pause, resume, stop',
     needs: ['model', 'microphone'],
     async drive(engine) {
@@ -698,8 +762,9 @@ async function runScenario(binary, scenario) {
     return `expected [${scenario.lines.join(', ')}], got [${lines.join(', ')}]`;
   }
 
-  if (code !== scenario.exit) {
-    return `expected exit ${scenario.exit}, got ${code}`;
+  const exits = Array.isArray(scenario.exit) ? scenario.exit : [scenario.exit];
+  if (!exits.includes(code)) {
+    return `expected exit ${exits.join(' or ')}, got ${code}`;
   }
   const stderr = engine.stderr
     .split(/\r?\n/)

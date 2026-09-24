@@ -44,6 +44,7 @@ use crate::lifecycle::{
     CaptureDevice, CaptureReport, Event, OpenRequest, PrepareRequest, Prepared, Spawner,
 };
 use crate::mic_errors::CaptureError;
+use crate::protocol::DebugSwitch;
 use crate::samples::clamp_in_place;
 use crate::spotter::{self, SpotterSlot};
 
@@ -217,6 +218,9 @@ fn stream_closed() -> CaptureError {
 
 /// Run one microphone until it is closed or fails.
 ///
+/// `debug` is read for every report, so `debug on` and `debug off` take effect
+/// on a microphone that is already running.
+///
 /// `closed` is set by [`CaptureDevice::close`] before it stops the stream.
 /// It is checked after every read and again under the sink's lock, so once it
 /// is set nothing further reaches the sink, including the tail decibri
@@ -227,14 +231,14 @@ pub fn run_capture(
     detector: &mut dyn SpeechDetector,
     sink: &Mutex<dyn SpeechSink>,
     closed: &AtomicBool,
-    debug: bool,
+    debug: &DebugSwitch,
     now_ms: &dyn Fn() -> u64,
     report: &mut dyn FnMut(CaptureReport),
 ) {
     // Debug lines are dropped here rather than sent and discarded later, so a
     // capture outside debug mode posts nothing but failures.
     let mut report = |line: CaptureReport| {
-        if debug || !matches!(line, CaptureReport::Debug(_)) {
+        if debug.is_on() || !matches!(line, CaptureReport::Debug(_)) {
             report(line);
         }
     };
@@ -248,7 +252,7 @@ pub fn run_capture(
         if closed.load(Ordering::SeqCst) {
             return;
         }
-        if debug {
+        if debug.is_on() {
             if let Some(count) = overruns.poll(now_ms(), source.overrun_count()) {
                 report(CaptureReport::Debug(format!("overruns: {count}")));
             }
@@ -396,7 +400,7 @@ fn capture_thread(request: OpenRequest, events: Sender<Event>, sink: Arc<Mutex<d
         &mut detector,
         &*sink,
         &closed,
-        request.debug,
+        &request.debug,
         &now_ms,
         &mut |report| {
             let _ = events.send(Event::Capture { id, report });
@@ -663,7 +667,7 @@ mod tests {
             &mut detector,
             &sink,
             &closed,
-            debug,
+            &DebugSwitch::new(debug),
             &|| clock.get(),
             &mut |report| reports.push(report),
         );
@@ -693,7 +697,7 @@ mod tests {
             &mut detector,
             &sink,
             &closed,
-            debug,
+            &DebugSwitch::new(debug),
             &|| clock.get(),
             &mut |report| reports.push(report),
         );
@@ -788,7 +792,7 @@ mod tests {
             device: AudioDevice::Default,
             vad_model: PathBuf::from("/m/silero_vad.onnx"),
             ort_library: Some(PathBuf::from("/o/ort.so")),
-            debug: false,
+            debug: DebugSwitch::new(false),
         };
         let config = vad_config(&request);
         assert_eq!(config.model_path, PathBuf::from("/m/silero_vad.onnx"));
@@ -1044,6 +1048,77 @@ mod tests {
                 CaptureReport::Debug("KWS result: {}".to_string()),
                 detected,
             ]
+        );
+    }
+
+    /// A sink that says which chunk it was given, and turns the shared debug
+    /// switch to `to` when it is given chunk number `flip_on`, the way `debug
+    /// on` or `debug off` arriving on the event loop would part way through.
+    struct SwitchingSink {
+        switch: DebugSwitch,
+        accepted: usize,
+        flip_on: usize,
+        to: bool,
+    }
+
+    impl SpeechSink for SwitchingSink {
+        fn accept(&mut self, _samples: &[f32], report: &mut dyn FnMut(CaptureReport)) {
+            self.accepted += 1;
+            if self.accepted == self.flip_on {
+                self.switch.set(self.to);
+            }
+            report(CaptureReport::Debug(format!("chunk {}", self.accepted)));
+        }
+
+        fn end_segment(&mut self, _report: &mut dyn FnMut(CaptureReport)) {}
+
+        fn reset(&mut self) {}
+    }
+
+    fn run_switching(initially: bool, flip_on: usize, to: bool) -> Vec<String> {
+        let source = FakeSource::new(vec![loud(0.1), loud(0.2), loud(0.3), loud(0.4)]);
+        let switch = DebugSwitch::new(initially);
+        let sink = Mutex::new(SwitchingSink {
+            switch: switch.clone(),
+            accepted: 0,
+            flip_on,
+            to,
+        });
+        let mut detector = FakeDetector {
+            scores: Rc::clone(&source.scores),
+            seen: Vec::new(),
+            fail_on_call: None,
+        };
+        let clock = Rc::clone(&source.clock);
+        let closed = Arc::clone(&source.closed);
+        let mut lines = Vec::new();
+        run_capture(
+            &source,
+            &mut detector,
+            &sink,
+            &closed,
+            &switch,
+            &|| clock.get(),
+            &mut |report| {
+                if let CaptureReport::Debug(line) = report {
+                    lines.push(line);
+                }
+            },
+        );
+        lines
+    }
+
+    #[test]
+    fn follows_the_debug_switch_while_it_runs() {
+        assert_eq!(
+            run_switching(false, 3, true),
+            ["chunk 3", "chunk 4"],
+            "turned on part way: nothing before, everything after"
+        );
+        assert_eq!(
+            run_switching(true, 3, false),
+            ["VAD: speech (1 pre-roll chunks)", "chunk 1", "chunk 2"],
+            "turned off part way: nothing after"
         );
     }
 

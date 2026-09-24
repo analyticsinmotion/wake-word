@@ -51,8 +51,9 @@ vi.mock("../../src/tokeniser", () => ({
   readVocabulary: mocks.readVocabulary,
 }));
 
-import { SherpaEngine, nativeEnginePath, prepareNativeEngine } from "../../src/sherpaEngine";
-import { WakePhrase } from "../../src/speechEngineInterface";
+import * as vscodeApi from "vscode";
+import { DownloadCancelledError, SherpaEngine, nativeEnginePath, prepareNativeEngine } from "../../src/sherpaEngine";
+import { EngineRestart, WakePhrase } from "../../src/speechEngineInterface";
 import { releaseThenFire } from "../../src/wakeWordCore";
 
 const ROUTES: WakePhrase[] = [
@@ -109,10 +110,14 @@ interface Captured {
   started: number;
   stopped: number;
   paused: number;
+  cancelled: number;
   detected: Array<{ phrase: WakePhrase; confidence: number | undefined }>;
+  restarts: EngineRestart[];
   warnings: string[];
   errors: Error[];
   debug: string[];
+  /** The verbose log. */
+  detail: string[];
 }
 
 /** Subscribe to everything. An unhandled 'error' would throw inside the engine. */
@@ -121,18 +126,24 @@ function capture(engine: SherpaEngine): Captured {
     started: 0,
     stopped: 0,
     paused: 0,
+    cancelled: 0,
     detected: [],
+    restarts: [],
     warnings: [],
     errors: [],
     debug: [],
+    detail: [],
   };
   engine.on("started", () => c.started++);
   engine.on("stopped", () => c.stopped++);
   engine.on("paused", () => c.paused++);
+  engine.on("cancelled", () => c.cancelled++);
   engine.on("detected", (phrase, confidence) => c.detected.push({ phrase, confidence }));
+  engine.on("restarting", (restart) => c.restarts.push({ ...restart }));
   engine.on("warning", (msg) => c.warnings.push(msg));
   engine.on("error", (err) => c.errors.push(err));
   engine.on("debug", (info) => c.debug.push(info));
+  engine.on("detail", (info) => c.detail.push(info));
   return c;
 }
 
@@ -207,6 +218,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 // ── the engine binary ───────────────────────────────────────
@@ -363,9 +375,9 @@ describe("start", () => {
   });
 
   it("passes the configured audio device to the child", async () => {
-    const { engine } = makeEngine("Blue Yeti");
+    const { engine } = makeEngine("Desk Mic 2");
     await engine.start(ROUTES, 0.3, false);
-    expect(configLine(latest()).audioDevice).toBe("Blue Yeti");
+    expect(configLine(latest()).audioDevice).toBe("Desk Mic 2");
   });
 
   it("clamps the threshold before sending it", async () => {
@@ -547,15 +559,15 @@ describe("tokenising the phrases", () => {
   it("logs the tokenising phases and each phrase's pieces in debug mode", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, true);
-    const lines = events.debug.filter((d) => !d.startsWith("Model already present"));
-    expect(lines.slice(0, 5)).toEqual([
+    const lines = events.detail.filter((d) => !d.startsWith("Model already present"));
+    expect(lines).toEqual([
       expect.stringMatching(/^Timing: bpe-load \d+ms$/),
       expect.stringMatching(/^Timing: tokenise \d+ms$/),
       "phrase: hey claude -> tokens: ▁HEY ▁CLAUDE -> decoded: HEY CLAUDE",
       "phrase: hey computer -> tokens: ▁HEY ▁COMPUTER -> decoded: HEY COMPUTER",
       "phrase: open terminal -> tokens: ▁OPEN ▁TERMINAL -> decoded: OPEN TERMINAL",
     ]);
-    expect(lines[5]).toMatch(/^Spawning: /);
+    expect(events.debug.find((d) => d.startsWith("Spawning: "))).toBeDefined();
   });
 
   it("times the model load from the start of tokenising", async () => {
@@ -566,17 +578,18 @@ describe("tokenising the phrases", () => {
     }));
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, true);
-    const bpeLoad = events.debug.find((d) => d.startsWith("Timing: bpe-load"));
+    const bpeLoad = events.detail.find((d) => d.startsWith("Timing: bpe-load"));
     const elapsed = Number(/(\d+)ms$/.exec(bpeLoad ?? "")?.[1]);
     expect(elapsed).toBeGreaterThanOrEqual(59_000);
     expect(elapsed).toBeLessThanOrEqual(60_000);
     // A load time in the future leaves nothing for the tokenise phase.
-    expect(events.debug).toContain("Timing: tokenise 0ms");
+    expect(events.detail).toContain("Timing: tokenise 0ms");
   });
 
   it("logs no tokenising lines outside debug mode", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, false);
+    expect(events.detail).toEqual([]);
     expect(events.debug.filter((d) => d.startsWith("Timing:") || d.startsWith("phrase:"))).toEqual([]);
   });
 
@@ -616,12 +629,13 @@ describe("stdout protocol", () => {
   it("reassembles lines split across chunks", async () => {
     const { engine, events } = makeEngine();
     await startAndReady(engine);
+    engine.setDebugMode(true);
     const proc = latest();
     proc.sendRaw("DETEC");
     proc.sendRaw("TED:hey claude\nDEB");
     expect(events.detected).toHaveLength(1);
     proc.sendRaw("UG:half a line\n");
-    expect(events.debug).toContain("half a line");
+    expect(events.detail).toContain("half a line");
   });
 
   it("handles several lines in one chunk", async () => {
@@ -631,19 +645,14 @@ describe("stdout protocol", () => {
     expect(events.detected.map((d) => d.phrase.label)).toEqual(["Claude", "Terminal"]);
   });
 
-  it("forwards ERROR lines as error events", async () => {
+  it("forwards DEBUG lines to the verbose log, and stderr as debug events", async () => {
     const { engine, events } = makeEngine();
-    await startAndReady(engine);
-    latest().sendLine("ERROR:Failed to open microphone: boom");
-    expect(events.errors[0].message).toBe("Failed to open microphone: boom");
-  });
-
-  it("forwards DEBUG lines and stderr as debug events", async () => {
-    const { engine, events } = makeEngine();
-    await startAndReady(engine);
+    await engine.start(ROUTES, 0.3, true);
+    latest().sendLine("READY");
     latest().sendLine("DEBUG:VAD: speech");
     latest().sendStderr("  warning from a dependency \n");
-    expect(events.debug).toContain("VAD: speech");
+    expect(events.detail).toContain("VAD: speech");
+    expect(events.debug).not.toContain("VAD: speech");
     expect(events.debug).toContain("stderr: warning from a dependency");
   });
 
@@ -655,6 +664,237 @@ describe("stdout protocol", () => {
     expect(events.detected).toHaveLength(0);
     expect(events.errors).toHaveLength(0);
     expect(engine.isListening).toBe(true);
+  });
+});
+
+// ── a fatal error from the child ────────────────────────────
+
+describe("a fatal error from the child", () => {
+  const NOT_FOUND =
+    'No microphone matching "Desk Mic" was found. Check wakeWord.audioDevice against the input devices on this machine.';
+  const UNPLUGGED = "The microphone stopped responding: decibri: audio device error: device unplugged";
+  const NO_MICROPHONE = "No microphone found. Check your audio device settings.";
+
+  it("reports an ERROR before the engine has listened once, with the engine's own message, and restarts nothing", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    const proc = latest();
+    proc.sendLine(`ERROR:${NOT_FOUND}`);
+    proc.simulateExit(1);
+
+    expect(events.errors.map((e) => e.message)).toEqual([NOT_FOUND]);
+    expect(events.restarts).toEqual([]);
+    expect(proc.killed).toBe(true);
+    expect(engine.isStarting).toBe(false);
+    expect(engine.restarting).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(events.errors).toHaveLength(1);
+  });
+
+  it("restarts a child whose microphone fails after it has listened, with the message as the reason", async () => {
+    // A device unplugged while listening: a new child opens whatever
+    // device is the default now.
+    const { engine, events } = makeEngine();
+    await startAndReady(engine);
+    latest().sendLine(`ERROR:${UNPLUGGED}`);
+
+    expect(events.errors).toEqual([]);
+    expect(events.restarts).toEqual([{ attempt: 1, attempts: 3, delayMs: 2000, reason: UNPLUGGED }]);
+    expect(engine.isListening).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0]);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    latest().sendLine("READY");
+    expect(engine.isListening).toBe(true);
+    expect(engine.restarting).toBeNull();
+  });
+
+  it("keeps restarting while the microphone cannot be reopened, then reports the child's own message", async () => {
+    // Unplugged with no other microphone: every restart fails to open one.
+    const { engine, events } = makeEngine();
+    await startAndReady(engine);
+    latest().sendLine(`ERROR:${UNPLUGGED}`);
+    for (const delay of RETRY_DELAYS_MS) {
+      await vi.advanceTimersByTimeAsync(delay);
+      await flush();
+      latest().sendLine(`ERROR:${NO_MICROPHONE}`);
+    }
+
+    expect(mocks.spawn).toHaveBeenCalledTimes(4);
+    expect(events.restarts.map((r) => r.reason)).toEqual([UNPLUGGED, NO_MICROPHONE, NO_MICROPHONE]);
+    expect(events.errors.map((e) => e.message)).toEqual([NO_MICROPHONE]);
+    expect(engine.restarting).toBeNull();
+  });
+
+  it("reports once the ERROR of a child restarted after a crash, when the engine never listened", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    latest().simulateExit(1);
+    await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0]);
+    await flush();
+    latest().sendLine(`ERROR:${NOT_FOUND}`);
+
+    expect(events.restarts).toHaveLength(1);
+    expect(events.errors.map((e) => e.message)).toEqual([NOT_FOUND]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("judges the next session afresh after a stop", async () => {
+    const { engine, events } = makeEngine();
+    await startAndReady(engine);
+    engine.stop();
+    await engine.start(ROUTES, 0.3, false);
+    latest().sendLine(`ERROR:${NOT_FOUND}`);
+    expect(events.errors.map((e) => e.message)).toEqual([NOT_FOUND]);
+    expect(events.restarts).toEqual([]);
+  });
+
+  it("reads an ERROR line that arrives after the exit has been reported", async () => {
+    // Node can report a child's exit before the last of its output.
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    const proc = latest();
+    proc.simulateExitBeforeOutput(1);
+    proc.sendLine(`ERROR:${NOT_FOUND}`);
+    proc.simulateClose();
+
+    expect(events.errors.map((e) => e.message)).toEqual([NOT_FOUND]);
+    expect(events.restarts).toEqual([]);
+  });
+
+  it("restarts a resumed child that cannot reopen the microphone", async () => {
+    // The device went away during the handoff.
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.resume();
+    proc.sendLine(`ERROR:${NO_MICROPHONE}`);
+    expect(events.restarts).toEqual([{ attempt: 1, attempts: 3, delayMs: 2000, reason: NO_MICROPHONE }]);
+    expect(events.errors).toEqual([]);
+  });
+
+  it("does not restart a paused child that reports an error, and the next resume starts a new one", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await pausedEngine(engine);
+    proc.sendLine("ERROR:Invalid config JSON: expected value at line 1 column 1");
+
+    expect(proc.killed).toBe(true);
+    expect(events.restarts).toEqual([]);
+    expect(events.errors).toEqual([]);
+    expect(events.warnings).toEqual([
+      "Speech engine error while paused: Invalid config JSON: expected value at line 1 column 1. " +
+        "The next resume starts it again.",
+    ]);
+    expect(engine.isPaused).toBe(true);
+
+    engine.resume();
+    await flush();
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops anything the failed child prints after its ERROR line", async () => {
+    const { engine, events } = makeEngine();
+    await startAndReady(engine);
+    latest().sendRaw(`ERROR:${UNPLUGGED}\nDETECTED:hey claude\n`);
+    expect(events.detected).toEqual([]);
+  });
+});
+
+describe("isStarting", () => {
+  it("is set from start() until READY", async () => {
+    const { engine } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    expect(engine.isStarting).toBe(true);
+    await starting;
+    expect(engine.isStarting).toBe(true);
+    latest().sendLine("READY");
+    expect(engine.isStarting).toBe(false);
+  });
+
+  it("is set from resume() until READY", async () => {
+    const { engine } = makeEngine();
+    const proc = await pausedEngine(engine);
+    expect(engine.isStarting).toBe(false);
+    engine.resume();
+    expect(engine.isStarting).toBe(true);
+    proc.sendLine("READY");
+    expect(engine.isStarting).toBe(false);
+  });
+
+  it("is cleared by stop() and by a failure", async () => {
+    const stopped = makeEngine();
+    await stopped.engine.start(ROUTES, 0.3, false);
+    stopped.engine.stop();
+    expect(stopped.engine.isStarting).toBe(false);
+
+    mocks.readVocabulary.mockRejectedValueOnce(new Error("tokens.txt is unreadable"));
+    const failed = makeEngine();
+    await failed.engine.start(ROUTES, 0.3, false);
+    await flush();
+    expect(failed.events.errors).toHaveLength(1);
+    expect(failed.engine.isStarting).toBe(false);
+  });
+});
+
+describe("the model download", () => {
+  // The model is not on disk, so the start downloads it; the download's
+  // progress notification is where the outcome comes from.
+  beforeEach(() => {
+    mocks.existsSync.mockImplementation((file: string) => String(file).endsWith("wake-word-engine"));
+  });
+
+  it("ends a start cancelled from the download notification with cancelled, not an error", async () => {
+    vi.spyOn(vscodeApi.window, "withProgress").mockRejectedValue(new DownloadCancelledError());
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+
+    expect(events.cancelled).toBe(1);
+    expect(events.errors).toEqual([]);
+    expect(engine.isStarting).toBe(false);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it("reports a stalled download as the model being unavailable", async () => {
+    vi.spyOn(vscodeApi.window, "withProgress").mockRejectedValue(
+      new Error("no data arrived for 30 seconds, so the download was stopped.")
+    );
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+
+    expect(events.errors.map((e) => e.message)).toEqual([
+      "Model unavailable: no data arrived for 30 seconds, so the download was stopped.",
+    ]);
+    expect(events.cancelled).toBe(0);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it("says nothing of a download that fails once the start has been stopped", async () => {
+    const download = deferred<string>();
+    vi.spyOn(vscodeApi.window, "withProgress").mockReturnValue(download.promise as never);
+    const { engine, events } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    engine.stop();
+    download.reject(new Error("no data arrived for 30 seconds, so the download was stopped."));
+    await starting;
+
+    expect(events.errors).toEqual([]);
+    expect(events.cancelled).toBe(0);
+    expect(events.debug).toContain("Start abandoned: stopped during the model check");
+  });
+});
+
+describe("the config line", () => {
+  it("names the editor that started the engine", async () => {
+    const context = { globalStorageUri: { fsPath: "/fake/storage" } } as unknown as vscode.ExtensionContext;
+    const engine = new SherpaEngine(context, "", "Example Editor");
+    capture(engine);
+    await engine.start(ROUTES, 0.3, false);
+    expect(configLine(latest()).editorName).toBe("Example Editor");
   });
 });
 
@@ -915,9 +1155,10 @@ describe("pause", () => {
   it("sees a PAUSED that arrives behind other output in one chunk", async () => {
     const { engine, events } = makeEngine();
     const proc = await startAndReady(engine);
+    engine.setDebugMode(true);
     engine.pause();
     proc.sendRaw("DEBUG:VAD: silence\nPAUSED\n");
-    expect(events.debug).toContain("VAD: silence");
+    expect(events.detail).toContain("VAD: silence");
     expect(events.debug).toContain("Mic release: acknowledged by engine (paused)");
   });
 
@@ -1357,7 +1598,7 @@ describe("resume", () => {
     const proc = await pausedEngine(engine);
     engine.resume();
     proc.simulateExit(1);
-    expect(events.warnings[0]).toMatch(/Retrying in 2s \(attempt 1\/3\)/);
+    expect(events.restarts).toEqual([{ attempt: 1, attempts: 3, delayMs: 2000, reason: "exit code 1" }]);
     await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0]);
     await flush();
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
@@ -1418,7 +1659,7 @@ describe("start while paused", () => {
     await pausedEngine(engine);
     await engine.start(ROUTES, 0.3, false);
     latest().simulateExit(1);
-    expect(events.warnings).toHaveLength(1);
+    expect(events.restarts).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0]);
     await flush();
     expect(mocks.spawn).toHaveBeenCalledTimes(3);
@@ -1437,7 +1678,7 @@ describe("debug timing", () => {
     proc.sendLine("PAUSED");
     engine.resume();
     proc.sendLine("READY");
-    const timing = events.debug.filter((d) => d.startsWith("Timing:"));
+    const timing = events.detail.filter((d) => d.startsWith("Timing:"));
     expect(timing).toHaveLength(5);
     expect(timing[0]).toMatch(/^Timing: bpe-load \d+ms$/);
     expect(timing[1]).toMatch(/^Timing: tokenise \d+ms$/);
@@ -1451,28 +1692,113 @@ describe("debug timing", () => {
     const proc = await pausedEngine(engine);
     engine.resume();
     proc.sendLine("READY");
+    expect(events.detail.filter((d) => d.startsWith("Timing:"))).toEqual([]);
     expect(events.debug.filter((d) => d.startsWith("Timing:"))).toEqual([]);
   });
 
   it("forwards the child's own timing lines", async () => {
     const { engine, events } = makeEngine();
-    const proc = await startAndReady(engine);
+    await engine.start(ROUTES, 0.3, true);
+    const proc = latest();
+    proc.sendLine("READY");
     proc.sendLine("DEBUG:Timing: model-load 487ms");
-    expect(events.debug).toContain("Timing: model-load 487ms");
+    expect(events.detail).toContain("Timing: model-load 487ms");
+  });
+});
+
+// ── verbose log ─────────────────────────────────────────────
+
+describe("the verbose log switched while the engine runs", () => {
+  it("tells a listening child with debug on and debug off, and nothing else", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    expect(configLine(proc).debugMode).toBe(false);
+
+    engine.setDebugMode(true);
+    engine.setDebugMode(true);
+    engine.setDebugMode(false);
+    expect(commands(proc)).toEqual(["debug on", "debug off"]);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(engine.isListening).toBe(true);
+  });
+
+  it("starts and stops passing the child's DEBUG lines on at once", async () => {
+    const { engine, events } = makeEngine();
+    const proc = await startAndReady(engine);
+    proc.sendLine("DEBUG:VAD: speech");
+    expect(events.detail).toEqual([]);
+
+    engine.setDebugMode(true);
+    proc.sendLine("DEBUG:debug lines on");
+    proc.sendLine("DEBUG:VAD: silence");
+    expect(events.detail).toEqual(["debug lines on", "VAD: silence"]);
+
+    engine.setDebugMode(false);
+    // Already on its way when the child was told.
+    proc.sendLine("DEBUG:VAD: speech");
+    expect(events.detail).toEqual(["debug lines on", "VAD: silence"]);
+  });
+
+  it("tells a child paused for a handoff, which keeps it for the resume", async () => {
+    const { engine } = makeEngine();
+    const proc = await pausedEngine(engine);
+    engine.setDebugMode(true);
+    engine.resume();
+    expect(commands(proc)).toEqual(["pause", "debug on", "resume"]);
+  });
+
+  it("configures a child spawned after a switch made during the model check and tokenising", async () => {
+    const pending = deferred<{ pieces: string[][]; loadedAt: number }>();
+    mocks.tokenise.mockReturnValueOnce(pending.promise);
+    const { engine, events } = makeEngine();
+    const starting = engine.start(ROUTES, 0.3, false);
+    await flush();
+    engine.setDebugMode(true);
+    pending.resolve({ pieces: [["▁HEY", "▁CLAUDE"], ["▁HEY", "▁COMPUTER"], ["▁OPEN", "▁TERMINAL"]], loadedAt: Date.now() });
+    await starting;
+    const proc = latest();
+    expect(configLine(proc).debugMode).toBe(true);
+    expect(commands(proc)).toEqual([]);
+    expect(events.detail.some((d) => d.startsWith("Timing: tokenise"))).toBe(true);
+  });
+
+  it("gives a child restarted after a crash the mode switched to since", async () => {
+    const { engine } = makeEngine();
+    await startAndReady(engine);
+    engine.setDebugMode(true);
+    await crashAndRetry(2000);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(configLine(latest()).debugMode).toBe(true);
+  });
+
+  it("passes on nothing for a phrase no route has, in the verbose log or anywhere else", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, true);
+    const proc = latest();
+    proc.sendLine("READY");
+    proc.sendLine("DETECTED:open the pod bay doors");
+    expect(events.detected).toEqual([]);
+    expect([...events.debug, ...events.detail, ...events.warnings].join("\n")).not.toContain("pod bay");
+  });
+
+  it("writes nothing when there is no child", () => {
+    const { engine } = makeEngine();
+    engine.setDebugMode(true);
+    expect(mocks.spawn).not.toHaveBeenCalled();
   });
 });
 
 // ── crash and retry ─────────────────────────────────────────
 
 describe("crash and retry", () => {
-  it("warns and retries after the first backoff delay", async () => {
+  it("reports the restart and retries after the first backoff delay", async () => {
     const { engine, events } = makeEngine();
     await startAndReady(engine);
     latest().simulateExit(1);
 
     expect(engine.isListening).toBe(false);
-    expect(events.warnings).toHaveLength(1);
-    expect(events.warnings[0]).toMatch(/exit code 1\. Retrying in 2s \(attempt 1\/3\)/);
+    expect(events.restarts).toEqual([{ attempt: 1, attempts: 3, delayMs: 2000, reason: "exit code 1" }]);
+    expect(engine.restarting).toEqual(events.restarts[0]);
     expect(events.errors).toHaveLength(0);
 
     await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0] - 1);
@@ -1482,6 +1808,12 @@ describe("crash and retry", () => {
     await vi.advanceTimersByTimeAsync(1);
     await flush();
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    // Still restarting until the new child says READY.
+    expect(engine.restarting).not.toBeNull();
+    expect(engine.isStarting).toBe(false);
+    latest().sendLine("READY");
+    expect(engine.restarting).toBeNull();
+    expect(engine.isListening).toBe(true);
   });
 
   it("escalates the delay on each consecutive crash", async () => {
@@ -1490,15 +1822,15 @@ describe("crash and retry", () => {
     await crashAndRetry(RETRY_DELAYS_MS[0]);
     await crashAndRetry(RETRY_DELAYS_MS[1]);
     await crashAndRetry(RETRY_DELAYS_MS[2]);
-    expect(events.warnings.map((w) => w.match(/Retrying in (\d+)s \(attempt (\d)\/3\)/)?.slice(1))).toEqual([
-      ["2", "1"],
-      ["5", "2"],
-      ["10", "3"],
+    expect(events.restarts.map((r) => [r.delayMs, r.attempt, r.attempts])).toEqual([
+      [2000, 1, 3],
+      [5000, 2, 3],
+      [10000, 3, 3],
     ]);
     expect(mocks.spawn).toHaveBeenCalledTimes(4);
   });
 
-  it("gives up with an error after three retries", async () => {
+  it("gives up with an error that says the engine kept stopping after three restarts", async () => {
     const { engine, events } = makeEngine();
     await startAndReady(engine);
     await crashAndRetry(RETRY_DELAYS_MS[0]);
@@ -1507,13 +1839,23 @@ describe("crash and retry", () => {
     latest().simulateExit(1);
 
     expect(events.errors).toHaveLength(1);
-    expect(events.errors[0].message).toBe("exit code 1 (failed after 3 retries)");
-    expect(events.warnings).toHaveLength(3);
+    expect(events.errors[0].message).toBe(
+      "The speech engine stopped unexpectedly (exit code 1) and did not recover after 3 restarts."
+    );
+    expect(events.restarts).toHaveLength(3);
+    expect(engine.restarting).toBeNull();
 
     await vi.advanceTimersByTimeAsync(60_000);
     await flush();
     expect(mocks.spawn).toHaveBeenCalledTimes(4);
     expect(engine.isListening).toBe(false);
+  });
+
+  it("names a signal that ended the child", async () => {
+    const { engine, events } = makeEngine();
+    await startAndReady(engine);
+    latest().simulateExit(null, "SIGKILL");
+    expect(events.restarts[0].reason).toBe("signal SIGKILL");
   });
 
   it("resets the retry budget once a child reports READY", async () => {
@@ -1524,7 +1866,24 @@ describe("crash and retry", () => {
     expect(engine.isListening).toBe(true);
 
     latest().simulateExit(1);
-    expect(events.warnings[1]).toMatch(/Retrying in 2s \(attempt 1\/3\)/);
+    expect(events.restarts[1]).toMatchObject({ attempt: 1, delayMs: 2000 });
+  });
+
+  it("gives a start after a final failure the full number of restarts", async () => {
+    const { engine, events } = makeEngine();
+    await startAndReady(engine);
+    await crashAndRetry(RETRY_DELAYS_MS[0]);
+    await crashAndRetry(RETRY_DELAYS_MS[1]);
+    await crashAndRetry(RETRY_DELAYS_MS[2]);
+    latest().simulateExit(1);
+    expect(events.errors).toHaveLength(1);
+
+    // The user clicks the status bar to try again, with no stop in between.
+    await engine.start(ROUTES, 0.3, false);
+    latest().sendLine("READY");
+    latest().simulateExit(1);
+    expect(events.restarts.at(-1)).toMatchObject({ attempt: 1 });
+    expect(events.errors).toHaveLength(1);
   });
 
   it("treats a clean exit while listening as a stop, not a crash", async () => {
@@ -1541,13 +1900,27 @@ describe("crash and retry", () => {
   });
 
   it("retries a crash that happens before READY", async () => {
+    // With no ERROR line nothing says a restart cannot help, so a crash is
+    // restarted whether or not the engine has listened yet.
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, false);
     latest().simulateExit(1);
-    expect(events.warnings).toHaveLength(1);
+    expect(events.restarts).toHaveLength(1);
+    expect(events.errors).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(RETRY_DELAYS_MS[0]);
     await flush();
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("treats a clean exit during a start as a stop, not a crash", async () => {
+    // The engine exits 0 only when told to stop, or on a signal from outside.
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    expect(engine.isStarting).toBe(true);
+    latest().simulateExit(0);
+    expect(engine.isStarting).toBe(false);
+    expect(events.stopped).toBe(1);
+    expect(events.restarts).toHaveLength(0);
   });
 });
 
@@ -1583,15 +1956,16 @@ describe("stop during crash backoff", () => {
     await startAndReady(engine);
     await crashAndRetry(RETRY_DELAYS_MS[0]);
     latest().simulateExit(1);
-    expect(events.warnings[1]).toMatch(/attempt 2\/3/);
+    expect(events.restarts[1]).toMatchObject({ attempt: 2 });
 
     engine.stop();
+    expect(engine.restarting).toBeNull();
     await engine.start(ROUTES, 0.3, false);
     latest().sendLine("READY");
     expect(engine.isListening).toBe(true);
 
     latest().simulateExit(1);
-    expect(events.warnings[2]).toMatch(/attempt 1\/3/);
+    expect(events.restarts[2]).toMatchObject({ attempt: 1 });
   });
 });
 
@@ -1663,7 +2037,18 @@ describe("dispose", () => {
     engine.dispose();
     expect(proc.killed).toBe(true);
     expect(engine.isListening).toBe(false);
-    for (const event of ["detected", "started", "stopped", "paused", "error", "warning", "debug"]) {
+    for (const event of [
+      "detected",
+      "started",
+      "stopped",
+      "paused",
+      "cancelled",
+      "restarting",
+      "error",
+      "warning",
+      "debug",
+      "detail",
+    ]) {
       expect(engine.listenerCount(event)).toBe(0);
     }
   });

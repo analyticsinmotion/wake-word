@@ -69,10 +69,29 @@ export class MockChildProcess extends EventEmitter {
     this.stderr.push(text);
   }
 
-  /** The child exits. `code` is null when it died from a signal. */
+  /**
+   * The child exits and its output ends, reported as Node reports them:
+   * 'exit', then 'close'. `code` is null when it died from a signal.
+   */
   simulateExit(code: number | null, signal: NodeJS.Signals | null = null): void {
     this.exitCode = code;
     this.emit("exit", code, signal);
+    this.emit("close", code, signal);
+  }
+
+  /**
+   * The child exits while its last output is still on its way, which Node
+   * can report: 'exit' first, and 'close' only once the output has ended.
+   * Finish with simulateClose().
+   */
+  simulateExitBeforeOutput(code: number | null, signal: NodeJS.Signals | null = null): void {
+    this.exitCode = code;
+    this.emit("exit", code, signal);
+  }
+
+  /** The child's output has ended after simulateExitBeforeOutput(). */
+  simulateClose(signal: NodeJS.Signals | null = null): void {
+    this.emit("close", this.exitCode, signal);
   }
 
   /** spawn() itself failed, for example ENOENT for the node executable. */

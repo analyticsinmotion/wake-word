@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.16.0] - 2026-09-24
+
+### Added
+
+- **Wake Word: Toggle Listening** has a keyboard shortcut: Shift+Alt+W, or Ctrl+Cmd+W on macOS. It works from the editor, the terminal, and an assistant's panel, so it also resumes listening after a manual handoff, and a foot pedal that sends a key combination can press it. Wake Word adds its command to the default of `terminal.integrated.commandsToSkipShell` so the terminal passes the shortcut on. Change it in Keyboard Shortcuts.
+- A verbose log for tracking down a problem. Run **Developer: Set Log Level**, choose Wake Word, then Debug or Trace, and the output channel also shows the speech engine's detail. It takes effect at once, without restarting listening, and never contains audio or anything you said.
+- **Wake Word: Show Diagnostics** lists your input devices, marking the system default and the one Wake Word uses, and says whether the toggle shortcut reaches Wake Word from the terminal. A device name that looks like a person's, such as a headset named after its owner, is shortened in the report. The report also says whether the window is local or remote.
+- **Report Issue** on the Show Diagnostics notification copies the report and opens a new issue on GitHub for you to paste it into, check, and submit. Wake Word itself sends nothing.
+- Status bar states for starting (**Wake: Starting**), for a pause while the window is not focused (**Wake: Unfocused**), for restarting the speech engine after it stops (**Wake: Restarting**), and for when no route's command is available (**Wake: No commands**).
+
+### Changed
+
+- **Remote windows:** Wake Word runs on your own machine in remote windows (SSH, WSL, dev containers, and Codespaces in the desktop editor), beside your microphone, and wake phrases open commands on the remote side, such as Claude Code installed there. **If you installed Wake Word from a remote window before this version, open it in the Extensions view and choose Install Locally.**
+- A route whose command is not available in the editor, such as "Hey Claude" without Claude Code installed, is set aside and not listened for. A notification names the route, its command, and the extension to install, once rather than on every start. The route is listened for again as soon as that extension is installed or enabled, without restarting the editor, and an extension that is installed but has not started yet counts as providing its commands. If no route's command is available, the microphone is not opened. **Wake Word: Show Diagnostics** lists the routes set aside and why.
+- An error that a restart cannot resolve, such as no microphone or a `wakeWord.audioDevice` that matches nothing, is shown once with its own message. A microphone that fails while listening, such as one that is unplugged, is restarted.
+- The speech model download stops if no data arrives for 30 seconds, and its notification has a Cancel button. Either way the partial download is removed and the next start tries again.
+- The microphone permission message names the editor you are running.
+- The Wake Word output channel is a log channel: each line carries the editor's time and level, and your home directory is shown as `~`, as it already was in Show Diagnostics.
+- The extension's description and keywords are updated.
+- Wake Word runs in the desktop editor only, not in an editor opened in a web browser.
+
+### Fixed
+
+- A pause for focus loss ends when the window is focused again, including when `wakeWord.pauseOnFocusLoss` was turned off during the pause. A Calibrate run that ends while the window is not focused leaves listening paused.
+- The status bar icon for Off, Unfocused, Other window, and No commands shows in editors built on older VS Code releases.
+
 ## [0.15.0] - 2026-09-21
 
 ### Added

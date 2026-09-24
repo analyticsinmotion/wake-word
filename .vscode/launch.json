@@ -5,7 +5,7 @@
       "name": "Run Extension",
       "type": "extensionHost",
       "request": "launch",
-      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}", "--log=analytics-in-motion.wake-word:debug"],
       "outFiles": ["${workspaceFolder}/dist/**/*.js"],
       "preLaunchTask": "npm: compile"
     }

@@ -1,8 +1,8 @@
 {
   "name": "wake-word",
   "displayName": "Wake Word",
-  "description": "Voice control for your editor with customizable wake word. Fully local, zero config.",
-  "version": "0.15.0",
+  "description": "Say a wake phrase to open Claude Code, the chat panel, the terminal, or any command. Runs locally, no accounts, zero config.",
+  "version": "0.16.0",
   "license": "Apache-2.0",
   "icon": "icon.png",
   "publisher": "analytics-in-motion",
@@ -17,6 +17,9 @@
   "engines": {
     "vscode": "^1.85.0"
   },
+  "extensionKind": [
+    "ui"
+  ],
   "categories": [
     "Other"
   ],
@@ -26,8 +29,7 @@
     "speech",
     "hands-free",
     "accessibility",
-    "copilot",
-    "claude",
+    "claude code",
     "voice activation"
   ],
   "activationEvents": [
@@ -65,6 +67,20 @@
         "title": "Wake Word: Show Diagnostics"
       }
     ],
+    "keybindings": [
+      {
+        "command": "wakeWord.toggle",
+        "key": "shift+alt+w",
+        "win": "shift+alt+w",
+        "linux": "shift+alt+w",
+        "mac": "ctrl+cmd+w"
+      }
+    ],
+    "configurationDefaults": {
+      "terminal.integrated.commandsToSkipShell": [
+        "wakeWord.toggle"
+      ]
+    },
     "configuration": {
       "title": "Wake Word",
       "properties": {
@@ -166,7 +182,7 @@
         "wakeWord.audioDevice": {
           "type": "string",
           "default": "",
-          "description": "Microphone to listen on. Leave empty for the system default. Use a case-insensitive substring of the device name (e.g. 'USB' or 'Blue Yeti') or the device index number."
+          "description": "Microphone to listen on. Leave empty for the system default. Use a case-insensitive substring of the device name (e.g. 'USB' or 'Headset') or the device index number."
         }
       }
     }

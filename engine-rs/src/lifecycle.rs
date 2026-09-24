@@ -30,7 +30,7 @@ use std::time::Instant;
 use crate::assets;
 use crate::config::{AudioDevice, Config, PhraseMap};
 use crate::mic_errors::{mic_error_message, CaptureError};
-use crate::protocol::{parse_control_line, ControlLine, Reporter, Sink};
+use crate::protocol::{parse_control_line, ControlLine, DebugSwitch, Reporter, Sink};
 
 /// A monotonic millisecond clock, so a test can pin the timing lines.
 pub trait Clock: Send {
@@ -83,8 +83,9 @@ pub struct OpenRequest {
     /// The ONNX Runtime library, when the config names one. Otherwise decibri
     /// searches for it (see `crate::assets`).
     pub ort_library: Option<PathBuf>,
-    /// Whether the capture loop should report debug lines.
-    pub debug: bool,
+    /// Whether the capture loop should report debug lines. Shared with the
+    /// reporter, so `debug on` and `debug off` reach a microphone already open.
+    pub debug: DebugSwitch,
 }
 
 /// Everything needed to build the keyword spotter.
@@ -207,9 +208,11 @@ impl Ctx {
 /// How every microphone in this session is opened.
 struct CaptureOptions {
     device: AudioDevice,
+    /// The editor that started the engine, named in a permission error.
+    editor: Option<String>,
     vad_model: PathBuf,
     ort_library: Option<PathBuf>,
-    debug: bool,
+    debug: DebugSwitch,
     /// The phrases the spotter reports, for the debug line after the first
     /// `READY`.
     listening_for: Vec<String>,
@@ -316,7 +319,7 @@ impl CaptureSession {
             device: self.options.device.clone(),
             vad_model: self.options.vad_model.clone(),
             ort_library: self.options.ort_library.clone(),
-            debug: self.options.debug,
+            debug: self.options.debug.clone(),
         });
     }
 
@@ -341,6 +344,7 @@ impl CaptureSession {
                         &error,
                         "Failed to open microphone",
                         &self.options.device,
+                        self.options.editor.as_deref(),
                     ));
                 }
             }
@@ -390,6 +394,7 @@ impl CaptureSession {
                     &error,
                     "Microphone error",
                     &self.options.device,
+                    self.options.editor.as_deref(),
                 ));
             }
         }
@@ -503,6 +508,7 @@ impl Lifecycle {
             ControlLine::Stop => self.shutdown(),
             ControlLine::Pause => self.pause_capture(),
             ControlLine::Resume => self.resume_capture(),
+            ControlLine::Debug(on) => self.set_debug(on),
             ControlLine::Empty => {}
             ControlLine::Invalid(message) => self.fatal(&message),
             ControlLine::Config(config) => self.on_config(config),
@@ -600,9 +606,10 @@ impl Lifecycle {
 
         let options = CaptureOptions {
             device: config.audio_device.clone(),
+            editor: config.editor_name.clone(),
             vad_model: assets::vad_model_path(config.vad_model_path.as_deref()),
             ort_library: config.ort_library_path.as_ref().map(PathBuf::from),
-            debug: config.debug_mode,
+            debug: self.ctx.out.debug_switch(),
             listening_for: prepared.listening_for,
         };
         let ort = assets::ort_location(config.ort_library_path.as_deref());
@@ -665,6 +672,20 @@ impl Lifecycle {
             // microphone closed.
             None => self.ctx.out.paused(),
         }
+    }
+
+    /// `debug on` or `debug off`. Every `DEBUG:` line from here on follows it,
+    /// the capture thread of a microphone already open included, which drops
+    /// its debug reports at the source while it is off. Nothing else changes:
+    /// the microphone stays as it is and nothing is reloaded. The line that
+    /// turns it on says so, so the extension's log shows where the detail
+    /// begins.
+    fn set_debug(&mut self, on: bool) {
+        if self.finished() {
+            return;
+        }
+        self.ctx.out.set_debug(on);
+        self.ctx.out.debug("debug lines on");
     }
 
     /// `resume`: reopen the microphone.
@@ -1244,9 +1265,44 @@ mod tests {
         harness.fail_open_with("PERMISSION_DENIED", "Microphone permission denied.");
         assert_eq!(
             harness.sent(),
-            ["ERROR:Microphone access denied. Enable microphone access for VS Code in your system privacy settings."]
+            ["ERROR:Microphone access denied. Enable microphone access for your editor in your system privacy settings."]
         );
         assert_eq!(harness.lifecycle.exit_code(), Some(1));
+    }
+
+    #[test]
+    fn names_the_editor_from_the_config_when_microphone_access_is_denied() {
+        let mut harness = Harness::new();
+        harness.line(&config_with(r#""editorName":"Example Editor""#));
+        harness.complete_prepare();
+        harness.fail_open_with("PERMISSION_DENIED", "Microphone permission denied.");
+        assert_eq!(
+            harness.sent(),
+            ["ERROR:Microphone access denied. Enable microphone access for Example Editor in your system privacy settings."]
+        );
+    }
+
+    #[test]
+    fn names_the_editor_when_access_is_withdrawn_while_listening() {
+        let mut harness = Harness::new();
+        harness.line(&config_with(r#""editorName":"Example Editor""#));
+        harness.complete_prepare();
+        harness.complete_open(0);
+        let id = harness.last_open_id();
+        harness.report(
+            id,
+            CaptureReport::Failed(CaptureError {
+                code: Some("PERMISSION_DENIED"),
+                message: "Microphone permission denied.".to_string(),
+            }),
+        );
+        assert_eq!(
+            harness.protocol(),
+            [
+                "READY",
+                "ERROR:Microphone access denied. Enable microphone access for Example Editor in your system privacy settings."
+            ]
+        );
     }
 
     #[test]
@@ -1404,6 +1460,70 @@ mod tests {
     }
 
     #[test]
+    fn turns_debug_lines_on_and_off_for_a_microphone_already_open() {
+        let mut harness = Harness::new();
+        harness.listening();
+        let id = harness.last_open_id();
+        let request = harness.requests().pop().expect("an open was requested");
+        harness.report(id, CaptureReport::Debug("VAD: speech".into()));
+        assert_eq!(harness.sent(), ["READY"], "off, as the config line said");
+
+        harness.line("debug on");
+        assert!(
+            request.debug.is_on(),
+            "the running microphone's capture thread shares the switch"
+        );
+        harness.report(id, CaptureReport::Debug("VAD: silence".into()));
+        assert_eq!(
+            harness.sent(),
+            ["READY", "DEBUG:debug lines on", "DEBUG:VAD: silence"]
+        );
+
+        harness.line("debug off");
+        assert!(!request.debug.is_on());
+        harness.report(id, CaptureReport::Debug("VAD: speech".into()));
+        harness.report(id, CaptureReport::Detected("hey claude".into()));
+        assert_eq!(
+            harness.sent(),
+            [
+                "READY",
+                "DEBUG:debug lines on",
+                "DEBUG:VAD: silence",
+                "DETECTED:hey claude"
+            ],
+            "off again: detections still go out, debug lines do not"
+        );
+        assert_eq!(harness.opens(), 1, "the microphone was not reopened");
+    }
+
+    #[test]
+    fn a_debug_command_while_paused_reaches_the_next_microphone() {
+        let mut harness = Harness::new();
+        harness.listening();
+        harness.line("pause");
+        harness.line("debug on");
+        harness.line("resume");
+        harness.complete_open(0);
+        let request = harness.requests().pop().expect("a reopen was requested");
+        assert!(request.debug.is_on());
+        let id = harness.last_open_id();
+        harness.report(id, CaptureReport::Debug("VAD: silence".into()));
+        assert_eq!(
+            harness.sent().last().map(String::as_str),
+            Some("DEBUG:VAD: silence")
+        );
+    }
+
+    #[test]
+    fn a_debug_command_after_stop_says_nothing() {
+        let mut harness = Harness::new();
+        harness.listening();
+        harness.line("stop");
+        harness.line("debug on");
+        assert_eq!(harness.sent(), ["READY", "RELEASED"]);
+    }
+
+    #[test]
     fn gives_every_open_its_own_id() {
         let mut harness = Harness::new();
         harness.listening();
@@ -1433,7 +1553,7 @@ mod tests {
             request.ort_library,
             Some(PathBuf::from("/ort/libonnxruntime.so"))
         );
-        assert!(request.debug);
+        assert!(request.debug.is_on());
     }
 
     #[test]
@@ -1443,7 +1563,7 @@ mod tests {
         let request = harness.requests().pop().expect("an open was requested");
         assert_eq!(request.ort_library, None);
         assert_eq!(request.device, AudioDevice::Default);
-        assert!(!request.debug);
+        assert!(!request.debug.is_on());
     }
 
     #[test]
