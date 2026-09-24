@@ -202,7 +202,7 @@
     "release": "npm run compile && npm run package"
   },
   "devDependencies": {
-    "@types/node": "^22.20.2",
+    "@types/node": "^22.20.4",
     "@types/vscode": "~1.85.0",
     "@eslint/js": "^10.0.0",
     "@typescript-eslint/eslint-plugin": "^8.70.0",
