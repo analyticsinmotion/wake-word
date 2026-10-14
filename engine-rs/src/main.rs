@@ -52,7 +52,7 @@ use protocol::{flush_and_exit, LineSplitter, Reporter, StdoutSink};
 /// The decibri release this binary is built against, as pinned in
 /// `Cargo.toml`. The crate exports no version constant of its own; a test
 /// keeps the two in step.
-const DECIBRI_VERSION: &str = "6.3.0";
+const DECIBRI_VERSION: &str = "6.4.0";
 
 /// How long shutdown waits for a microphone that is still opening, so it can
 /// be closed rather than left to the operating system to reclaim. `RELEASED`

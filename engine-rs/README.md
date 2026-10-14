@@ -75,7 +75,7 @@ a new process would fail the same way.
 The permission message names the editor that started the engine, from
 `editorName` in the config line, because the operating system grants
 microphone access to that application; without the field it says "your
-editor". decibri 6.3.0 does not raise its permission error yet.
+editor". decibri 6.4.0 does not raise its permission error yet.
 
 ### Keyword spotting
 
@@ -655,7 +655,7 @@ stream can be replaced safely once a pause has closed the microphone.
 
 | Crate | Why |
 | --- | --- |
-| `decibri` `=6.3.0` | microphone capture, conditioning, device selection, Silero voice activity detection, and the typed errors. Built without default features, with `capture`, `vad`, `gain`, and `ort-load-dynamic` |
+| `decibri` `=6.4.0` | microphone capture, conditioning, device selection, Silero voice activity detection, and the typed errors. Built without default features, with `capture`, `vad`, `gain`, and `ort-load-dynamic` |
 | `sherpa-onnx` `=1.13.8` | the keyword spotter. Pinned exactly: the model files and the keyword line syntax are read by this version of the C library. Built with `static`, which links the C library and its own ONNX Runtime into the executable |
 | `serde_json` | the config line |
 
