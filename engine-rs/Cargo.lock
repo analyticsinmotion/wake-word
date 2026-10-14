@@ -261,15 +261,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -293,12 +284,11 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decibri"
-version = "6.3.0"
+version = "6.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e0f427cdf372222216bfa2b73d73308755b15653972666f0c1d6dd27abce6a3"
+checksum = "baa1020d3eee821b16c6d25f3fbc6e65e625771eb947b2e29a0a60c02ce80815"
 dependencies = [
  "cpal",
- "crossbeam-channel",
  "decibri-decode",
  "decibri-resampler",
  "libloading",

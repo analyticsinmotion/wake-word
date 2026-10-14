@@ -9,10 +9,6 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    # Version updates read the manifests on development and open their pull
-    # requests against it. Security updates always target the default
-    # branch, and the options in this entry do not apply to them.
-    target-branch: development
     # The @typescript-eslint packages are released together, and
     # eslint-plugin requires a parser of its own version or later, so their
     # version updates are raised in one pull request.
@@ -35,7 +31,3 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    # Version updates read the manifests on development and open their pull
-    # requests against it. Security updates always target the default
-    # branch, and the options in this entry do not apply to them.
-    target-branch: development

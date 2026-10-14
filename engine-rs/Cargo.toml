@@ -42,7 +42,7 @@ path = "src/main.rs"
 # sends the keyword lines in the config line.
 [dependencies]
 serde_json = "1"
-decibri = { version = "=6.3.0", default-features = false, features = ["capture", "vad", "gain", "ort-load-dynamic"] }
+decibri = { version = "=6.4.0", default-features = false, features = ["capture", "vad", "gain", "ort-load-dynamic"] }
 sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["static"] }
 
 [profile.release]
