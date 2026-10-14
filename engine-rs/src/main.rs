@@ -283,6 +283,7 @@ mod self_test {
 /// these are what a terminal or an operating system shutdown sends instead.
 #[cfg(unix)]
 mod signals {
+    use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::mpsc::Sender;
     use std::thread;
@@ -298,8 +299,8 @@ mod signals {
     extern "C" {
         fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
         fn pipe(fds: *mut i32) -> i32;
-        fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
-        fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
+        fn read(fd: i32, buffer: *mut c_void, count: usize) -> isize;
+        fn write(fd: i32, buffer: *const c_void, count: usize) -> isize;
     }
 
     /// A signal handler may only call async-signal-safe functions, so this
@@ -309,7 +310,7 @@ mod signals {
         let descriptor = WRITE_FD.load(Ordering::Relaxed);
         if descriptor >= 0 {
             let byte = signum as u8;
-            let _ = unsafe { write(descriptor, &byte, 1) };
+            let _ = unsafe { write(descriptor, (&raw const byte).cast(), 1) };
         }
     }
 
@@ -333,7 +334,7 @@ mod signals {
             let mut failures = 0;
             loop {
                 let mut byte = 0u8;
-                let count = unsafe { read(read_end, &mut byte, 1) };
+                let count = unsafe { read(read_end, (&raw mut byte).cast(), 1) };
                 if count == 1 {
                     failures = 0;
                     let name = if i32::from(byte) == SIGINT {
