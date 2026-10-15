@@ -5,20 +5,27 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *
  * It honours the `wx` (exclusive create) flag, which is what makes lock
  * acquisition atomic between two windows, so the race path can be driven
- * deterministically rather than hoped for.
+ * deterministically rather than hoped for. Each file keeps the time it was
+ * written, from `clock`, which statSync() reports.
  */
 const fsMock = vi.hoisted(() => {
   const files = new Map<string, string>();
+  const modified = new Map<string, number>();
   const dirs = new Set<string>();
+  const clock = { now: 0 };
   const errno = (code: string, p: string): NodeJS.ErrnoException =>
     Object.assign(new Error(`${code}: ${p}`), { code });
 
   return {
     files,
+    modified,
     dirs,
+    clock,
     reset(): void {
       files.clear();
+      modified.clear();
       dirs.clear();
+      clock.now = Date.parse("2026-09-05T10:30:00.000Z");
     },
     readFileSync: vi.fn((p: string): string => {
       const content = files.get(p);
@@ -32,14 +39,23 @@ const fsMock = vi.hoisted(() => {
         throw errno("EEXIST", p);
       }
       files.set(p, String(data));
+      modified.set(p, clock.now);
     }),
     unlinkSync: vi.fn((p: string): void => {
       if (!files.delete(p)) {
         throw errno("ENOENT", p);
       }
+      modified.delete(p);
     }),
     mkdirSync: vi.fn((p: string): void => {
       dirs.add(p);
+    }),
+    statSync: vi.fn((p: string): { mtimeMs: number } => {
+      const mtimeMs = modified.get(p);
+      if (mtimeMs === undefined) {
+        throw errno("ENOENT", p);
+      }
+      return { mtimeMs };
     }),
   };
 });
@@ -49,13 +65,20 @@ vi.mock("fs", () => ({
   writeFileSync: fsMock.writeFileSync,
   unlinkSync: fsMock.unlinkSync,
   mkdirSync: fsMock.mkdirSync,
+  statSync: fsMock.statSync,
 }));
 
 import * as path from "path";
 import {
   LOCK_CHECK_INTERVAL_MS,
   LOCK_FILE_NAME,
+  LOCK_FOCUSED_CHECK_INTERVAL_MS,
+  LOCK_HANDOVER_INTERVAL_MS,
+  LOCK_HANDOVER_MS,
+  LOCK_WRITE_GRACE_MS,
+  TAKEOVER_SUFFIX,
   isProcessAlive,
+  lockCheckDelay,
   lockFilePath,
   readLock,
   releaseLock,
@@ -64,6 +87,7 @@ import {
 
 const STORAGE = path.join("/", "storage", "wake-word");
 const LOCK = path.join(STORAGE, LOCK_FILE_NAME);
+const TAKEOVER = `${LOCK}${TAKEOVER_SUFFIX}`;
 
 /** A PID that no operating system will have handed out. */
 const DEAD_PID = 2_147_483_647;
@@ -71,13 +95,25 @@ const OTHER_PID = 4242;
 
 const alive = () => true;
 const dead = () => false;
+/** The mock filesystem's clock, for tests that look at a file's age. */
+const now = () => new Date(fsMock.clock.now);
 
-function plant(lock: unknown): void {
-  fsMock.files.set(LOCK, typeof lock === "string" ? lock : JSON.stringify(lock));
+/**
+ * Put a lock file in place, written `ageMs` before the mock clock's now: a
+ * minute ago unless a test says otherwise, which is long past the time a
+ * window takes to write one.
+ */
+function plant(lock: unknown, ageMs = 60_000, file = LOCK): void {
+  fsMock.files.set(file, typeof lock === "string" ? lock : JSON.stringify(lock));
+  fsMock.modified.set(file, fsMock.clock.now - ageMs);
 }
 
 function stored(): { pid: number; startedAt: string } {
   return JSON.parse(fsMock.files.get(LOCK) ?? "null");
+}
+
+function errno(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(code), { code });
 }
 
 beforeEach(() => {
@@ -86,6 +122,7 @@ beforeEach(() => {
   fsMock.writeFileSync.mockClear();
   fsMock.unlinkSync.mockClear();
   fsMock.mkdirSync.mockClear();
+  fsMock.statSync.mockClear();
 });
 
 describe("lockFilePath", () => {
@@ -98,6 +135,36 @@ describe("lockFilePath", () => {
 describe("LOCK_CHECK_INTERVAL_MS", () => {
   it("polls a standing-by window every ten seconds", () => {
     expect(LOCK_CHECK_INTERVAL_MS).toBe(10_000);
+  });
+});
+
+describe("lockCheckDelay", () => {
+  it("checks every ten seconds whatever the wait, when listening does not follow focus", () => {
+    for (const waited of [0, 100, 2_000, 60_000]) {
+      expect(lockCheckDelay(waited, false)).toBe(LOCK_CHECK_INTERVAL_MS);
+    }
+  });
+
+  it("checks every 100 ms for the first two seconds of a handover, then once a second", () => {
+    expect(LOCK_HANDOVER_INTERVAL_MS).toBe(100);
+    expect(LOCK_HANDOVER_MS).toBe(2_000);
+    expect(LOCK_FOCUSED_CHECK_INTERVAL_MS).toBe(1_000);
+    expect(lockCheckDelay(0, true)).toBe(100);
+    expect(lockCheckDelay(1_900, true)).toBe(100);
+    expect(lockCheckDelay(2_000, true)).toBe(1_000);
+    expect(lockCheckDelay(600_000, true)).toBe(1_000);
+  });
+
+  it("makes twenty quick checks and then slows down, counting the wait from its own delays", () => {
+    const delays: number[] = [];
+    let waited = 0;
+    for (let i = 0; i < 25; i++) {
+      const delay = lockCheckDelay(waited, true);
+      delays.push(delay);
+      waited += delay;
+    }
+    expect(delays.filter((d) => d === 100)).toHaveLength(20);
+    expect(delays.slice(20)).toEqual([1_000, 1_000, 1_000, 1_000, 1_000]);
   });
 });
 
@@ -287,13 +354,41 @@ describe("tryAcquireLock", () => {
     expect(fsMock.writeFileSync).toHaveBeenCalledTimes(2);
   });
 
-  it("propagates a write failure that is not a lost race", () => {
+  it("propagates a write failure when the storage directory cannot be written at all", () => {
     // An unwritable storage directory is the caller's decision: the
     // extension logs it and listens without coordination.
-    fsMock.writeFileSync.mockImplementationOnce(() => {
-      throw Object.assign(new Error("EACCES"), { code: "EACCES" });
-    });
+    const refuse = (): never => {
+      throw errno("EACCES");
+    };
+    // The lock, and then the file the lock module writes beside it to tell
+    // an unwritable directory from a passing refusal.
+    fsMock.writeFileSync.mockImplementationOnce(refuse).mockImplementationOnce(refuse);
     expect(() => tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive })).toThrow(/EACCES/);
+    expect(fsMock.writeFileSync).toHaveBeenCalledTimes(2);
+    expect(fsMock.files.size).toBe(0);
+  });
+
+  it("does not take the lock this time when Windows refuses the create for a moment", () => {
+    // EPERM while another process is still deleting the previous lock file.
+    // The directory itself can be written, so this is no reason to listen
+    // without coordination: the next check takes the lock.
+    fsMock.writeFileSync.mockImplementationOnce(() => {
+      throw errno("EPERM");
+    });
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive })).toBe(false);
+    expect(fsMock.files.size).toBe(0);
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive })).toBe(true);
+    expect(stored().pid).toBe(100);
+  });
+
+  it("removes the file it writes to check the directory", () => {
+    fsMock.writeFileSync.mockImplementationOnce(() => {
+      throw errno("EBUSY");
+    });
+    tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive });
+    const probe = fsMock.writeFileSync.mock.calls[1][0];
+    expect(probe).toBe(`${LOCK}.100.probe`);
+    expect(fsMock.files.has(probe)).toBe(false);
   });
 
   it("copes with the stale lock vanishing before it can be removed", () => {
@@ -305,6 +400,106 @@ describe("tryAcquireLock", () => {
     });
     expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: dead })).toBe(true);
     expect(stored().pid).toBe(100);
+  });
+});
+
+/**
+ * The races tryAcquireLock() closes, each of which would let two windows
+ * believe they hold the lock at once, driven one step at a time.
+ */
+describe("tryAcquireLock under contention", () => {
+  it("leaves an empty lock a moment after another window created it, before its write", () => {
+    // The exclusive create makes the file, and the write fills it a moment
+    // later. Taken over as corrupt, the new lock would be deleted under its
+    // owner.
+    plant("", 0);
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive, now })).toBe(false);
+    expect(fsMock.files.get(LOCK)).toBe("");
+    expect(fsMock.unlinkSync).not.toHaveBeenCalled();
+  });
+
+  it("leaves a corrupt lock written less than LOCK_WRITE_GRACE_MS ago, and takes it over after that", () => {
+    expect(LOCK_WRITE_GRACE_MS).toBe(1_000);
+    plant("{ half a lock", LOCK_WRITE_GRACE_MS - 1);
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive, now })).toBe(false);
+    fsMock.clock.now += 1;
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive, now })).toBe(true);
+    expect(stored().pid).toBe(100);
+  });
+
+  it("takes over a corrupt lock dated in the future, as one is after the clock is set back", () => {
+    plant("{ not json", -3_600_000);
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive, now })).toBe(true);
+    expect(stored().pid).toBe(100);
+  });
+
+  it("leaves a corrupt lock that cannot be looked at for the next check", () => {
+    plant("{ not json");
+    fsMock.statSync.mockImplementationOnce(() => {
+      throw errno("EPERM");
+    });
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive, now })).toBe(false);
+    expect(fsMock.files.get(LOCK)).toBe("{ not json");
+  });
+
+  it("reads the winner of a simultaneous create as still being written, not as corrupt", () => {
+    fsMock.writeFileSync.mockImplementationOnce(() => {
+      // The other window's exclusive create has made the file, empty.
+      plant("", 0);
+      throw errno("EEXIST");
+    });
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: alive, now })).toBe(false);
+    expect(fsMock.files.get(LOCK)).toBe("");
+  });
+
+  it("does not delete a stale lock while another window holds the takeover file", () => {
+    plant({ pid: DEAD_PID, startedAt: "long ago" });
+    plant(String(OTHER_PID), 0, TAKEOVER);
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: dead, now })).toBe(false);
+    expect(stored()).toEqual({ pid: DEAD_PID, startedAt: "long ago" });
+    expect(fsMock.files.get(TAKEOVER)).toBe(String(OTHER_PID));
+  });
+
+  it("removes a takeover file left by a window that stopped part way, and takes over at the next check", () => {
+    plant({ pid: DEAD_PID, startedAt: "long ago" });
+    plant(String(OTHER_PID), LOCK_WRITE_GRACE_MS, TAKEOVER);
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: dead, now })).toBe(false);
+    expect(fsMock.files.has(TAKEOVER)).toBe(false);
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: dead, now })).toBe(true);
+    expect(stored().pid).toBe(100);
+  });
+
+  it("reads the lock again under the takeover file, and leaves one another window has taken since", () => {
+    // The race the takeover file closes: this window has read the stale
+    // lock, and before it deletes it another window takes it over and
+    // writes its own. Deleting by name would delete that window's new lock.
+    plant({ pid: DEAD_PID, startedAt: "long ago" });
+    fsMock.readFileSync.mockImplementationOnce((p: string) => {
+      const stale = fsMock.files.get(p) as string;
+      plant({ pid: OTHER_PID, startedAt: "just now" }, 0);
+      return stale;
+    });
+    const isAlive = (pid: number) => pid === OTHER_PID;
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive, now })).toBe(false);
+    expect(stored()).toEqual({ pid: OTHER_PID, startedAt: "just now" });
+    expect(fsMock.files.has(TAKEOVER)).toBe(false);
+  });
+
+  it("takes over a stale lock through the takeover file, and removes the takeover file", () => {
+    plant({ pid: DEAD_PID, startedAt: "long ago" });
+    expect(tryAcquireLock(LOCK, { ownPid: 100, isAlive: dead, now })).toBe(true);
+    expect(stored().pid).toBe(100);
+    expect(fsMock.files.has(TAKEOVER)).toBe(false);
+    expect(fsMock.writeFileSync.mock.calls[0][0]).toBe(TAKEOVER);
+  });
+
+  it("propagates a failure to write the takeover file in a directory that cannot be written", () => {
+    plant({ pid: DEAD_PID, startedAt: "long ago" });
+    const refuse = (): never => {
+      throw errno("EROFS");
+    };
+    fsMock.writeFileSync.mockImplementationOnce(refuse).mockImplementationOnce(refuse);
+    expect(() => tryAcquireLock(LOCK, { ownPid: 100, isAlive: dead, now })).toThrow(/EROFS/);
   });
 });
 

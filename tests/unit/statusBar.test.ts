@@ -28,7 +28,7 @@ const EVERY_STATE: StatusBarState[] = [
   { kind: "focus-paused" },
   { kind: "restarting", attempt: 2, attempts: 3 },
   { kind: "error", message: "No microphone found. Check your audio device settings." },
-  { kind: "other-window" },
+  { kind: "other-window", followsFocus: true },
   { kind: "no-commands" },
 ];
 
@@ -115,6 +115,28 @@ describe("statusBarView", () => {
     expect(tooltip).toContain("The microphone is closed");
   });
 
+  it("says what the window standing by waits for, in each mode", () => {
+    // Listening follows focus: this window is focused and listens once the
+    // other one releases the microphone, and a click turns listening off.
+    const following = statusBarView({ kind: "other-window", followsFocus: true });
+    expect(following.tooltip).toBe(
+      "Another editor window has the microphone, and only one window listens at a time. This window " +
+        "listens as soon as that one releases it: once it has paused, or when its handoff to an " +
+        "assistant ends. Click to disable listening in this window."
+    );
+    // The setting off: the text every earlier version showed.
+    const first = statusBarView({ kind: "other-window", followsFocus: false });
+    expect(first.text).toBe("$(circle-slash) Wake: Other window");
+    expect(first.tooltip).toBe(
+      "Another editor window is already listening. Only one instance listens " +
+        "at a time. This window takes over automatically when that one stops."
+    );
+    expect(describeStatus({ kind: "other-window", followsFocus: false })).toBe("standing by: another window is listening");
+    expect(describeStatus({ kind: "other-window", followsFocus: true })).toBe(
+      "standing by: another window has the microphone, and this one listens once it is released"
+    );
+  });
+
   it("says a start has not opened the microphone yet", () => {
     expect(statusBarView({ kind: "starting" }).tooltip).toContain("Wake phrases are not heard until");
   });
@@ -163,7 +185,7 @@ const IDLE: StatusFacts = {
   restarting: null,
   starting: false,
   error: null,
-  standingBy: false,
+  standingBy: null,
   waitingForCommands: false,
 };
 
@@ -180,7 +202,7 @@ function everyCombination(): StatusFacts[] {
     ["restarting", { attempt: 1, attempts: 3 }],
     ["starting", true],
     ["error", "No microphone found."],
-    ["standingBy", true],
+    ["standingBy", { followsFocus: true }],
     ["waitingForCommands", true],
   ];
   const all: StatusFacts[] = [];
@@ -231,7 +253,7 @@ describe("deriveStatus", () => {
       expect(kind === "restarting" ? facts.restarting !== null : true).toBe(true);
       expect(kind === "starting" ? facts.starting : true).toBe(true);
       expect(kind === "error" ? facts.error !== null : true).toBe(true);
-      expect(kind === "other-window" ? facts.standingBy : true).toBe(true);
+      expect(kind === "other-window" ? facts.standingBy !== null : true).toBe(true);
       expect(kind === "no-commands" ? facts.waitingForCommands : true).toBe(true);
     }
   });
@@ -248,7 +270,8 @@ describe("deriveStatus", () => {
     [{ restarting: { attempt: 1, attempts: 3 } }, "restarting"],
     [{ starting: true }, "starting"],
     [{ error: "No microphone found." }, "error"],
-    [{ standingBy: true }, "other-window"],
+    [{ standingBy: { followsFocus: true } }, "other-window"],
+    [{ standingBy: { followsFocus: false } }, "other-window"],
     [{ waitingForCommands: true }, "no-commands"],
   ] as Array<[Partial<StatusFacts>, string]>)("shows %o as %s", (facts, kind) => {
     expect(deriveStatus({ ...IDLE, ...facts }).kind).toBe(kind);

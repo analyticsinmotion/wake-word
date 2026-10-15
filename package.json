@@ -164,8 +164,8 @@
         },
         "wakeWord.pauseOnFocusLoss": {
           "type": "boolean",
-          "default": false,
-          "description": "Pause wake word listening when the editor loses focus and resume when it regains focus."
+          "default": true,
+          "description": "Listen only in the focused editor window. Listening pauses and the microphone is released when the window loses focus, and listening resumes when it is focused again, so with several windows open the one you are using listens. When off, the first window to start listening keeps the microphone until listening stops there."
         },
         "wakeWord.confidenceThreshold": {
           "type": "number",

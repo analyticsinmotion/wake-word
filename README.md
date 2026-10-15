@@ -209,9 +209,13 @@ The status bar shows **Wake: Paused** while a manual route waits. The default Cl
 
 ### Multiple windows
 
-If you have more than one editor window open, only one listens at a time. The first window to start listening takes a lock; the others show **Wake: Other window** in the status bar and stand by. When the listening window closes, crashes, or has listening disabled, a standing-by window takes over within about ten seconds. The lock is held through the cooldown after a detection, so a second window never opens the microphone while an assistant has it.
+Only the editor window you are using listens. When a window loses focus, Wake Word pauses there and releases the microphone, and the window you switch to starts listening, usually within a fraction of a second. While another application has focus, nothing listens. A window you are not using shows **Wake: Unfocused** in the status bar.
 
-Windows of different editor products do not see each other's lock.
+A wake phrase that hands the microphone to an assistant keeps it handed over whichever window you move to. Until the cooldown ends, or, for a manual handoff, until you resume in the window that handed over, the window you are in shows **Wake: Other window** and does not open the microphone.
+
+To keep one window listening while you work elsewhere, turn off `wakeWord.pauseOnFocusLoss`. The first window to start listening then keeps the microphone, and the others show **Wake: Other window**. When that window closes, crashes, or has listening disabled, another takes over within about ten seconds.
+
+Windows of different editors, such as VS Code and an editor built on it, do not share the microphone. With `wakeWord.pauseOnFocusLoss` on, only one of them listens all the same, because only one window has focus at a time.
 
 ### Remote windows
 
@@ -225,12 +229,12 @@ Wake Word works in remote windows: SSH, WSL, dev containers, and Codespaces open
 | Wake: Listening | Listening for wake phrases |
 | Wake: Confirm | Confirmation mode heard a phrase once, and is waiting to hear it again |
 | Wake: Active, Wake: 30s, Wake: Paused | A wake phrase handed the microphone to the assistant it opened |
-| Wake: Unfocused | Paused while the window is not focused (`wakeWord.pauseOnFocusLoss`). Focusing the window resumes it |
+| Wake: Unfocused | Paused because the window is not focused: the window you are using listens instead. Focusing this window resumes it |
 | Wake: Restarting | The speech engine stopped and is being restarted |
 | Wake: Calibrating | A **Wake Word: Calibrate** run is listening |
 | Wake: Error | Listening stopped; the tooltip says why. Click to try again |
 | Wake: Off | Not listening. Click, or press the toggle shortcut, to start |
-| Wake: Other window | Another window of the same editor is listening |
+| Wake: Other window | Another window of the same editor has the microphone: it is still pausing, or a wake phrase handed it to an assistant there. This window listens as soon as it is released |
 | Wake: No commands | None of the routes' commands are available in this editor |
 
 ## Settings
@@ -241,7 +245,7 @@ Wake Word works in remote windows: SSH, WSL, dev containers, and Codespaces open
 | `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming. Routes with `handoff: "manual"` wait for you instead |
 | `wakeWord.enableOnStartup` | `true` | Start listening when the editor opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
-| `wakeWord.pauseOnFocusLoss` | `false` | Pause listening when the editor loses focus, and resume when it is focused again. The status bar shows `Wake: Unfocused` meanwhile |
+| `wakeWord.pauseOnFocusLoss` | `true` | Listen only in the focused editor window: pause when the window loses focus and resume when it is focused again. When off, the first window to start listening keeps the microphone until listening stops there |
 | `wakeWord.confidenceThreshold` | `0.05` | Trigger threshold (0.01 to 0.9) for wake phrase detection. Lower detects more easily, higher gives fewer false positives |
 | `wakeWord.confirmationMode` | `false` | Require the wake phrase twice within 5 seconds before triggering. Reduces false positives in noisy environments. |
 | `wakeWord.audioDevice` | `""` | Microphone to use: a case-insensitive substring of the device name (e.g. `"USB"`) or a device index. Empty for the system default. |

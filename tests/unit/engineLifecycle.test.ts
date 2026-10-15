@@ -1122,6 +1122,131 @@ describe("stop and the RELEASED handshake", () => {
   });
 });
 
+// ── the promise stop() returns ──────────────────────────────
+
+/**
+ * The extension gives the listener lock up only once the promise stop()
+ * returns has settled, so it must settle once the microphone is closed and
+ * not before, and every way the release can end must settle it.
+ */
+describe("release acknowledgement", () => {
+  /** Whether a promise has settled, read after a flush. */
+  function track(promise: Promise<void>): () => boolean {
+    let settled = false;
+    promise.then(() => {
+      settled = true;
+    });
+    return () => settled;
+  }
+
+  it("settles only once the child says RELEASED", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.stop());
+    await flush();
+    expect(settled()).toBe(false);
+    proc.sendLine("RELEASED");
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles when the release times out and the child is killed", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.stop());
+    await vi.advanceTimersByTimeAsync(RELEASE_TIMEOUT_MS - 1);
+    await flush();
+    expect(settled()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles at once when stdin is already closed", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    proc.stdin.end();
+    const settled = track(engine.stop());
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles at once for a child still loading, which is killed", async () => {
+    const { engine } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    const settled = track(engine.stop());
+    await flush();
+    expect(settled()).toBe(true);
+    expect(latest().killed).toBe(true);
+  });
+
+  it("settles at once when there is no child", async () => {
+    const { engine } = makeEngine();
+    const settled = track(engine.stop());
+    await flush();
+    expect(settled()).toBe(true);
+  });
+
+  it("settles for a paused child once it says RELEASED", async () => {
+    const { engine } = makeEngine();
+    const proc = await pausedEngine(engine);
+    const settled = track(engine.stop());
+    await flush();
+    expect(settled()).toBe(false);
+    proc.sendLine("RELEASED");
+    await flush();
+    expect(settled()).toBe(true);
+  });
+
+  it("settles both waits when stop() is called again, which kills the child", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const first = track(engine.stop());
+    const second = track(engine.stop());
+    await flush();
+    expect(first()).toBe(true);
+    expect(second()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles when a start() kills the releasing child", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.stop());
+    await engine.start(ROUTES, 0.3, false);
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("settles when dispose() lands during the wait", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.stop());
+    engine.dispose();
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
+  });
+
+  it("gives a pause() of the stopped engine the release still under way", async () => {
+    // A window that loses focus while its stop is releasing the microphone
+    // must not give the lock up before the release ends.
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    engine.stop();
+    const settled = track(engine.pause());
+    await flush();
+    expect(settled()).toBe(false);
+    proc.sendLine("RELEASED");
+    await flush();
+    expect(settled()).toBe(true);
+  });
+});
+
 // ── pause: the child stays alive ────────────────────────────
 
 describe("pause", () => {
@@ -1344,14 +1469,34 @@ describe("pause acknowledgement", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("settles when stop() lands during the wait", async () => {
+  it("settles with the release when stop() lands during the wait", async () => {
+    // The child closes its microphone for the stop. Until it says so, the
+    // pause's promise must not say the microphone is closed: the extension
+    // gives the listener lock up when it settles.
     const { engine } = makeEngine();
     const proc = await startAndReady(engine);
     const settled = track(engine.pause());
     engine.stop();
     await flush();
-    expect(settled()).toBe(true);
+    expect(settled()).toBe(false);
     expect(commands(proc)).toEqual(["pause", "stop"]);
+    proc.sendLine("RELEASED");
+    await flush();
+    expect(settled()).toBe(true);
+  });
+
+  it("settles when stop() lands during the wait and the release times out", async () => {
+    const { engine } = makeEngine();
+    const proc = await startAndReady(engine);
+    const settled = track(engine.pause());
+    engine.stop();
+    await vi.advanceTimersByTimeAsync(RELEASE_TIMEOUT_MS - 1);
+    await flush();
+    expect(settled()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(settled()).toBe(true);
+    expect(proc.killed).toBe(true);
   });
 
   it("settles when dispose() lands during the wait", async () => {
@@ -1452,8 +1597,8 @@ describe("pause acknowledgement", () => {
   });
 
   it("fires nothing when listening is disabled during the release", async () => {
-    // The extension abandons the handoff, then stops the engine: the stop
-    // settles the release early, and the command must not run after it.
+    // The extension abandons the handoff, then stops the engine: the
+    // release ends with the stop's, and the command must not run after it.
     const { engine } = makeEngine();
     const proc = await startAndReady(engine);
     let generation = 0;
@@ -1467,10 +1612,11 @@ describe("pause acknowledgement", () => {
     );
     generation++;
     engine.stop();
+    proc.sendLine("RELEASED");
 
     await expect(handoff).resolves.toEqual({ kind: "superseded" });
     expect(executeCommand).not.toHaveBeenCalled();
-    expect(commands(proc)).toEqual(["pause", "stop"]);
+    expect(commands(proc).slice(0, 2)).toEqual(["pause", "stop"]);
   });
 });
 

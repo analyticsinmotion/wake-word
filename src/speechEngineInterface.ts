@@ -37,7 +37,13 @@ export interface EngineRestart {
 export interface ISpeechEngine {
   /** `debugMode` turns the verbose log on for this start: see setDebugMode(). */
   start(phrases: WakePhrase[], threshold: number, debugMode: boolean): void | Promise<void>;
-  stop(): void;
+  /**
+   * Stop listening and release the microphone for good. The promise settles
+   * once the microphone is known to be closed, whether the engine confirmed
+   * it, forced it, or had it closed already, and never rejects. The
+   * extension gives the listener lock up only once it settles.
+   */
+  stop(): Promise<void>;
   /**
    * Turn the verbose log on or off: the engine's and the extension's detail,
    * sent as `detail` events. Takes effect at once, a running engine included,
@@ -48,7 +54,14 @@ export interface ISpeechEngine {
    * Stop listening at once and release the microphone. The promise settles
    * once the microphone is known to be closed, whether the engine confirmed
    * it or forced it, and never rejects. The extension awaits it before
-   * firing a route's command.
+   * firing a route's command, and before it gives the listener lock up when
+   * the window loses focus.
+   *
+   * An engine that is not listening is not paused, except that a restart
+   * still waiting to begin is called off and the engine left paused. Its
+   * promise settles once a pause or a stop still in flight has closed the
+   * microphone. A start or a resume under way is not paused by this: that
+   * engine is listening once it reports `started`.
    */
   pause(): Promise<void>;
   resume(): void;
