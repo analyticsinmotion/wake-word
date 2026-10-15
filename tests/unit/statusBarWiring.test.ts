@@ -99,7 +99,7 @@ vi.mock("../../src/sherpaEngine", async () => {
         this.isStarting = true;
       }
     }
-    stop(): void {
+    stop(): Promise<void> {
       this.stops++;
       const was = this.isListening || this.isPaused;
       this.isListening = false;
@@ -109,6 +109,7 @@ vi.mock("../../src/sherpaEngine", async () => {
       if (was) {
         this.emit("stopped");
       }
+      return Promise.resolve();
     }
     crash(reason: string, attempt = 1): void {
       this.isListening = false;
@@ -146,7 +147,7 @@ vi.mock("../../src/sherpaEngine", async () => {
 });
 
 vi.mock("../../src/lockFile", () => ({
-  LOCK_CHECK_INTERVAL_MS: 10_000,
+  lockCheckDelay: () => 10_000,
   lockFilePath: (dir: string) => `${dir}/wake-word.lock`,
   tryAcquireLock: () => {
     lock.held = true;
@@ -504,8 +505,10 @@ describe("the status bar", () => {
     const session = await startSession();
     await session.run("wakeWord.enable");
     session.engine().cancel();
-
     expect(session.status.text).toBe("$(circle-slash) Wake: Off");
+    // The lock goes once the engine's stop has closed the microphone.
+    await settle();
+
     expect(session.errors).toEqual([]);
     expect(lock.held).toBe(false);
     expect(

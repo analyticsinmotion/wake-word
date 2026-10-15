@@ -782,6 +782,78 @@ export function formatListenSettingsChange(
   return `${subject} changed while the engine was starting: applied as soon as it is listening`;
 }
 
+// -- Window focus -------------------------------------------------------
+
+/**
+ * What the extension's own engine and handoff are doing, which decides
+ * whether this window needs the listener lock. See lockFile.ts.
+ */
+export interface MicrophoneUse {
+  /** A Calibrate run is under way: it keeps the microphone until it ends. */
+  calibrating: boolean;
+  /**
+   * A detection's handoff: the microphone is being released, or has been
+   * handed to an assistant for a cooldown or a manual pause.
+   */
+  handoff: boolean;
+  /** The engine has the microphone open. */
+  listening: boolean;
+  /**
+   * The engine stopped on its own and is restarting: it opens the microphone
+   * again by itself.
+   */
+  restarting: boolean;
+  /**
+   * A start or a resume is under way: the engine opens the microphone when it
+   * is listening.
+   */
+  starting: boolean;
+}
+
+/**
+ * True while this window needs the listener lock: its engine has the
+ * microphone or will open it without being asked again, or a handoff or a
+ * calibration run is using it. A window gives the lock up only when this is
+ * false, and only once its microphone is closed, so a window that takes the
+ * lock never finds the microphone open in another one.
+ */
+export function needsListenerLock(use: MicrophoneUse): boolean {
+  return use.calibrating || use.handoff || use.listening || use.restarting || use.starting;
+}
+
+/**
+ * What a window does when it loses focus while listening follows focus
+ * (`wakeWord.pauseOnFocusLoss` on).
+ *
+ * - `keep`: nothing now. A calibration run keeps the microphone until it
+ *   ends, and a handoff keeps the lock until it ends, so no other window
+ *   opens the microphone while an assistant has it; each checks focus when
+ *   it ends.
+ * - `pause`: pause the engine, which also calls off a restart still waiting
+ *   to begin, and give the lock up once the microphone is closed.
+ * - `pause-when-started`: a start or a resume is under way and cannot be
+ *   paused until the engine is listening, so it is paused then, and keeps
+ *   the lock until then.
+ * - `stand-down`: stop waiting for another window's lock, since a window
+ *   that is not focused does not take it.
+ * - `release`: nothing has the microphone, so the lock goes now if this
+ *   window holds it: an engine that failed, or one that is off.
+ */
+export type FocusLossAction = "keep" | "pause" | "pause-when-started" | "stand-down" | "release";
+
+export function decideFocusLoss(use: MicrophoneUse, standingBy: boolean): FocusLossAction {
+  if (use.calibrating || use.handoff) {
+    return "keep";
+  }
+  if (use.listening || use.restarting) {
+    return "pause";
+  }
+  if (use.starting) {
+    return "pause-when-started";
+  }
+  return standingBy ? "stand-down" : "release";
+}
+
 // -- Debounce -----------------------------------------------------------
 
 /**
@@ -1395,7 +1467,7 @@ export type StatusBarState =
   | { kind: "focus-paused" }
   | { kind: "restarting"; attempt: number; attempts: number }
   | { kind: "error"; message: string }
-  | { kind: "other-window" }
+  | { kind: "other-window"; followsFocus: boolean }
   | { kind: "no-commands" };
 
 /** What the extension knows, from which deriveStatus() picks the state. */
@@ -1420,8 +1492,13 @@ export interface StatusFacts {
   starting: boolean;
   /** The engine failed and is not being restarted: its message, or null. */
   error: string | null;
-  /** Another window holds the listener lock, and this one stands by. */
-  standingBy: boolean;
+  /**
+   * Another window holds the listener lock, and this one stands by, or null.
+   * `followsFocus` is the `wakeWord.pauseOnFocusLoss` setting: with it on,
+   * this window is focused and takes the lock as soon as the other window
+   * releases it; with it off, when that window stops listening.
+   */
+  standingBy: { followsFocus: boolean } | null;
   /** No route's command is available, so nothing is listened for. */
   waitingForCommands: boolean;
 }
@@ -1469,7 +1546,7 @@ export function deriveStatus(facts: StatusFacts): StatusBarState {
     return { kind: "error", message: facts.error };
   }
   if (facts.standingBy) {
-    return { kind: "other-window" };
+    return { kind: "other-window", followsFocus: facts.standingBy.followsFocus };
   }
   return facts.waitingForCommands ? { kind: "no-commands" } : { kind: "off" };
 }
@@ -1586,9 +1663,12 @@ export function statusBarView(state: StatusBarState): StatusBarView {
     case "other-window":
       return {
         text: `${MICROPHONE_CLOSED_ICON} Wake: Other window`,
-        tooltip:
-          "Another editor window is already listening. Only one instance listens " +
-          "at a time. This window takes over automatically when that one stops.",
+        tooltip: state.followsFocus
+          ? "Another editor window has the microphone, and only one window listens at a time. This window " +
+            "listens as soon as that one releases it: once it has paused, or when its handoff to an " +
+            "assistant ends. Click to disable listening in this window."
+          : "Another editor window is already listening. Only one instance listens " +
+            "at a time. This window takes over automatically when that one stops.",
         settingsLink: false,
         background: null,
       };
@@ -1630,7 +1710,9 @@ export function describeStatus(state: StatusBarState): string {
     case "error":
       return `error: ${state.message}`;
     case "other-window":
-      return "standing by: another window is listening";
+      return state.followsFocus
+        ? "standing by: another window has the microphone, and this one listens once it is released"
+        : "standing by: another window is listening";
     case "no-commands":
       return "waiting: none of the routes' commands are available";
   }

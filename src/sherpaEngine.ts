@@ -88,6 +88,14 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   private hasListened = false;
   private releaseTimer: ReturnType<typeof setTimeout> | null = null;
   /**
+   * Settles the promise stop() returned, while the leaving child's RELEASED
+   * is awaited. Every way that wait can end goes through settleRelease(),
+   * from resetChildState(), so an awaited stop cannot hang.
+   */
+  private releaseSettled: (() => void) | null = null;
+  /** The promise stop() returned, while that wait is open. */
+  private releaseAcknowledged: Promise<void> | null = null;
+  /**
    * Advanced by every start() and stop(). start() awaits the model check
    * before it spawns, and a stop that lands in that window finds no child
    * to kill; the generation is how the start notices afterwards that it
@@ -114,8 +122,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
   private pauseTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Settles the promise pause() returned, while PAUSED is awaited. Every way
-   * that wait can end goes through settlePause(), so an awaited pause cannot
-   * hang.
+   * that wait can end goes through settlePause(), or, for a stop() that
+   * lands during it, through the release that takes it over, so an awaited
+   * pause cannot hang.
    */
   private pauseSettled: (() => void) | null = null;
   /** The promise pause() returned, while that wait is open. */
@@ -584,7 +593,18 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     }
   }
 
-  stop(): void {
+  /**
+   * Stop listening and release the microphone for good.
+   *
+   * The returned promise settles once the microphone is known to be closed:
+   * the child has said RELEASED, or it did not say so within
+   * RELEASE_TIMEOUT_MS and has been killed, or it has gone some other way
+   * (a start() or dispose() that kills it). A child still loading is killed
+   * at once, and with no child the promise settles at once. It never
+   * rejects. The extension gives the listener lock up only once it settles,
+   * so no other window opens the microphone while this one still has it.
+   */
+  stop(): Promise<void> {
     // Cancel any pending retry first, before the state guard below.
     //
     // During crash backoff both _isListening and _isPaused are false while a
@@ -617,14 +637,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     } else {
       this.forceKill();
     }
+    const released = this.releaseAcknowledged ?? Promise.resolve();
 
     if (!this._isListening && !this._isPaused) {
-      return;
+      return released;
     }
 
     this._isPaused = false;
     this._isListening = false;
     this.emit("stopped");
+    return released;
   }
 
   /**
@@ -634,10 +656,16 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    * nothing the child prints from here counts as a detection. The returned
    * promise settles once the microphone is known to be closed: the child has
    * said PAUSED, or it did not say so within PAUSE_TIMEOUT_MS and has been
-   * killed, or it has gone some other way (a crash, stop(), dispose(), a
-   * start() that replaces it). It never rejects. The extension awaits it
-   * before firing the route's command, so the command that hands the
-   * microphone to an assistant runs after the release instead of racing it.
+   * killed, or a stop() has released it, or it has gone some other way (a
+   * crash, dispose(), a start() that replaces it). It never rejects. The
+   * extension awaits it before firing the route's command, so the command
+   * that hands the microphone to an assistant runs after the release instead
+   * of racing it.
+   *
+   * An engine that is not listening has nothing to pause. Its promise
+   * settles when a pause or a stop still in flight has closed the
+   * microphone, and at once when none is. A start or a resume under way is
+   * not paused: that engine listens once its child says READY.
    */
   pause(): Promise<void> {
     if (!this._isListening) {
@@ -650,8 +678,9 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
         this._isPaused = true;
         this.emit("paused");
       }
-      // A pause already waiting on the child settles when that one does.
-      return this.pauseAcknowledged ?? Promise.resolve();
+      // A pause or a stop already waiting on the child settles when that
+      // one does.
+      return this.pauseAcknowledged ?? this.releaseAcknowledged ?? Promise.resolve();
     }
 
     this._isPaused = true;
@@ -727,6 +756,15 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    * the promise pause() returned. Safe to call when nothing is waiting.
    */
   private settlePause(): void {
+    this.takePauseWait()?.();
+  }
+
+  /**
+   * End the wait for PAUSED without settling it: cancel the timeout and hand
+   * back what settles the promise pause() returned, or null when nothing is
+   * waiting.
+   */
+  private takePauseWait(): (() => void) | null {
     if (this.pauseTimer) {
       clearTimeout(this.pauseTimer);
       this.pauseTimer = null;
@@ -734,16 +772,28 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     const settle = this.pauseSettled;
     this.pauseSettled = null;
     this.pauseAcknowledged = null;
+    return settle;
+  }
+
+  /**
+   * End the wait for RELEASED, however it ended, and settle the promise
+   * stop() returned. Safe to call when nothing is waiting.
+   */
+  private settleRelease(): void {
+    const settle = this.releaseSettled;
+    this.releaseSettled = null;
+    this.releaseAcknowledged = null;
     settle?.();
   }
 
   /**
    * Forget everything known about the current child, timers included. A
-   * pause still waiting on that child settles here: whatever replaced or
-   * removed the child has closed its microphone.
+   * pause or a stop still waiting on that child settles here: whatever
+   * replaced or removed the child has closed its microphone.
    */
   private resetChildState(): void {
     this.settlePause();
+    this.settleRelease();
     this.childReady = false;
     this.childPaused = false;
     this.pauseSentAt = 0;
@@ -826,7 +876,20 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
     this._killedIntentionally = true;
     this.clearReleaseTimer();
+    // A pause still waiting for this child's PAUSED ends with the release
+    // instead: the child closes its microphone for the stop, and until it
+    // has, the pause's promise must not say the microphone is closed.
+    const pauseSettled = this.takePauseWait();
     this.resetChildState();
+    // Settled by forceKill(), through resetChildState(), whichever way the
+    // wait ends: RELEASED, the timeout, or a start() or dispose() that kills
+    // this child first.
+    this.releaseAcknowledged = new Promise<void>((resolve) => {
+      this.releaseSettled = () => {
+        resolve();
+        pauseSettled?.();
+      };
+    });
 
     proc.stdout?.removeAllListeners("data");
     proc.stderr?.removeAllListeners("data");

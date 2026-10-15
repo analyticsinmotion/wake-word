@@ -20,6 +20,7 @@ import {
   CommandSources,
   ListenSettingsChange,
   ListeningState,
+  MicrophoneUse,
   PendingConfirmation,
   RouteAvailability,
   SessionStats,
@@ -29,6 +30,7 @@ import {
   clampThreshold,
   commandSources,
   createSessionStats,
+  decideFocusLoss,
   decideListenSettingsChange,
   deriveStatus,
   describeStatus,
@@ -49,6 +51,7 @@ import {
   issueReportText,
   issueReportUrl,
   logLevelName,
+  needsListenerLock,
   phraseChecksKey,
   planAvailabilityReport,
   recordDetection,
@@ -62,14 +65,7 @@ import {
   terminalHandsOverToggle,
   validatePhraseQuality,
 } from "./wakeWordCore";
-import {
-  LOCK_CHECK_INTERVAL_MS,
-  describeLock,
-  lockFilePath,
-  readLock,
-  releaseLock,
-  tryAcquireLock,
-} from "./lockFile";
+import { describeLock, lockCheckDelay, lockFilePath, readLock, releaseLock, tryAcquireLock } from "./lockFile";
 
 let statusBarItem: vscode.StatusBarItem;
 /**
@@ -87,10 +83,18 @@ let countdownRemaining = 0;
 let speechEngine: ISpeechEngine;
 let isStarting = false;
 let isDevMode = false;
+/**
+ * Listening waits for this window to be focused: wakeWord.pauseOnFocusLoss
+ * paused it, or kept it from starting, while the window was not focused.
+ * Focus resumes it. See pauseForFocus().
+ */
 let isPausedByFocus = false;
+/** Whether this window has focus, as the editor last said. */
+let windowFocused = true;
 let lastDetectionTime = 0;
 let lockPath = "";
-let lockWatchTimer: ReturnType<typeof setInterval> | null = null;
+/** Set while this window stands by for another window's lock: see startLockWatcher(). */
+let lockWatchTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionStats: SessionStats = createSessionStats();
 let pendingConfirmation: PendingConfirmation | null = null;
 let confirmationTimer: ReturnType<typeof setTimeout> | null = null;
@@ -245,13 +249,34 @@ function wireEngine(engine: ISpeechEngine, context: vscode.ExtensionContext): vo
     sessionStats.engineStarts++;
     engineStarting = false;
     engineFailure = null;
+    // A start or a resume cannot be paused until the engine is listening, so
+    // one the window lost focus during is paused now, and so is a restart
+    // the engine finished by itself.
+    if (calibration === null && waitsForFocus()) {
+      // A routes or threshold change waiting for this start is applied when
+      // listening resumes instead.
+      if (listenSettingsChangedWhileStarting) {
+        listenSettingsChangedWhileStarting = false;
+        listenSettingsChangedWhilePaused = true;
+      }
+      pauseForFocus("Paused: the window lost focus while listening was starting");
+      return;
+    }
     refreshStatusBar();
     calibration?.onEngineStarted?.();
     applyListenSettingsChangedWhileStarting(context);
   });
   // Whoever paused the engine has already recorded why: a detection's
   // handoff, the window losing focus, or Calibrate putting a handoff back.
-  engine.on("paused", () => refreshStatusBar());
+  engine.on("paused", () => {
+    // A pause calls off a restart still waiting to begin. A start or a
+    // resume the restart was finishing is then over: the engine is paused,
+    // and no `started` will come to end the wait for it.
+    if (!engine.isStarting && !engine.restarting) {
+      engineStarting = false;
+    }
+    refreshStatusBar();
+  });
   engine.on("stopped", () => {
     engineStarting = false;
     refreshStatusBar();
@@ -282,6 +307,12 @@ function wireEngine(engine: ISpeechEngine, context: vscode.ExtensionContext): vo
     });
     refreshStatusBar();
     calibration?.finish("error");
+    // An engine that failed has no microphone. A window that is not focused
+    // gives the lock up, so the focused one can listen; a focused one gives
+    // it up when it loses focus.
+    if (waitsForFocus()) {
+      releaseLockWhenClosed(speechEngine.pause());
+    }
   });
 }
 
@@ -305,6 +336,8 @@ export function activate(context: vscode.ExtensionContext) {
   sessionStats = createSessionStats();
   extensionState = context.globalState;
   extensionKind = context.extension?.extensionKind;
+  // With wakeWord.pauseOnFocusLoss on, only a focused window listens.
+  windowFocused = vscode.window.state.focused;
 
   speechEngine = createEngine(context);
   wireEngine(speechEngine, context);
@@ -336,8 +369,9 @@ export function activate(context: vscode.ExtensionContext) {
       } else if (isManuallyPaused) {
         resumeFromManualHandoff();
       } else if (listeningWanted()) {
-        // Listening, handed off, paused, starting, or restarting: a click
-        // turns it off, as each of those tooltips says.
+        // Listening, handed off, paused, starting, restarting, or waiting
+        // for focus or for the other window's lock: a click turns it off, as
+        // each of those tooltips says.
         stopListening();
       } else {
         return handleConsentThenStart(context, true);
@@ -390,7 +424,10 @@ export function activate(context: vscode.ExtensionContext) {
         engineStarting = false;
         const cooldownActive = countdownTimer !== null;
         const manualActive = isManuallyPaused;
-        isPausedByFocus = false;
+        // A window waiting for focus goes on waiting with the new engine,
+        // and starts it when it is focused. The old engine, paused, closed
+        // its microphone with the pause.
+        isPausedByFocus = isPausedByFocus && !wasListening;
         lastDetectionTime = 0;
         clearConfirmation();
         speechEngine.dispose();
@@ -408,8 +445,15 @@ export function activate(context: vscode.ExtensionContext) {
         } else if (wasListening) {
           void startListening();
         }
+        if (e.affectsConfiguration("wakeWord.pauseOnFocusLoss")) {
+          applyFocusSetting();
+        }
         refreshStatusBar();
         return;
+      }
+
+      if (e.affectsConfiguration("wakeWord.pauseOnFocusLoss")) {
+        applyFocusSetting();
       }
 
       // The routes and the threshold are read at the start and sent in the
@@ -432,40 +476,23 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Pause when VS Code loses focus (opt-in)
-  context.subscriptions.push(
-    vscode.window.onDidChangeWindowState((state) => {
-      // A calibration run keeps the microphone whatever the focus does: it
-      // ends on its own timer, and then settles a focus pause itself.
-      if (calibration) {
-        return;
-      }
-      // A pause for focus ends when focus returns, even if the setting was
-      // turned off meanwhile: nothing else would end it, and the status bar
-      // says it resumes on focus.
-      if (state.focused && isPausedByFocus) {
-        isPausedByFocus = false;
-        log("info", "Resumed: window regained focus");
-        // resumeListening(), not resume(): a routes change made while the
-        // window was unfocused has to be applied, and resume() would bring
-        // the engine back with the old phrases.
-        void resumeListening();
-        return;
-      }
-      if (!state.focused && speechEngine.isListening && pausesOnFocusLoss()) {
-        pauseForFocus();
-      }
-    })
-  );
+  // With wakeWord.pauseOnFocusLoss on, listening follows focus: the window
+  // that loses focus pauses and releases the listener lock, and the window
+  // that gains it takes the lock and listens.
+  context.subscriptions.push(vscode.window.onDidChangeWindowState((state) => onWindowFocusChanged(state.focused)));
 }
 
 export function deactivate() {
   if (speechEngine) {
     logSessionStats();
-    // stopListening() also stops the lock watcher and releases the lock, so
-    // a window that closes hands the microphone to the next one.
+    // stopListening() stops the lock watcher and releases the lock once the
+    // engine has closed its microphone, which dispose() does at once by
+    // killing the engine's child. The extension host is going away, so the
+    // lock is released here, not left for a promise: a window that closes
+    // hands the microphone to the next one.
     stopListening();
     speechEngine.dispose();
+    releaseLock(lockPath);
   }
 }
 
@@ -513,7 +540,7 @@ async function handleConsentThenStart(
   try {
     const choice = await vscode.window.showWarningMessage(
       "Wake Word uses your microphone to listen for wake phrases " +
-        "whenever the editor is open. All audio is processed locally on " +
+        "in the editor window you are using. All audio is processed locally on " +
         "your machine. Nothing is recorded or transmitted.\n\n" +
         "When a wake phrase is detected, the microphone is released " +
         "so the target assistant can use it. Wake word listening " +
@@ -607,6 +634,9 @@ async function startListening(explicit = false): Promise<void> {
   if (request !== listenRequest) {
     return;
   }
+  if (consentWithdrawn()) {
+    return;
+  }
   waitingForCommands = false;
   // This start decides afresh what the status bar says: a failure before it
   // is behind it, and the engine is marked as starting only once it is asked
@@ -625,13 +655,20 @@ async function startListening(explicit = false): Promise<void> {
     return;
   }
 
-  // Only one window listens at a time. The lock is held for the whole
-  // session, cooldowns included, and re-acquiring one we already hold is a
-  // no-op, so calling this on every start is safe.
+  // When listening follows focus, a window that is not focused does not
+  // take the microphone: it waits for focus. Editor windows restored at
+  // startup all start listening, and only the focused one goes on.
+  if (waitsForFocus()) {
+    pauseForFocus("Not listening while this window is not focused: listening starts when it is focused");
+    return;
+  }
+  isPausedByFocus = false;
+
+  // Only one window listens at a time: see lockFile.ts. Re-acquiring a lock
+  // this window already holds is a no-op, so calling this on every start is
+  // safe.
   if (!acquireListenerLock()) {
-    log("info", "Another editor window is listening. This window will take over if it stops.");
-    startLockWatcher();
-    refreshStatusBar();
+    standBy();
     return;
   }
   stopLockWatcher();
@@ -680,8 +717,7 @@ async function startListening(explicit = false): Promise<void> {
  * decideListenSettingsChange(), and so does Enable or a status bar click.
  */
 function waitForCommands(): void {
-  speechEngine.stop();
-  releaseLock(lockPath);
+  releaseLockWhenClosed(speechEngine.stop());
   waitingForCommands = true;
   refreshStatusBar();
 }
@@ -791,8 +827,7 @@ function stopListening() {
   engineFailure = null;
   waitingForCommands = false;
   lastDetectionTime = 0;
-  speechEngine.stop();
-  releaseLock(lockPath);
+  releaseLockWhenClosed(speechEngine.stop());
   refreshStatusBar();
 }
 
@@ -816,29 +851,211 @@ function acquireListenerLock(): boolean {
 }
 
 /**
- * While another window holds the lock, check every LOCK_CHECK_INTERVAL_MS
- * whether it has gone: closed cleanly and released, or crashed and left a
- * lock naming a dead process. Either way this window takes over.
+ * Another window holds the lock: show it, and take the lock when that window
+ * releases it. See startLockWatcher().
+ */
+function standBy(): void {
+  log(
+    "info",
+    pausesOnFocusLoss()
+      ? "Another editor window has the microphone. This window listens as soon as that window releases it."
+      : "Another editor window is listening. This window will take over if it stops."
+  );
+  startLockWatcher();
+  refreshStatusBar();
+}
+
+/**
+ * While another window holds the lock, check whether it has released it or
+ * gone: closed, or crashed and left a lock naming a dead process. Either way
+ * this window takes over, through resumeListening(), which resumes a paused
+ * engine or starts one.
+ *
+ * How often depends on wakeWord.pauseOnFocusLoss: see lockCheckDelay(). With
+ * it on, this window is focused, and the window that lost focus releases the
+ * lock moments after it pauses. The time waited is counted from the delays
+ * themselves rather than the clock.
  */
 function startLockWatcher(): void {
   if (lockWatchTimer) {
     return;
   }
-  lockWatchTimer = setInterval(() => {
-    if (!acquireListenerLock()) {
-      return;
-    }
-    stopLockWatcher();
-    log("info", "The listening window has stopped. Taking over.");
-    void startListening();
-  }, LOCK_CHECK_INTERVAL_MS);
+  let waited = 0;
+  const scheduleCheck = (): void => {
+    const delay = lockCheckDelay(waited, pausesOnFocusLoss());
+    waited += delay;
+    lockWatchTimer = setTimeout(() => {
+      lockWatchTimer = null;
+      if (!acquireListenerLock()) {
+        scheduleCheck();
+        return;
+      }
+      log(
+        "info",
+        pausesOnFocusLoss()
+          ? "The other window has released the microphone. Taking over."
+          : "The listening window has stopped. Taking over."
+      );
+      void resumeListening();
+    }, delay);
+  };
+  scheduleCheck();
 }
 
 function stopLockWatcher(): void {
   if (lockWatchTimer) {
-    clearInterval(lockWatchTimer);
+    clearTimeout(lockWatchTimer);
     lockWatchTimer = null;
   }
+}
+
+/**
+ * What this window's engine and handoff are doing, for needsListenerLock()
+ * and decideFocusLoss().
+ */
+function microphoneUse(): MicrophoneUse {
+  return {
+    calibrating: calibration !== null,
+    handoff: handingOff || countdownTimer !== null || isManuallyPaused,
+    listening: speechEngine.isListening,
+    restarting: Boolean(speechEngine.restarting),
+    starting: engineStarting || Boolean(speechEngine.isStarting),
+  };
+}
+
+/**
+ * Give the listener lock up once `closed`, the engine's promise that its
+ * microphone is closed, settles, unless the window needs the lock again by
+ * then: a start or a resume may have begun meanwhile. A window that takes
+ * the lock can then never find this window's microphone still open.
+ */
+function releaseLockWhenClosed(closed: Promise<void>): void {
+  void closed.then(() => {
+    if (!needsListenerLock(microphoneUse())) {
+      releaseLock(lockPath);
+    }
+  });
+}
+
+// ── Window focus ────────────────────────────────────────────
+
+/** Whether listening follows focus: wakeWord.pauseOnFocusLoss, on by default. */
+function pausesOnFocusLoss(): boolean {
+  return vscode.workspace.getConfiguration("wakeWord").get<boolean>("pauseOnFocusLoss", true);
+}
+
+/** Listening waits for this window to be focused. */
+function waitsForFocus(): boolean {
+  return !windowFocused && pausesOnFocusLoss();
+}
+
+/**
+ * The window gained or lost focus.
+ *
+ * Gaining it ends a pause for focus, even if the setting was turned off
+ * meanwhile: nothing else would end it, and the status bar says it resumes
+ * on focus. The resume takes the listener lock first, and stands by if the
+ * window that lost focus has not released it yet.
+ *
+ * Losing it, with the setting on, closes this window's microphone and
+ * releases the lock: see decideFocusLoss(). Moving between the editor, the
+ * terminal, and panels inside the window, an assistant's panel included,
+ * does not change the window's focus; another application or another editor
+ * window does, and so does a dialog of the operating system's own.
+ *
+ * A calibration run keeps the microphone whatever the focus does: it ends
+ * on its own timer, and then settles a pause for focus itself.
+ */
+function onWindowFocusChanged(focused: boolean): void {
+  windowFocused = focused;
+  if (calibration) {
+    return;
+  }
+  if (focused) {
+    if (isPausedByFocus) {
+      isPausedByFocus = false;
+      log("info", "Resumed: window regained focus");
+      // resumeListening(), not resume(): a routes change made while the
+      // window was unfocused has to be applied, and resume() would bring
+      // the engine back with the old phrases.
+      void resumeListening();
+    }
+    return;
+  }
+  if (pausesOnFocusLoss()) {
+    onFocusLost("Paused: window lost focus");
+  }
+}
+
+/** This window is not focused and listening follows focus. */
+function onFocusLost(message: string): void {
+  switch (decideFocusLoss(microphoneUse(), lockWatchTimer !== null)) {
+    case "keep":
+      // A handoff keeps the lock until it ends, and its end checks focus:
+      // see resumeListening(). A calibration run settles focus when it ends.
+      return;
+    case "pause-when-started":
+      // Paused by the started handler, once the engine is listening.
+      return;
+    case "pause":
+    case "stand-down":
+      pauseForFocus(message);
+      return;
+    case "release":
+      // An engine that failed, or one that is off: nothing has the
+      // microphone, or will have it once a stop in flight is done.
+      releaseLockWhenClosed(speechEngine.pause());
+      return;
+  }
+}
+
+/**
+ * wakeWord.pauseOnFocusLoss changed. A window standing by checks the lock at
+ * the new setting's pace. Turned on in a window that is not focused, it acts
+ * as the window losing focus now. Turned off, a window waiting for focus
+ * goes on waiting until it is focused, as its status bar says.
+ */
+function applyFocusSetting(): void {
+  if (lockWatchTimer !== null) {
+    stopLockWatcher();
+    startLockWatcher();
+  }
+  if (calibration === null && waitsForFocus()) {
+    onFocusLost("Paused: this window is not focused, and listening now follows focus");
+  }
+}
+
+/**
+ * Listening waits for focus: the window is not focused and
+ * wakeWord.pauseOnFocusLoss is on. The engine pauses if it is listening, and
+ * also calls off a restart still waiting to begin; the listener lock is
+ * released once the microphone is closed, so the focused window can take
+ * it; and a window standing by for the lock stops, since it would not use
+ * it. Focus ends the wait: see onWindowFocusChanged().
+ */
+function pauseForFocus(message: string): void {
+  // Recorded before the pause, so the status bar the pause refreshes says
+  // why: a pause for focus, not a handoff.
+  isPausedByFocus = true;
+  stopLockWatcher();
+  clearConfirmation();
+  releaseLockWhenClosed(speechEngine.pause());
+  log("info", message);
+  refreshStatusBar();
+}
+
+/**
+ * Microphone consent was reset, in this window or another one, since this
+ * window began listening. Listening stops instead of starting or resuming,
+ * and Enable asks again.
+ */
+function consentWithdrawn(): boolean {
+  if (extensionState?.get<boolean>(CONSENT_KEY, false)) {
+    return false;
+  }
+  log("info", "Listening is off: microphone consent was reset. Enable listening to be asked again.");
+  stopListening();
+  return true;
 }
 
 // ── Route configuration ─────────────────────────────────────
@@ -1158,8 +1375,10 @@ function startCountdown(seconds: number) {
 
     if (countdownRemaining <= 0) {
       clearResumeTimer();
+      // A window that is not focused leaves the microphone to the focused
+      // one: see resumeListening().
+      log("info", waitsForFocus() ? "Cooldown expired" : "Resumed: cooldown expired");
       void resumeListening();
-      log("info", "Resumed: cooldown expired");
     } else {
       refreshStatusBar();
     }
@@ -1184,30 +1403,37 @@ function resumeFromManualHandoff(): void {
   void resumeListening();
 }
 
-/** Whether listening pauses while the window is not focused (opt-in). */
-function pausesOnFocusLoss(): boolean {
-  return vscode.workspace.getConfiguration("wakeWord").get<boolean>("pauseOnFocusLoss", false);
-}
-
-/** Pause because the window is not focused. Focus returning resumes it. */
-function pauseForFocus(): void {
-  // Recorded before the pause, so the status bar the pause refreshes says
-  // why: a pause for focus, not a handoff.
-  isPausedByFocus = true;
-  clearConfirmation();
-  speechEngine.pause();
-  log("info", "Paused: window lost focus");
-  refreshStatusBar();
-}
-
+/**
+ * Bring listening back: at the end of a cooldown or a manual handoff, when
+ * the window regains focus, and when the other window releases the lock.
+ *
+ * A window that is not focused, when listening follows focus, waits for
+ * focus instead: the end of a handoff in a window the user has left leaves
+ * the microphone to the focused window. A pause for focus released the lock,
+ * so it is taken again first, and if another window has it, this one stands
+ * by with its engine still paused.
+ */
 async function resumeListening(): Promise<void> {
   cancelPendingHandoff();
   const request = ++listenRequest;
   clearResumeTimer();
   clearConfirmation();
   isManuallyPaused = false;
+  isPausedByFocus = false;
   lastDetectionTime = 0;
   engineFailure = null;
+  if (consentWithdrawn()) {
+    return;
+  }
+  if (waitsForFocus()) {
+    pauseForFocus("Not resuming while this window is not focused: listening resumes when it is focused");
+    return;
+  }
+  if (!acquireListenerLock()) {
+    standBy();
+    return;
+  }
+  stopLockWatcher();
   // From here until the engine says READY, listening is on its way back:
   // the status bar says so, and a settings change that arrives meanwhile
   // waits for READY, since the resume that would have applied it has begun.
@@ -1221,6 +1447,13 @@ async function resumeListening(): Promise<void> {
   if (speechEngine.isPaused && !listenSettingsChangedWhilePaused) {
     const availability = await checkConfiguredRoutes();
     if (request !== listenRequest) {
+      return;
+    }
+    // The window can have lost focus while the commands were read, and the
+    // engine is still paused: it stays so.
+    if (waitsForFocus()) {
+      engineStarting = false;
+      pauseForFocus("Paused: window lost focus");
       return;
     }
     if (
@@ -1509,8 +1742,8 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
       // have: a pause for focus if the window is unfocused and the setting
       // is on, and listening otherwise. isPausedByFocus is as the run found
       // it: nothing clears it during a run.
-      if (pausesOnFocusLoss() && !vscode.window.state.focused) {
-        pauseForFocus();
+      if (waitsForFocus()) {
+        pauseForFocus("Paused: the window is not focused");
       } else {
         if (isPausedByFocus) {
           isPausedByFocus = false;
@@ -1535,8 +1768,7 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
       void startListening();
       break;
     case "off":
-      speechEngine.stop();
-      releaseLock(lockPath);
+      releaseLockWhenClosed(speechEngine.stop());
       refreshStatusBar();
       break;
   }
@@ -1626,7 +1858,7 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     threshold: clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD)),
     cooldownSeconds: config.get<number>("cooldownSeconds", 30),
     confirmationMode: config.get<boolean>("confirmationMode", false),
-    pauseOnFocusLoss: config.get<boolean>("pauseOnFocusLoss", false),
+    pauseOnFocusLoss: pausesOnFocusLoss(),
     enableOnStartup: config.get<boolean>("enableOnStartup", true),
     routes: availability.listened,
     unverified: availability.unverified,
@@ -1714,7 +1946,7 @@ function statusFacts(): StatusFacts {
     // A calibration run waiting for its engine is a start as well.
     starting: engineStarting || Boolean(speechEngine.isStarting) || (calibration !== null && !calibrationOpen),
     error: engineFailure,
-    standingBy: lockWatchTimer !== null,
+    standingBy: lockWatchTimer !== null ? { followsFocus: pausesOnFocusLoss() } : null,
     waitingForCommands,
   };
 }
@@ -1740,7 +1972,9 @@ function refreshStatusBar(): void {
 
 /**
  * Listening is on or on its way: listening, handed off, paused for focus,
- * starting, or restarting. A status bar click then turns it off.
+ * starting, or restarting, or, when listening follows focus, waiting for the
+ * window that lost focus to release the microphone. A status bar click then
+ * turns it off, as each of those tooltips says.
  */
 function listeningWanted(): boolean {
   return (
@@ -1748,6 +1982,8 @@ function listeningWanted(): boolean {
     speechEngine.isPaused ||
     engineStarting ||
     Boolean(speechEngine.isStarting) ||
-    Boolean(speechEngine.restarting)
+    Boolean(speechEngine.restarting) ||
+    isPausedByFocus ||
+    (lockWatchTimer !== null && pausesOnFocusLoss())
   );
 }

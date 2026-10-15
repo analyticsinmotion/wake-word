@@ -67,7 +67,7 @@ vi.mock("../../src/sherpaEngine", async () => {
     resume(): void {
       this.resumes++;
     }
-    stop(): void {
+    stop(): Promise<void> {
       this.stops++;
       const was = this.isListening || this.isPaused;
       this.isListening = false;
@@ -75,6 +75,7 @@ vi.mock("../../src/sherpaEngine", async () => {
       if (was) {
         this.emit("stopped");
       }
+      return Promise.resolve();
     }
     setDebugMode(on: boolean): void {
       this.debugModes.push(on);
@@ -96,7 +97,7 @@ vi.mock("../../src/sherpaEngine", async () => {
 });
 
 vi.mock("../../src/lockFile", () => ({
-  LOCK_CHECK_INTERVAL_MS: 10_000,
+  lockCheckDelay: () => 10_000,
   lockFilePath: (dir: string) => `${dir}/wake-word.lock`,
   tryAcquireLock: () => {
     lock.held = true;
@@ -225,6 +226,9 @@ async function startSession(memento: Memento, settings: Record<string, unknown> 
   vi.spyOn(vscode.window, "showInformationMessage").mockImplementation((() => Promise.resolve(undefined)) as never);
   vi.spyOn(vscode.window, "showErrorMessage").mockImplementation((() => Promise.resolve(undefined)) as never);
   vi.spyOn(vscode.window, "onDidChangeWindowState").mockReturnValue(disposable as never);
+  // The window the user is in: with wakeWord.pauseOnFocusLoss on by default,
+  // only a focused window listens.
+  vi.spyOn(vscode.window, "state", "get").mockImplementation(() => ({ focused: true }) as never);
   vi.spyOn(vscode.workspace, "getConfiguration").mockReturnValue(configuration as never);
   vi.spyOn(vscode.workspace, "onDidChangeConfiguration").mockReturnValue(disposable as never);
   vi.spyOn(vscode.commands, "registerCommand").mockImplementation(((id: string, handler: () => unknown) => {

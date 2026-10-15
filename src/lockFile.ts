@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import * as path from "path";
 
 /**
@@ -8,16 +8,18 @@ import * as path from "path";
  * this extension. Without coordination three windows meant three engine
  * processes on the same microphone, three detections of one phrase, and
  * three commands firing at once. The fix is a PID lock in globalStorage,
- * which every window of the same editor shares: the first window to start
- * listening writes its extension host PID, and the others stand down until
- * that PID is gone.
+ * which every window of the same editor shares. A window opens the microphone
+ * only while it holds the lock, and gives the lock up only once its
+ * microphone is closed, so two windows never have it open at once.
  *
- * The lock is held for the whole listening session, including the cooldown
- * after a detection: the microphone is handed to an assistant then, and a
- * second window must not grab it in the meantime. It is released when the
- * user disables listening in the owning window and when that window's
- * extension host deactivates. A crash releases nothing, so a lock whose PID
- * is no longer running is treated as free.
+ * Which window holds it depends on `wakeWord.pauseOnFocusLoss`. With the
+ * setting on, the lock follows focus: a window that loses focus pauses and
+ * releases the lock, and the window that gains focus takes it. With it off,
+ * the first window to start listening keeps the lock until listening stops
+ * there. Either way it is held through a handoff: the microphone has been
+ * handed to an assistant, and a second window must not take it in the
+ * meantime. A crash releases nothing, so a lock whose PID is no longer
+ * running is treated as free.
  *
  * Nothing here touches the VS Code API. The extension host passes the storage
  * directory in, so this module is unit tested with the filesystem mocked.
@@ -25,8 +27,56 @@ import * as path from "path";
 
 export const LOCK_FILE_NAME = "wake-word.lock";
 
-/** How often a standing-by window checks whether the lock holder has gone. */
+/**
+ * How often a window standing by checks whether the lock holder has gone,
+ * when listening does not follow focus. The holder keeps the lock until
+ * listening stops there, so nothing is gained by looking more often.
+ */
 export const LOCK_CHECK_INTERVAL_MS = 10_000;
+
+/**
+ * How often a focused window checks the lock while it waits for the window
+ * that lost focus to release it. That window releases the lock once its
+ * engine has closed the microphone, which takes milliseconds and at most the
+ * engine's 500 ms pause timeout, but the two windows hear about the change
+ * of focus separately and in either order.
+ */
+export const LOCK_HANDOVER_INTERVAL_MS = 100;
+
+/**
+ * How long a focused window keeps checking at LOCK_HANDOVER_INTERVAL_MS. A
+ * window that still holds the lock after this is not handing it over: it is
+ * finishing a start, or a wake phrase has handed its microphone to an
+ * assistant, and it keeps the lock until that handoff ends.
+ */
+export const LOCK_HANDOVER_MS = 2_000;
+
+/**
+ * How often a focused window checks the lock after LOCK_HANDOVER_MS, until
+ * the holder releases it or this window loses focus. Once a second is soon
+ * enough after a handoff ends and cheap enough to keep up for as long as one
+ * lasts.
+ */
+export const LOCK_FOCUSED_CHECK_INTERVAL_MS = 1_000;
+
+/**
+ * A lock file written less than this long ago that cannot be read as a lock
+ * is taken to be still being written. See tryAcquireLock().
+ */
+export const LOCK_WRITE_GRACE_MS = 1_000;
+
+/**
+ * How long a window standing by waits before its next check of the lock,
+ * given how long it has been waiting. `followsFocus` is the
+ * `wakeWord.pauseOnFocusLoss` setting; with it on, only a focused window
+ * checks at all.
+ */
+export function lockCheckDelay(waitedMs: number, followsFocus: boolean): number {
+  if (!followsFocus) {
+    return LOCK_CHECK_INTERVAL_MS;
+  }
+  return waitedMs < LOCK_HANDOVER_MS ? LOCK_HANDOVER_INTERVAL_MS : LOCK_FOCUSED_CHECK_INTERVAL_MS;
+}
 
 export interface LockInfo {
   /** Extension host PID of the window that is listening. */
@@ -117,7 +167,7 @@ export function readLock(lockPath: string): LockState {
  *
  * Returns false when another running process holds it. A lock naming a PID
  * that is no longer running was left by a crashed window and is taken over;
- * so is a corrupt one.
+ * so is a corrupt one, once it is older than LOCK_WRITE_GRACE_MS.
  *
  * The write uses exclusive create (`wx`) so two windows that read the same
  * absent or stale lock at the same moment cannot both believe they own it:
@@ -125,8 +175,27 @@ export function readLock(lockPath: string): LockState {
  * winner. Windows restored together on editor startup all reach this point
  * within the same second, so that race is the common case, not a corner.
  *
- * Filesystem errors other than EEXIST propagate. The caller decides whether
- * to listen without coordination when the storage directory is unwritable.
+ * Three more races would each let two windows believe they hold the lock at
+ * once, and are closed here:
+ *
+ * - The exclusive create makes the file before the write fills it, so for a
+ *   moment a lock that has just been taken reads as an empty file. A window
+ *   that took that over as corrupt would delete the new lock and write its
+ *   own. A corrupt lock written less than LOCK_WRITE_GRACE_MS ago is
+ *   therefore left for the next check.
+ * - Taking over an abandoned lock is a delete and then a create. Two windows
+ *   that judge the same lock abandoned can interleave so that the second
+ *   one's delete removes the lock the first has just created. Only the
+ *   window holding the takeover file deletes a lock it does not own: see
+ *   removeAbandonedLock().
+ * - A create can fail with EPERM on Windows for a moment while another
+ *   process is still deleting the previous file of that name. Taken for an
+ *   unwritable directory, it would make the window listen without
+ *   coordination. A create that fails for any reason but EEXIST is a
+ *   failure to take the lock this time if a file beside it can be written.
+ *   Only a storage directory that cannot be written at all makes the error
+ *   propagate, and the caller then decides whether to listen without
+ *   coordination.
  */
 export function tryAcquireLock(lockPath: string, options: AcquireOptions = {}): boolean {
   const ownPid = options.ownPid ?? process.pid;
@@ -147,14 +216,13 @@ export function tryAcquireLock(lockPath: string, options: AcquireOptions = {}): 
       }
     }
 
-    if (state.kind !== "absent") {
-      // Stale or corrupt: clear it so the exclusive create can succeed.
-      try {
-        unlinkSync(lockPath);
-      } catch {
-        // Another window may have removed it first. The create below
-        // settles who owns the replacement.
-      }
+    if (state.kind === "corrupt" && inspectCorruptLock(lockPath, now()) === "writing") {
+      return false;
+    }
+
+    // Stale or corrupt: clear it so the exclusive create can succeed.
+    if (state.kind !== "absent" && !removeAbandonedLock(lockPath, ownPid, isAlive, now)) {
+      return false;
     }
 
     mkdirSync(path.dirname(lockPath), { recursive: true });
@@ -164,14 +232,133 @@ export function tryAcquireLock(lockPath: string, options: AcquireOptions = {}): 
       writeFileSync(lockPath, JSON.stringify(lock), { encoding: "utf8", flag: "wx" });
       return true;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw err;
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        // Lost the race. Loop once to read the winner.
+        continue;
       }
-      // Lost the race. Loop once to read the winner.
+      if (canWriteBeside(lockPath, ownPid)) {
+        return false;
+      }
+      throw err;
     }
   }
 
   return false;
+}
+
+/** Suffix of the file whose holder alone may delete an abandoned lock. */
+export const TAKEOVER_SUFFIX = ".takeover";
+
+/**
+ * Delete a lock left by a crashed window, or a corrupt one, so a new one can
+ * be created. Returns true when the name is free for the exclusive create,
+ * and false when this is not the moment: another window is taking the lock
+ * over, or the lock is no longer abandoned.
+ *
+ * Only the window that creates the takeover file, exclusively, deletes a
+ * lock that is not its own, and it reads the lock again first: while it
+ * holds that file, no other window deletes the lock, so what it reads is
+ * what it deletes. The create that follows is exclusive as always, so a
+ * window that creates the lock in between wins, and this one reads the
+ * winner on its second pass.
+ *
+ * A takeover file older than LOCK_WRITE_GRACE_MS was left by a window that
+ * stopped part way, since a takeover lasts microseconds: it is removed, and
+ * the lock is taken over at the next check.
+ */
+function removeAbandonedLock(
+  lockPath: string,
+  ownPid: number,
+  isAlive: (pid: number) => boolean,
+  now: () => Date
+): boolean {
+  const takeover = `${lockPath}${TAKEOVER_SUFFIX}`;
+  try {
+    writeFileSync(takeover, String(ownPid), { encoding: "utf8", flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+      // As for the lock itself: only a directory that cannot be written at
+      // all is the caller's to decide about.
+      if (canWriteBeside(lockPath, ownPid)) {
+        return false;
+      }
+      throw err;
+    }
+    if (inspectCorruptLock(takeover, now()) === "abandoned") {
+      try {
+        unlinkSync(takeover);
+      } catch {
+        // Removed by its holder or another window meanwhile.
+      }
+    }
+    return false;
+  }
+  try {
+    const state = readLock(lockPath);
+    if (state.kind === "absent") {
+      return true;
+    }
+    if (state.kind === "held" && (state.lock.pid === ownPid || isAlive(state.lock.pid))) {
+      return false;
+    }
+    if (state.kind === "corrupt") {
+      const corrupt = inspectCorruptLock(lockPath, now());
+      if (corrupt !== "abandoned") {
+        return corrupt === "gone";
+      }
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // Gone already: the name is free either way.
+    }
+    return true;
+  } finally {
+    try {
+      unlinkSync(takeover);
+    } catch {
+      // Removed by a window that took it for abandoned: see above.
+    }
+  }
+}
+
+/**
+ * What a file that could not be read as a lock is: `writing`, written less
+ * than LOCK_WRITE_GRACE_MS ago and probably still being written (see
+ * tryAcquireLock()); `gone`, removed since it was read; or `abandoned`,
+ * older, and left by a window that stopped part way through writing it. One
+ * that cannot be looked at counts as `writing`, so it is left for the next
+ * check. The age is compared both ways, so a clock set back after the file
+ * was written cannot keep a corrupt lock from ever being taken over.
+ */
+function inspectCorruptLock(file: string, now: Date): "writing" | "gone" | "abandoned" {
+  try {
+    const age = Math.abs(now.getTime() - statSync(file).mtimeMs);
+    return age < LOCK_WRITE_GRACE_MS ? "writing" : "abandoned";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "gone" : "writing";
+  }
+}
+
+/**
+ * True when a file can be written beside the lock: the storage directory
+ * works, so a failure to create the lock itself was about that one name. The
+ * file carries this process's PID, so windows never share one, and is
+ * removed at once.
+ */
+function canWriteBeside(lockPath: string, ownPid: number): boolean {
+  const probe = `${lockPath}.${ownPid}.probe`;
+  try {
+    writeFileSync(probe, "", { encoding: "utf8", flag: "w" });
+  } catch {
+    return false;
+  }
+  try {
+    unlinkSync(probe);
+  } catch {
+    // Left behind, it is overwritten the next time this process looks.
+  }
+  return true;
 }
 
 /**
