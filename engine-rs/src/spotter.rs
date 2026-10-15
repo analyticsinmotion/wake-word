@@ -51,6 +51,13 @@ pub const TOKENISER_MODEL_FILE: &str = "bpe.model";
 /// SentencePiece marks a word boundary with U+2581 LOWER ONE EIGHTH BLOCK.
 const WORD_BOUNDARY: char = '\u{2581}';
 
+/// The model's special tokens: the transducer's blank, the sentence boundary,
+/// and the unknown token. They are in the token table, so the vocabulary check
+/// lets them through, but they spell no part of a word, and a keyword that
+/// names one would have the spotter listen for the blank or for the token the
+/// model gives sounds it cannot spell.
+const SPECIAL_TOKENS: [&str; 3] = ["<blk>", "<sos/eos>", "<unk>"];
+
 /// Mel filterbank bins per frame, which is what the model was trained on.
 pub const FEATURE_DIM: i32 = 80;
 /// Hypotheses kept alive during the search.
@@ -486,14 +493,15 @@ fn is_readable_number(text: &str) -> bool {
 /// Each word of a line must be a piece in the model's token table or a `:` or
 /// `#` field with a readable number. The library does not report a line that
 /// breaks this as an error. A word it cannot find in the token table, such as
-/// a digit or an accented letter SentencePiece returned as itself, makes it
-/// end the process from inside the call that creates the spotter, so nothing
-/// is written for the extension to show, and a field it cannot read as a
-/// number ends the process the same way. The bindings pass the lines as a C
-/// string, which cannot hold a NUL. A line break would make one entry two
-/// keyword lines, and a line with no pieces names no keyword. Checking every
-/// line first turns each of these into an ordinary fatal error that names the
-/// phrase or the line.
+/// a digit or an accented letter, makes it end the process from inside the
+/// call that creates the spotter, so nothing is written for the extension to
+/// show, and a field it cannot read as a number ends the process the same way.
+/// The bindings pass the lines as a C string, which cannot hold a NUL. A line
+/// break would make one entry two keyword lines, and a line with no pieces
+/// names no keyword. One of the special tokens is in the token table but is
+/// not a piece of a word (see `SPECIAL_TOKENS`). Checking every line first
+/// turns each of these into an ordinary fatal error that names the phrase or
+/// the line.
 fn check_keyword_lines(
     lines: &[String],
     vocabulary: &HashSet<String>,
@@ -508,6 +516,13 @@ fn check_keyword_lines(
         }
         let mut pieces = 0;
         for word in words(line) {
+            if SPECIAL_TOKENS.contains(&word) {
+                let decoded = decoded_line(line);
+                let phrase = phrase_map.get(&decoded).unwrap_or(&decoded);
+                return Err(format!(
+                    "the phrase {phrase:?} cannot be spotted: {word:?} is one of the model's special tokens, not a piece of a word"
+                ));
+            }
             if vocabulary.contains(word) {
                 pieces += 1;
             } else if is_field(word) {
@@ -1403,6 +1418,44 @@ mod tests {
             )]
         );
         assert!(backend.engines().is_empty());
+    }
+
+    #[test]
+    fn refuses_a_keyword_line_that_names_a_special_token() {
+        // The token table has the special tokens, as the model's does, so it
+        // is not the vocabulary check that refuses them.
+        for token in SPECIAL_TOKENS {
+            let backend = FakeBackend {
+                vocabulary: Ok(vec![
+                    "<blk>",
+                    "<sos/eos>",
+                    "<unk>",
+                    "\u{2581}",
+                    "\u{2581}HEY",
+                    "\u{2581}CLAUDE",
+                ]),
+                ..FakeBackend::working()
+            };
+            for line in [
+                format!("\u{2581}HEY {token} :3.0 #0.3"),
+                format!("\u{2581} {token} :3.0 #0.3"),
+                format!("{token} :3.0 #0.3"),
+            ] {
+                let (result, _) = run(&request(&[HEY_CLAUDE, line.as_str()]), &backend, false);
+                let phrase = decoded_line(&line).to_lowercase();
+                assert_eq!(
+                    result,
+                    Err(PrepareError::ModelLoad(format!(
+                        "the phrase {phrase:?} cannot be spotted: {token:?} is one of the model's special tokens, not a piece of a word"
+                    ))),
+                    "{line}"
+                );
+            }
+            assert!(
+                backend.engines().is_empty(),
+                "the library is never handed a special token"
+            );
+        }
     }
 
     #[test]

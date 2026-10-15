@@ -3,10 +3,11 @@ import * as fs from "fs";
 import * as path from "path";
 
 /**
- * What package.json declares for the toggle shortcut and for the listing.
- * The shortcut and the words the Marketplace, Open VSX, and each editor's
- * Extensions view show are pinned here, so a change to either is a change to
- * this test, made on purpose.
+ * What package.json declares for the toggle shortcut, for the listing, and
+ * for what ships. The shortcut, the words the Marketplace, Open VSX, and each
+ * editor's Extensions view show, and the absence of runtime dependencies are
+ * pinned here, so a change to any of them is a change to this test, made on
+ * purpose.
  */
 
 interface Keybinding {
@@ -21,6 +22,7 @@ interface Keybinding {
 const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf8")) as {
   description: string;
   keywords: string[];
+  dependencies?: Record<string, string>;
   contributes: {
     commands: Array<{ command: string }>;
     keybindings: Keybinding[];
@@ -85,5 +87,11 @@ describe("the listing", () => {
       const withoutClaudeCode = text.replace(/claude code/gi, "");
       expect(withoutClaudeCode).not.toMatch(/claude/i);
     }
+  });
+});
+
+describe("what ships", () => {
+  it("declares no runtime dependency, so nothing from npm is packaged", () => {
+    expect(manifest.dependencies ?? {}).toEqual({});
   });
 });

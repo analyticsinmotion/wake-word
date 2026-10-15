@@ -11,8 +11,8 @@
  * library than the systems it is meant for. None of those fails a build, so
  * each is checked here, on the artifact itself:
  *
- *   - the extension and the sentencepiece-js package the extension host loads
- *     are present;
+ *   - the extension is present, and nothing under node_modules is, since the
+ *     extension has no runtime dependency;
  *   - the engine binary is present, is built for the target's architecture,
  *     and on macOS and Linux is stored executable;
  *   - ONNX Runtime and the Silero model are present beside it, byte for byte
@@ -341,14 +341,15 @@ function main() {
   const packaged = (file) => `extension/${PACKAGE_DIR}/${file}`;
   console.log(`${path.basename(vsix)}: ${zip.length} bytes, ${entries.size} entries\n`);
 
-  for (const required of [
-    'extension/package.json',
-    'extension/dist/extension.js',
-    'extension/node_modules/sentencepiece-js/package.json',
-    'extension/node_modules/sentencepiece-js/dist/index.js',
-  ]) {
+  for (const required of ['extension/package.json', 'extension/dist/extension.js']) {
     report.check(entries.has(required), `${required} is packaged`);
   }
+  const dependencyFiles = [...entries.keys()].filter((name) => name.startsWith('extension/node_modules/'));
+  report.check(
+    dependencyFiles.length === 0,
+    'nothing under node_modules is packaged',
+    `${dependencyFiles.length} files, the first ${dependencyFiles[0]}`
+  );
 
   // The engine binary.
   const engineEntry = entries.get(packaged(exe));

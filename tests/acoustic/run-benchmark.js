@@ -58,7 +58,8 @@ function requireCompiled(name) {
   }
 }
 
-const { buildKeywordSpec } = requireCompiled('keywords');
+const { buildKeywordSpec, skippedPhraseWarning } = requireCompiled('keywords');
+const { loadTokeniser } = requireCompiled('tokeniser');
 const { clampThreshold } = requireCompiled('wakeWordCore');
 
 function listWavs(dir) {
@@ -114,22 +115,23 @@ function readFixture(file) {
 }
 
 /**
- * Build the keyword spotter the way the extension does: tokenise each phrase
- * with SentencePiece, hand the token lines to sherpa-onnx, and keep the
- * decoded-to-spoken map so a hit can be named.
+ * Build the keyword spotter the way the extension does: clean up and tokenise
+ * each phrase with the extension's own tokeniser, hand the keyword lines to
+ * sherpa-onnx, and keep the decoded-to-spoken map so a hit can be named.
  */
 async function createSpotter(modelDir, keywords, threshold) {
-  const { SentencePieceProcessor } = require('sentencepiece-js');
   const sherpa = requireSherpaOnnx();
-
-  const sp = new SentencePieceProcessor();
-  await sp.load(modelPath(modelDir, 'bpe.model'));
+  const tokeniser = await loadTokeniser(modelDir);
 
   const spec = buildKeywordSpec(
     keywords.map((phrase) => ({ phrase, label: phrase })),
-    (text) => sp.encodePieces(text),
-    threshold
+    (text) => tokeniser.encode(text),
+    threshold,
+    tokeniser.vocabulary
   );
+  for (const skipped of spec.skipped) {
+    console.warn(`  note: ${skippedPhraseWarning(skipped)}`);
+  }
   if (spec.keywordLines.length === 0) {
     throw new Error('No usable keywords');
   }

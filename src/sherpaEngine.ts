@@ -17,10 +17,10 @@ import * as path from "path";
 import * as https from "https";
 import { pipeline } from "stream/promises";
 import * as vscode from "vscode";
-import { buildKeywordSpec, keywordTexts, skippedPhraseWarning } from "./keywords";
+import { buildKeywordSpec, skippedPhraseWarning } from "./keywords";
 import { EngineRestart, ISpeechEngine, WakePhrase } from "./speechEngineInterface";
 import { extractTarGz } from "./tarExtract";
-import { Tokenised, readVocabulary, tokenise } from "./tokeniser";
+import { Tokeniser, loadTokeniser } from "./tokeniser";
 import {
   DEFAULT_THRESHOLD,
   DeviceListing,
@@ -39,10 +39,10 @@ import {
  * which finds ONNX Runtime and the voice activity model beside itself and
  * needs nothing installed.
  *
- * Before spawning, the phrases are tokenised here, in a worker thread (see
- * tokeniser.ts), and the config line carries the finished keyword lines and
- * the decoded-to-spoken phrase map. A phrase with a piece the model's token
- * table lacks is left out with a warning.
+ * Before spawning, the phrases are cleaned up and tokenised here (see
+ * keywords.ts and tokeniser.ts), and the config line carries the finished
+ * keyword lines and the decoded-to-spoken phrase map. A phrase the model
+ * cannot spell is left out with a warning.
  *
  * The child lives across handoffs. pause() tells it to close the microphone
  * and resume() to reopen it, so the models load once per start instead of
@@ -267,34 +267,33 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
       return;
     }
 
-    const texts = keywordTexts(phrases);
-    const tokenisingSince = Date.now();
-    let tokenised: Tokenised;
-    let vocabulary: Set<string>;
+    // Reading the tokeniser's model is the one wait here; it happens once
+    // per model directory, and the cleaning up and tokenising after it are
+    // synchronous.
+    const loadingSince = Date.now();
+    let tokeniser: Tokeniser;
     try {
-      [tokenised, vocabulary] = await Promise.all([tokenise(modelDir, texts), readVocabulary(modelDir)]);
+      tokeniser = await loadTokeniser(modelDir);
     } catch (err: unknown) {
       if (generation === this.startGeneration) {
         const message = err instanceof Error ? err.message : String(err);
         this.fail(new Error("Could not tokenise the wake phrases: " + message));
       } else {
-        this.emit("debug", "Start abandoned: stopped while the phrases were tokenised");
+        this.emit("debug", "Start abandoned: stopped while the tokeniser loaded");
       }
       return;
     }
-    // The same race as the model check, over the tokenising.
+    // The same race as the model check, over the tokeniser's load.
     if (generation !== this.startGeneration) {
-      this.emit("debug", "Start abandoned: stopped while the phrases were tokenised");
+      this.emit("debug", "Start abandoned: stopped while the tokeniser loaded");
       return;
     }
 
-    // keywordTexts() walks the phrases the way buildKeywordSpec() does, so
-    // every text it asks for was tokenised above.
-    const pieces = new Map(texts.map((text, i) => [text, tokenised.pieces[i]]));
-    const spec = buildKeywordSpec(phrases, (text) => pieces.get(text) ?? [], safeThreshold, vocabulary);
+    const tokenisingSince = Date.now();
+    const spec = buildKeywordSpec(phrases, (text) => tokeniser.encode(text), safeThreshold, tokeniser.vocabulary);
     if (this.currentDebugMode) {
-      this.detail(`Timing: bpe-load ${Math.max(0, tokenised.loadedAt - tokenisingSince)}ms`);
-      this.detail(`Timing: tokenise ${Math.max(0, Date.now() - tokenised.loadedAt)}ms`);
+      this.detail(`Timing: bpe-load ${Math.max(0, tokenisingSince - loadingSince)}ms`);
+      this.detail(`Timing: tokenise ${Math.max(0, Date.now() - tokenisingSince)}ms`);
       for (const d of spec.details) {
         this.detail(`phrase: ${d.phrase} -> tokens: ${d.tokens} -> decoded: ${d.decoded}`);
       }
@@ -340,8 +339,8 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
 
     // Send config as JSON line then leave stdin open (child reads more commands).
     // The debug mode is read now, not when the start began: the verbose log
-    // can have been switched while the model was checked and the phrases
-    // tokenised.
+    // can have been switched while the model was checked and the tokeniser
+    // loaded.
     const config = {
       threshold: safeThreshold,
       modelDir,

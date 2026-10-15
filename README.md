@@ -9,55 +9,6 @@
 <h3 align="center">Voice Activation for Code Editors</h3>
 
 <!-- badges: start -->
-<!--
-<div align="center">
-  <table>
-    <tr>
-      <td><strong>Meta</strong></td>
-      <td>
-        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/v/analytics-in-motion.wake-word?label=Marketplace&color=blue" alt="VS Code Marketplace version"></a>&nbsp;
-        <a href="https://open-vsx.org/extension/analytics-in-motion/wake-word"><img src="https://img.shields.io/open-vsx/v/analytics-in-motion/wake-word?label=Open%20VSX&color=blue" alt="Open VSX version"></a>&nbsp;
-        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/i/analytics-in-motion.wake-word?label=Marketplace%20Installs&color=blue" alt="VS Code Marketplace installs"></a>&nbsp;
-        <a href="https://open-vsx.org/extension/analytics-in-motion/wake-word"><img src="https://img.shields.io/open-vsx/dt/analytics-in-motion/wake-word?label=Open%20VSX%20Installs&color=blue" alt="Open VSX installs"></a>&nbsp;
-        <a href="https://github.com/analyticsinmotion/wake-word/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0 License"></a>&nbsp;
-      </td>
-    </tr>
-  </table>
-</div>
--->
-<!-- badges: end -->
-
-<!-- badges: start -->
-<!--
-<div align="center">
-  <table>
-    <tr>
-      <td><strong>Meta</strong></td>
-      <td>
-        <a href="https://github.com/analyticsinmotion/wake-word/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0 License"></a>&nbsp;
-        <a href="https://github.com/analyticsinmotion"><img src="https://github.com/user-attachments/assets/616c530f-cf2a-4f26-8f6c-7397be513847" alt="Analytics in Motion" width="137" height="20"></a>
-      </td>
-    </tr>
-    <tr>
-      <td><strong>Microsoft Marketplace</strong></td>
-      <td>
-        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/v/analytics-in-motion.wake-word?label=Version&color=blue" alt="VS Code Marketplace version"></a>&nbsp;
-        <a href="https://marketplace.visualstudio.com/items?itemName=analytics-in-motion.wake-word"><img src="https://img.shields.io/visual-studio-marketplace/i/analytics-in-motion.wake-word?label=Installs&color=blue" alt="VS Code Marketplace installs"></a>&nbsp;
-      </td>
-    </tr>
-    <tr>
-      <td><strong>Open VSX Registry</strong></td>
-      <td>
-        <a href="https://open-vsx.org/extension/analytics-in-motion/wake-word"><img src="https://img.shields.io/open-vsx/v/analytics-in-motion/wake-word?label=Version&color=blue" alt="Open VSX version"></a>&nbsp;
-        <a href="https://open-vsx.org/extension/analytics-in-motion/wake-word"><img src="https://img.shields.io/open-vsx/dt/analytics-in-motion/wake-word?label=Installs&color=blue" alt="Open VSX installs"></a>&nbsp;
-      </td>
-    </tr>
-  </table>
-</div>
--->
-<!-- badges: end -->
-
-<!-- badges: start -->
 <div align="center">
   <table>
     <tr>
@@ -84,7 +35,7 @@ Say a wake phrase and the right AI assistant opens -- no clicking required.
 
 Say **"Hey Claude"** and Claude opens. Say **"Hey Chat"** and the chat panel opens. Say **"Hey Computer"** and the terminal focuses. The extension handles the routing, pauses its own mic so the assistant can use it, then resumes listening when the voice session ends.
 
-**Zero config. No API keys. No accounts.** Install and go. On Windows it needs the Visual C++ Redistributable, which most machines already have.
+**Zero config. No API keys. No accounts.** Install and go.
 
 All audio processing happens locally on your machine. Nothing is recorded or transmitted.
 
@@ -92,12 +43,12 @@ https://github.com/user-attachments/assets/fb007095-5c4c-4927-aaa6-fa76550d7cb2
 
 ## How It Works
 
-1. Install the extension. A local speech model (~17MB) is downloaded on first use and cached. The download can be cancelled from its notification, and one that receives nothing for 30 seconds stops and says so.
+1. Install the extension. A local speech model (~17MB) is downloaded on first use and cached.
 2. When your editor opens, the extension starts listening on your microphone
 3. Audio is processed locally -- through voice activity detection and keyword spotting -- and matched against your configured wake phrases
-4. If a phrase is detected, the extension **releases the mic**, waits for the speech engine to confirm it is closed, and then fires the mapped command
+4. If a phrase is detected, the extension **releases the mic** and then fires the mapped command
 5. The assistant the route opens takes over the microphone with no contention
-6. Wake word listening resumes after a configurable cooldown, or, for routes set to manual handoff, when you click the status bar or press the toggle shortcut
+6. Wake word listening resumes after a configurable cooldown, with a live countdown in the status bar (`Wake: 30s`, `Wake: 29s`, ...), or, for routes set to manual handoff, when you click the status bar or press the toggle shortcut. Running **Wake Word: Enable Listening** during a cooldown resumes early
 
 ## Installation
 
@@ -119,7 +70,7 @@ code --install-extension analytics-in-motion.wake-word
 
 ### Prerequisites
 
-The speech engine is packaged with the extension, so there is no runtime to install. A local speech model (~17MB) is downloaded on first use and cached. [Platform Support](#platform-support) lists what each platform needs.
+The speech engine is packaged with the extension, so there is no runtime to install. [Platform Support](#platform-support) lists what each platform needs.
 
 **Windows needs the Microsoft Visual C++ Redistributable (x64)**, which most machines already have. Without it, listening fails to start and the status bar shows `Wake: Error`: install `VC_redist.x64.exe` from [Microsoft's latest supported downloads page](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) and enable listening again.
 
@@ -149,7 +100,7 @@ The Claude route needs the Claude Code extension. Without it, that route is set 
 
 ### Custom routes
 
-Add your own phrases in `settings.json`. Any spoken English phrase works. Routes are a list of objects, so the Settings editor links out to JSON rather than showing a form:
+Add your own phrases in `settings.json`. Any spoken English phrase works:
 
 ```json
 {
@@ -177,8 +128,6 @@ Add your own phrases in `settings.json`. Any spoken English phrase works. Routes
   ]
 }
 ```
-
-The speech engine listens only for the phrases in your routes, so speech that matches none of them never fires anything.
 
 Detection of uncommon words varies. The speech model works best with common English words, so a phrase built on a product name or other unusual word, such as "hey codex", may be missed more often than the default phrases. If one is, give that route a lower `confidenceThreshold`, lower `wakeWord.confidenceThreshold` for every phrase, or add an alias made of common words.
 
@@ -210,7 +159,7 @@ Warnings never block a phrase. They are shown once per session, and again when y
 
 When listening starts, Wake Word checks that each route's command exists in your editor. A route whose command is not available, such as the default Claude route when Claude Code is not installed, is not listened for. A notification names the route, its command, and the extension to install. It appears once, not every time the editor starts, and **Wake Word: Show Diagnostics** lists these routes under "Set aside".
 
-A command counts as available as soon as an installed extension provides it, even before that extension has started. Install or enable the extension a route needs and the route is listened for again, without restarting the editor. If none of your routes' commands are available, the microphone is not opened, and the status bar shows **Wake: No commands** until one is.
+Install or enable the extension a route needs and the route is listened for again, without restarting the editor. If none of your routes' commands are available, the microphone is not opened, and the status bar shows **Wake: No commands** until one is.
 
 ### Per-route cooldown
 
@@ -258,29 +207,15 @@ The range is 0.01 to 0.9, the same as `wakeWord.confidenceThreshold`. It applies
 
 The status bar shows **Wake: Paused** while a manual route waits. The default Claude route uses manual handoff.
 
-### The handoff
-
-When a wake phrase is detected:
-
-1. The extension asks the speech engine to close the microphone and waits for it to confirm. The engine keeps its process running with the speech model loaded, so listening comes back without reloading it. A process that has not confirmed within 500 ms is stopped, which closes the microphone as well
-2. Only then does the target VS Code command fire (opening the assistant)
-3. The assistant's voice mode takes over the microphone with no contention
-4. After `wakeWord.cooldownSeconds` (default: 30), wake word listening resumes. A route with `handoff: "manual"` waits for you instead. Running **Wake Word: Enable Listening** during a cooldown resumes early
-5. Status bar shows a live countdown (`Wake: 30s` → `Wake: 29s` → ...) during handoff, then returns to "Wake: Listening". A manual route shows "Wake: Paused" instead, with no countdown
-
-This ensures only one thing uses the mic at a time.
-
 ### Multiple windows
 
 If you have more than one editor window open, only one listens at a time. The first window to start listening takes a lock; the others show **Wake: Other window** in the status bar and stand by. When the listening window closes, crashes, or has listening disabled, a standing-by window takes over within about ten seconds. The lock is held through the cooldown after a detection, so a second window never opens the microphone while an assistant has it.
 
-The lock lives in the extension's global storage, which windows of the same editor share. Windows of different editor products do not see each other's lock.
+Windows of different editor products do not see each other's lock.
 
 ### Remote windows
 
 Wake Word works in remote windows: SSH, WSL, dev containers, and Codespaces opened in the desktop editor. It runs on your own machine, beside your microphone, and the commands it runs reach extensions on the remote side, such as Claude Code installed there. It does not run in the editor in a web browser, which cannot run its speech engine.
-
-If you installed Wake Word from a remote window before version 0.16.0, it was installed on the remote host. After updating, open Wake Word in the Extensions view and choose **Install Locally**.
 
 ### Status bar
 
@@ -370,7 +305,7 @@ The log and the report never contain audio or anything you said, and device name
 
 ## Privacy
 
-All speech recognition runs locally on your machine. No audio data ever leaves your device. A local `sherpa-onnx` model processes audio in memory in the engine child process. Nothing is recorded, stored, or transmitted. The only network request the extension makes is the one-time download of the speech model from GitHub.
+All speech recognition runs locally on your machine. No audio data ever leaves your device. Nothing is recorded, stored, or transmitted. The only network request the extension makes is the one-time download of the speech model from GitHub.
 
 ## Dependencies
 
@@ -381,24 +316,13 @@ The speech engine is built on two open source projects, both packaged with the e
 | decibri | Microphone capture, signal conditioning, and voice activity detection | [GitHub](https://github.com/decibri/decibri) / [decibri.com](https://decibri.com) |
 | sherpa-onnx | Open-vocabulary keyword spotting | [GitHub](https://github.com/k2-fsa/sherpa-onnx) |
 
-The extension host has one runtime npm dependency, `sentencepiece-js`, which turns each wake phrase into the speech model's word pieces. All native code runs in the engine child process.
-
 ## Platform Support
 
-| Platform | Status | Engine | Needs |
-| --- | --- | --- | --- |
-| Windows 10/11 (x64) | Supported | sherpa-onnx | Visual C++ Redistributable |
-| macOS 14+ (Apple silicon) | Supported | sherpa-onnx | nothing |
-| Linux (x64, ARM64) | Supported | sherpa-onnx | glibc 2.28+, ALSA |
-
-## Compatibility
-
-| Editor | Install method |
-| --- | --- |
-| VS Code | Marketplace or `code --install-extension analytics-in-motion.wake-word` |
-| Cursor | Open VSX or .vsix from GitHub Releases |
-| Windsurf | Open VSX or .vsix from GitHub Releases |
-| Other VS Code forks | .vsix from GitHub Releases |
+| Platform | Status | Needs |
+| --- | --- | --- |
+| Windows 10/11 (x64) | Supported | Visual C++ Redistributable |
+| macOS 14+ (Apple silicon) | Supported | nothing |
+| Linux (x64, ARM64) | Supported | glibc 2.28+, ALSA |
 
 ## License
 
