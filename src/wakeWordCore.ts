@@ -57,6 +57,53 @@ export function matchRoute(
   return routes.find((r) => normalizePhrases(r.phrase).includes(needle));
 }
 
+/** A phrase as the tokeniser takes it, or what stops it from being one. */
+export type CleanedPhrase = { text: string } | { unusable: string };
+
+/**
+ * The text a phrase is tokenised as. Wake Word's own rules, in this order:
+ *
+ * 1. Upper-case the phrase.
+ * 2. Remove accents and compatibility forms: decompose it (NFKD) and drop
+ *    the combining marks, Unicode general category Mn, so an E with a
+ *    diaeresis becomes a plain E and a full-width letter its plain letter.
+ * 3. Read the curly apostrophes U+2018 and U+2019 as "'".
+ * 4. Read . , ! ? : and ; as a space.
+ * 5. Read any white space as a space, collapse runs of spaces, and trim.
+ *
+ * What is left must be the letters A to Z, apostrophes, hyphens, and single
+ * spaces between words: the characters the model's pieces spell. Otherwise
+ * `unusable` is the first run of other characters, digits among them, or
+ * empty when nothing is left at all.
+ */
+export function cleanUpPhrase(phrase: string): CleanedPhrase {
+  const text = phrase
+    .toUpperCase()
+    .normalize("NFKD")
+    .replace(/\p{Mn}/gu, "")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[.,!?:;]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const unusable = /[^A-Z' -]+/.exec(text);
+  if (unusable) {
+    return { unusable: unusable[0] };
+  }
+  return text.length > 0 ? { text } : { unusable: "" };
+}
+
+/**
+ * A normalised phrase as the keyword spotter hears it, for the phrase checks:
+ * its cleaned-up text, in lower case. Phrases that differ only in case,
+ * punctuation, accents, full-width forms, or white space become one keyword
+ * line, so they are judged as one. A phrase the clean-up rules set aside, which is never
+ * listened for, is judged as it is.
+ */
+function heardAs(phrase: string): string {
+  const cleaned = cleanUpPhrase(phrase);
+  return "text" in cleaned ? cleaned.text.toLowerCase() : phrase;
+}
+
 // -- Routes -------------------------------------------------------------
 
 /** A route is usable only if it has at least one phrase, a label, and a command. */
@@ -1186,32 +1233,35 @@ export interface PhraseWarning {
  * phrase in a quiet room, so nothing is rejected. One phrase can draw more
  * than one warning ("hi" is a single word, short, and common), and every
  * alias of a route is checked on its own. Phrases are normalised first, so
- * a blank alias or a non-string is skipped exactly as the engine skips it.
+ * a blank alias or a non-string is skipped exactly as the engine skips it,
+ * and each is judged as the spotter hears it (heardAs()): "Hey!" is the
+ * common word "hey". The warning names the phrase as configured.
  */
 export function validatePhraseQuality(routes: readonly WakePhrase[]): PhraseWarning[] {
   const warnings: PhraseWarning[] = [];
 
   for (const route of routes) {
     for (const phrase of normalizePhrases(route.phrase)) {
-      const words = phrase.split(/\s+/);
+      const heard = heardAs(phrase);
+      const words = heard.split(/\s+/);
       const warn = (warning: string): void => {
         warnings.push({ label: route.label, phrase, warning });
       };
 
       if (words.length === 1) {
-        const example = phrase === "hey" ? "hey computer" : `hey ${phrase}`;
+        const example = heard === "hey" ? "hey computer" : `hey ${heard}`;
         warn(
           `"${phrase}" is a single word. Single words cause more false positives. ` +
             `Consider a two-word phrase like "${example}".`
         );
       }
-      if (phrase.length < SHORT_PHRASE_LENGTH) {
+      if (heard.length < SHORT_PHRASE_LENGTH) {
         warn(
-          `"${phrase}" is very short (${plural(phrase.length, "character")}). ` +
+          `"${phrase}" is very short (${plural(heard.length, "character")}). ` +
             "Short phrases are harder to detect reliably."
         );
       }
-      if (words.length === 1 && COMMON_WORDS.has(phrase)) {
+      if (words.length === 1 && COMMON_WORDS.has(heard)) {
         warn(`"${phrase}" is a very common word and will likely trigger frequently by accident.`);
       }
     }
@@ -1234,17 +1284,19 @@ export interface PhraseCollision {
  * phrase contained in another.
  *
  * An exact duplicate means the later route can never fire, because a
- * detection goes to the first route whose phrases match. A contained phrase
+ * detection goes to the first route whose phrases match. Two phrases that
+ * differ only in case, punctuation, accents, full-width forms, or white space
+ * become one keyword line, so only one of their routes can fire. A contained phrase
  * ("claude" inside "hey claude") means the shorter one can be heard when the
  * longer one is said. Aliases on the same route are not compared: whichever
- * is heard, the same command runs. Comparison is on normalised phrases, so
- * it ignores case and surrounding whitespace.
+ * is heard, the same command runs. Phrases are compared as the spotter hears
+ * them (heardAs()); the reasons name them as configured.
  */
 export function detectPhraseCollisions(routes: readonly WakePhrase[]): PhraseCollision[] {
-  const entries: Array<{ route: number; label: string; phrase: string }> = [];
+  const entries: Array<{ route: number; label: string; phrase: string; heard: string }> = [];
   routes.forEach((route, index) => {
     for (const phrase of new Set(normalizePhrases(route.phrase))) {
-      entries.push({ route: index, label: route.label, phrase });
+      entries.push({ route: index, label: route.label, phrase, heard: heardAs(phrase) });
     }
   });
 
@@ -1266,9 +1318,13 @@ export function detectPhraseCollisions(routes: readonly WakePhrase[]): PhraseCol
         reason =
           `"${a.label}" and "${b.label}" both use "${a.phrase}". ` +
           `Only "${a.label}" can fire: a detection goes to the first matching route.`;
-      } else if (a.phrase.includes(b.phrase)) {
+      } else if (a.heard === b.heard) {
+        reason =
+          `"${a.phrase}" (${a.label}) and "${b.phrase}" (${b.label}) are heard as the same phrase: ` +
+          "case, punctuation, and accents are set aside. Only one of the two routes can fire.";
+      } else if (a.heard.includes(b.heard)) {
         reason = contained(b, a);
-      } else if (b.phrase.includes(a.phrase)) {
+      } else if (b.heard.includes(a.heard)) {
         reason = contained(a, b);
       }
 

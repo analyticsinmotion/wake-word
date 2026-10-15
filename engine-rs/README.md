@@ -107,21 +107,24 @@ pieces (`HEY CLAUDE`), and the engine maps that back through `phraseMap` to the
 phrase as configured, lower-cased, before writing `DETECTED:`.
 
 The pieces come from the model's SentencePiece file, `bpe.model`, which the
-extension reads in a worker thread of its own. Despite its name
-the file is a Unigram model with the `nmt_nfkc` normaliser: pieces are chosen
-by a best-path search over piece scores, not by merge rules, and full-width and
-ligature forms fold to plain letters first.
+extension reads with a tokeniser of its own. Despite its name the file is a
+Unigram model: pieces are chosen by a best-path search over piece scores, not
+by merge rules. The extension cleans each phrase up first, to the letters A to
+Z, apostrophes, hyphens, and single spaces, setting aside case, accents,
+compatibility forms such as full-width letters, curly apostrophes, and the
+punctuation `. , ! ? : ;`, and it leaves out a phrase with any other character.
 
 Before the model loads, the engine checks every keyword line against the
 model's `tokens.txt`. The library does not report a bad line as an error: a
-word it cannot find in the token table (a digit or an accented letter, which
-SentencePiece returns as itself) makes it end the process, and so does a boost
-or threshold it cannot read as a number, with nothing written for the extension
-to show. The engine refuses such a line first, as a fatal
-`Failed to load KWS model:` error that names the phrase or the line, and it
-refuses a line with a NUL character, a line break, or no pieces in the same
-way. The extension leaves such phrases out before they reach the engine; the
-check is there for any line that arrives anyway.
+word it cannot find in the token table (a digit or an accented letter, for
+instance) makes it end the process, and so does a boost or threshold it cannot
+read as a number, with nothing written for the extension to show. The engine
+refuses such a line first, as a fatal `Failed to load KWS model:` error that
+names the phrase or the line, and it refuses in the same way a line with a NUL
+character, a line break, or no pieces, and a line that names one of the
+special tokens `<blk>`, `<sos/eos>`, and `<unk>`, which are in the token table
+but spell no part of a word. The extension leaves such phrases out before they
+reach the engine; the check is there for any line that arrives anyway.
 
 The spotter's stream, its decoding state, is restarted in three places:
 
@@ -295,7 +298,8 @@ stale, and verifies the signature.
 **The package check.** After `vsce package`, `scripts/verify-vsix.mjs` at the
 repository root reads the `.vsix` and fails unless:
 
-- the extension and `node_modules/sentencepiece-js` are in it;
+- the extension is in it, and nothing under `node_modules`, since the
+  extension has no runtime dependency;
 - `bin/` holds the engine for the target's architecture, stored executable on
   macOS and Linux, and the pinned runtime files and notices;
 - on Windows the engine imports no C runtime DLL and does not import ONNX
@@ -512,9 +516,9 @@ Entries that are not strings are ignored. Without `keywordLines` the engine
 answers `ERROR:Startup error: ...`, with an empty array
 `ERROR:No valid phrases to detect`, and without `phraseMap` entries
 `ERROR:Startup error: ...`, all before anything loads. The extension leaves out
-a phrase whose pieces are not all in the model's token table, with a warning,
-so one bad route does not take the engine down; the engine's own check, above,
-catches any such line that arrives anyway.
+a phrase the model's pieces cannot spell, with a warning, so one bad route does
+not take the engine down; the engine's own check, above, catches any such line
+that arrives anyway.
 
 `threshold` is clamped to 0.01 to 0.9, defaulting to 0.05, and passed as the
 spotter-wide threshold; each line carries its own. `modelDir` is the keyword

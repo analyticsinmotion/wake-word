@@ -1,9 +1,7 @@
 version: 2
 updates:
-  # The build and publish toolchain, and sentencepiece-js, the one package
-  # that ships in the .vsix. sentencepiece-js is pinned exactly, because the
-  # pieces it produces are what the keyword lines are built from:
-  # tests/unit/tokeniser.test.ts checks them against a pinned table.
+  # The build and publish toolchain. The extension has no runtime dependency,
+  # so nothing from npm ships in the .vsix.
   - package-ecosystem: npm
     directory: "/"
     schedule:

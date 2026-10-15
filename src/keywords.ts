@@ -1,12 +1,12 @@
-import { clampThreshold } from "./wakeWordCore";
+import { clampThreshold, cleanUpPhrase } from "./wakeWordCore";
 
 /**
  * Keyword lines for the sherpa-onnx keyword spotter, and the way back from
  * what it reports to the phrase the user configured.
  *
  * The spotter does not take plain text: each phrase reaches it as the
- * SentencePiece pieces for the upper-cased phrase, followed by two fields the
- * spotter parses off the end of the line:
+ * model's pieces for the phrase as cleanUpPhrase() leaves it, followed by two
+ * fields the spotter parses off the end of the line:
  *
  *   ▁HE Y ▁C LA U DE :3.0 #0.05
  *
@@ -29,8 +29,8 @@ import { clampThreshold } from "./wakeWordCore";
  *
  * The pieces come from the model's `bpe.model`. Despite the name it is a
  * SentencePiece Unigram model, not a BPE one: pieces are chosen by a best-path
- * search over piece scores, not by merge rules, so only a SentencePiece
- * implementation produces the pieces the spotter expects.
+ * search over piece scores, not by merge rules. tokeniser.ts reads the scores
+ * and runs that search.
  */
 
 /** SentencePiece marks a word boundary with U+2581 LOWER ONE EIGHTH BLOCK. */
@@ -64,7 +64,11 @@ export interface KeywordDetail {
 export interface SkippedPhrase {
   /** The phrase as configured. */
   phrase: string;
-  /** The first of its pieces that is not in the model's token table. */
+  /**
+   * What stopped it: the first run of characters cleanUpPhrase() does not
+   * allow, or a piece that is not in the model's token table. Empty for a
+   * phrase of punctuation alone.
+   */
   piece: string;
 }
 
@@ -82,49 +86,30 @@ export interface KeywordSpec {
   /** The lines as the spotter takes them, newline separated. */
   keywords: string;
   details: KeywordDetail[];
-  /** Phrases dropped because a piece is not in the token table. */
+  /** Phrases dropped because the model's pieces cannot spell them. */
   skipped: SkippedPhrase[];
 }
 
 /**
- * Every phrase string the keyword builder uses, with the text it tokenises:
- * upper-cased and trimmed. Non-string and blank phrases are left out. Each
- * one carries its route's `confidenceThreshold` as configured, so every
- * alias of a route gets that route's threshold.
+ * Every phrase string the keyword builder uses. Non-string and blank phrases
+ * are left out. Each one carries its route's `confidenceThreshold` as
+ * configured, so every alias of a route gets that route's threshold.
  */
 function* phraseStrings(
   phrases: readonly (PhraseSource | null | undefined)[] | null | undefined
-): Generator<{ phrase: string; text: string; threshold: unknown }> {
+): Generator<{ phrase: string; threshold: unknown }> {
   for (const p of phrases || []) {
     if (!p) {
       continue;
     }
     const raw = Array.isArray(p.phrase) ? p.phrase : [p.phrase];
     for (const r of raw) {
-      if (typeof r !== "string") {
+      if (typeof r !== "string" || r.trim().length === 0) {
         continue;
       }
-      const text = r.toUpperCase().trim();
-      if (text.length === 0) {
-        continue;
-      }
-      yield { phrase: r, text, threshold: p.confidenceThreshold };
+      yield { phrase: r, threshold: p.confidenceThreshold };
     }
   }
-}
-
-/**
- * The distinct texts buildKeywordSpec() asks its encoder for, in the order it
- * first asks, so they can be tokenised ahead of it in one batch.
- */
-export function keywordTexts(
-  phrases: readonly (PhraseSource | null | undefined)[] | null | undefined
-): string[] {
-  const texts = new Set<string>();
-  for (const { text } of phraseStrings(phrases)) {
-    texts.add(text);
-  }
-  return [...texts];
 }
 
 /**
@@ -145,24 +130,30 @@ export function decodePieces(tokens: readonly string[]): string {
 /**
  * Build the sherpa-onnx keyword list and the decoded-to-spoken lookup map.
  *
- * `encodePieces` is the SentencePiece encoder. `threshold` is the global
- * wakeWord.confidenceThreshold setting, written as the trigger threshold of
- * every line whose route did not set a `confidenceThreshold` of its own. Both
- * values go through the same clamp, the route's falling back to the global
- * one, so a missing or unusable value gives a threshold in range rather than
- * a line sherpa-onnx cannot parse.
+ * Each phrase is cleaned up by cleanUpPhrase(), and `encodePieces`, the
+ * tokeniser, turns the result into pieces, or null when no split into pieces
+ * covers it. `threshold` is the global wakeWord.confidenceThreshold setting,
+ * written as the trigger threshold of every line whose route did not set a
+ * `confidenceThreshold` of its own. Both values go through the same clamp,
+ * the route's falling back to the global one, so a missing or unusable value
+ * gives a threshold in range rather than a line sherpa-onnx cannot parse.
  *
  * Non-string and blank phrases are skipped rather than thrown on:
  * wakeWord.routes is user-edited JSON and a bad entry must not take the engine
- * down before the microphone ever opens. For the same reason, when
- * `vocabulary` is given, a phrase with a piece that is not in it is skipped
+ * down before the microphone ever opens. For the same reason a phrase the
+ * clean-up rules refuse, a phrase the tokeniser cannot split, and, when
+ * `vocabulary` is given, a phrase with a piece that is not in it are skipped
  * and listed in `skipped`: the spotter looks every piece up in the model's
  * token table, and the native library ends the process on one it does not
  * have. An empty result is for the caller to refuse.
+ *
+ * The phrase as configured stays the phrase's identity: it is what `skipped`
+ * and `details` name, and the phrase map's values are it, lower-cased and
+ * trimmed, which is how a detection is matched back to its route.
  */
 export function buildKeywordSpec(
   phrases: readonly (PhraseSource | null | undefined)[] | null | undefined,
-  encodePieces: (text: string) => string[],
+  encodePieces: (text: string) => readonly string[] | null,
   threshold?: unknown,
   vocabulary?: ReadonlySet<string>
 ): KeywordSpec {
@@ -172,8 +163,17 @@ export function buildKeywordSpec(
   const details: KeywordDetail[] = [];
   const skipped: SkippedPhrase[] = [];
 
-  for (const { phrase, text, threshold: routeThreshold } of phraseStrings(phrases)) {
-    const tokens = encodePieces(text);
+  for (const { phrase, threshold: routeThreshold } of phraseStrings(phrases)) {
+    const cleaned = cleanUpPhrase(phrase);
+    if ("unusable" in cleaned) {
+      skipped.push({ phrase, piece: cleaned.unusable });
+      continue;
+    }
+    const tokens = encodePieces(cleaned.text);
+    if (tokens === null) {
+      skipped.push({ phrase, piece: cleaned.text });
+      continue;
+    }
     const tokenStr = tokens.join(" ");
     const decoded = decodePieces(tokens);
     if (decoded) {
@@ -199,30 +199,31 @@ export function buildKeywordSpec(
 }
 
 /**
- * The log line for a phrase left out of the keyword lines. The model's pieces
- * spell the letters A to Z, the apostrophe, and the hyphen; digits, accented
- * letters, and other punctuation are not in its token table.
+ * Characters as a message shows them: a control character, a format
+ * character such as a zero-width space, a separator, or a mark is written as
+ * its code point, U+XXXX, since it would not be seen between quotes.
  */
-export function skippedPhraseWarning(skipped: SkippedPhrase): string {
-  return (
-    `Phrase "${skipped.phrase}" skipped: "${skipped.piece}" is not in the speech model's vocabulary. ` +
-    "Phrases can use the letters A to Z, apostrophes, and hyphens; write numbers as words."
-  );
+function visible(text: string): string {
+  return [...text]
+    .map((character) =>
+      /[\p{C}\p{Z}\p{M}]/u.test(character)
+        ? "U+" + (character.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")
+        : character
+    )
+    .join("");
 }
 
 /**
- * The tokens of a model's `tokens.txt`: one `<token> <id>` pair per line.
- * The same reading as the Rust engine's, so the two agree on what a
- * spottable phrase is.
+ * The log line for a phrase left out of the keyword lines. The model's pieces
+ * spell the letters A to Z, the apostrophe, and the hyphen; digits, letters
+ * of other alphabets, and other symbols are not in its token table.
  */
-export function parseVocabulary(tokensTxt: string): Set<string> {
-  const vocabulary = new Set<string>();
-  for (const raw of tokensTxt.split("\n")) {
-    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    const space = line.lastIndexOf(" ");
-    if (space !== -1) {
-      vocabulary.add(line.slice(0, space));
-    }
-  }
-  return vocabulary;
+export function skippedPhraseWarning(skipped: SkippedPhrase): string {
+  const reason = skipped.piece
+    ? `"${visible(skipped.piece)}" is not in the speech model's vocabulary`
+    : "it has no words, only punctuation";
+  return (
+    `Phrase "${skipped.phrase}" skipped: ${reason}. ` +
+    "Phrases can use the letters A to Z, apostrophes, and hyphens; write numbers as words."
+  );
 }

@@ -212,8 +212,5 @@
     "ovsx": "^1.2.0",
     "typescript": "^5.3.3",
     "vitest": "^5.0.4"
-  },
-  "dependencies": {
-    "sentencepiece-js": "1.1.0"
   }
 }

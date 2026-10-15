@@ -92,6 +92,19 @@ describe("validatePhraseQuality", () => {
     expect(warningsFor("hey   claude")).toEqual([]);
   });
 
+  it("judges a phrase as the spotter hears it, and names it as configured", () => {
+    // Punctuation is set aside, so "Hey!" is heard as the common word "hey".
+    const warnings = validatePhraseQuality([route("Greeting", "Hey!")]);
+    expect(warnings.map((w) => w.phrase)).toEqual(["hey!", "hey!", "hey!"]);
+    expect(warnings.map((w) => w.warning)).toEqual([
+      '"hey!" is a single word. Single words cause more false positives. ' +
+        'Consider a two-word phrase like "hey computer".',
+      '"hey!" is very short (3 characters). Short phrases are harder to detect reliably.',
+      '"hey!" is a very common word and will likely trigger frequently by accident.',
+    ]);
+    expect(warningsFor("Hey, Claude!")).toEqual([]);
+  });
+
   it("does not suggest \"hey hey\" for a bare \"hey\"", () => {
     expect(warningsFor("hey")[0]).toContain('"hey computer"');
   });
@@ -184,6 +197,39 @@ describe("detectPhraseCollisions", () => {
     expect(collisions).toHaveLength(1);
     expect(collisions[0].phraseA).toBe("hey claude");
     expect(collisions[0].phraseB).toBe("hey claude");
+  });
+
+  it("detects phrases that differ only in case, punctuation, accents, or white space", () => {
+    const collisions = detectPhraseCollisions([
+      route("Claude", "hey claude"),
+      route("Other", "Hey, Claude!"),
+      route("Spaced", "hey   claude"),
+    ]);
+    expect(collisions.map((c) => [c.routeA, c.phraseA, c.routeB, c.phraseB])).toEqual([
+      ["Claude", "hey claude", "Other", "hey, claude!"],
+      ["Claude", "hey claude", "Spaced", "hey   claude"],
+      ["Other", "hey, claude!", "Spaced", "hey   claude"],
+    ]);
+    expect(collisions[0].reason).toBe(
+      '"hey claude" (Claude) and "hey, claude!" (Other) are heard as the same phrase: ' +
+        "case, punctuation, and accents are set aside. Only one of the two routes can fire."
+    );
+    expect(detectPhraseCollisions([route("Zoe", "zoe"), route("Name", "Zo\u00eb")])).toHaveLength(1);
+    expect(
+      detectPhraseCollisions([route("Plain", "hey claude"), route("Wide", "\uff48\uff45\uff59 claude")])
+    ).toHaveLength(1);
+  });
+
+  it("finds a phrase contained in another as the spotter hears them", () => {
+    const collisions = detectPhraseCollisions([
+      route("Short", "what's up"),
+      route("Long", "what\u2019s up, now"),
+    ]);
+    expect(collisions).toHaveLength(1);
+    expect(collisions[0].reason).toBe(
+      '"what\'s up" (Short) is contained within "what\u2019s up, now" (Long). ' +
+        "The shorter phrase may trigger when the longer one is spoken."
+    );
   });
 
   it("tells routes apart by position, not by label", () => {

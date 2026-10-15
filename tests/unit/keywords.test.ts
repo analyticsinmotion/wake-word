@@ -3,10 +3,9 @@ import {
   WORD_BOUNDARY,
   buildKeywordSpec,
   decodePieces,
-  keywordTexts,
-  parseVocabulary,
   skippedPhraseWarning,
 } from "../../src/keywords";
+import { cleanUpPhrase } from "../../src/wakeWordCore";
 
 const B = WORD_BOUNDARY;
 
@@ -22,8 +21,8 @@ function linePieces(line: string): string[] {
 }
 
 /**
- * A stand-in for SentencePiece's encodePieces that splits on spaces, marks
- * each word boundary the way the real model does, and breaks longer words
+ * A stand-in for the tokeniser's encode() that splits on spaces, marks each
+ * word boundary the way the real model does, and breaks longer words
  * into two pieces. The round trip (encode, then decode the pieces) is what has
  * to agree with the string sherpa-onnx reports on a hit, so the shape of the
  * pieces matters more than the exact vocabulary.
@@ -252,7 +251,7 @@ describe("buildKeywordSpec", () => {
 
     it("skips a phrase with an unknown piece and names the phrase and the piece", () => {
       const spec = buildKeywordSpec(
-        [{ phrase: ["hey claude", "Route 66"] }],
+        [{ phrase: ["hey claude", "Route sixty"] }],
         fakeEncodePieces,
         0.05,
         vocabularyFor("hey claude", "route")
@@ -260,7 +259,7 @@ describe("buildKeywordSpec", () => {
       expect(spec.keywordLines).toEqual([B + "HE Y " + B + "CL AUDE" + SUFFIX]);
       expect(spec.phraseMap).toEqual({ "HEY CLAUDE": "hey claude" });
       expect(spec.details.map((d) => d.phrase)).toEqual(["hey claude"]);
-      expect(spec.skipped).toEqual([{ phrase: "Route 66", piece: B + "66" }]);
+      expect(spec.skipped).toEqual([{ phrase: "Route sixty", piece: B + "SI" }]);
     });
 
     it("skips every phrase when none of them can be spotted", () => {
@@ -279,18 +278,18 @@ describe("buildKeywordSpec", () => {
       // Pieces the table lacks that decode to the same text: without the
       // table, the later phrase would take the entry.
       const encode = (text: string) =>
-        text === "HEY CLAUDE." ? [B + "HEY", B + "CLAUDE"] : fakeEncodePieces(text);
-      const phrases = [{ phrase: "hey claude" }, { phrase: "hey claude." }];
-      expect(buildKeywordSpec(phrases, encode).phraseMap).toEqual({ "HEY CLAUDE": "hey claude." });
+        text === "HEY-CLAUDE" ? [B + "HEY", B + "CLAUDE"] : fakeEncodePieces(text);
+      const phrases = [{ phrase: "hey claude" }, { phrase: "hey-claude" }];
+      expect(buildKeywordSpec(phrases, encode).phraseMap).toEqual({ "HEY CLAUDE": "hey-claude" });
 
       const spec = buildKeywordSpec(phrases, encode, 0.05, vocabularyFor("hey claude"));
       expect(spec.phraseMap).toEqual({ "HEY CLAUDE": "hey claude" });
       expect(spec.keywordLines).toHaveLength(1);
-      expect(spec.skipped).toEqual([{ phrase: "hey claude.", piece: B + "HEY" }]);
+      expect(spec.skipped).toEqual([{ phrase: "hey-claude", piece: B + "HEY" }]);
     });
 
-    it("skips nothing when no table is given", () => {
-      const spec = buildKeywordSpec([{ phrase: "route 66" }], fakeEncodePieces);
+    it("skips nothing for its pieces when no table is given", () => {
+      const spec = buildKeywordSpec([{ phrase: "route sixty" }], fakeEncodePieces);
       expect(spec.keywordLines).toHaveLength(1);
       expect(spec.skipped).toEqual([]);
     });
@@ -383,39 +382,105 @@ describe("buildKeywordSpec", () => {
   });
 });
 
-describe("keywordTexts", () => {
-  it("lists every text buildKeywordSpec asks its encoder for, once each, in order", () => {
-    const phrases = [
-      { phrase: ["  Hey Claude", "open chat", 42, ""] },
-      null,
-      { phrase: "HEY CLAUDE" },
-      { phrase: "route 66" },
-    ];
-    const asked: string[] = [];
-    buildKeywordSpec(phrases, (text) => {
-      asked.push(text);
-      return fakeEncodePieces(text);
-    });
-    expect(keywordTexts(phrases)).toEqual(["HEY CLAUDE", "OPEN CHAT", "ROUTE 66"]);
-    expect([...new Set(asked)]).toEqual(keywordTexts(phrases));
+describe("cleanUpPhrase", () => {
+  const text = (phrase: string) => cleanUpPhrase(phrase);
+
+  it("upper-cases the phrase", () => {
+    expect(text("hey claude")).toEqual({ text: "HEY CLAUDE" });
+    expect(text("stra\u00dfe")).toEqual({ text: "STRASSE" });
+    expect(text("\ufb01ne")).toEqual({ text: "FINE" });
   });
 
-  it("is empty for no usable phrase", () => {
-    expect(keywordTexts([])).toEqual([]);
-    expect(keywordTexts(null)).toEqual([]);
-    expect(keywordTexts([{ phrase: ["  ", 1] }])).toEqual([]);
+  it("removes accents, composed or not", () => {
+    expect(text("Zo\u00eb")).toEqual({ text: "ZOE" });
+    expect(text("ZOE\u0308")).toEqual({ text: "ZOE" });
+    expect(text("caf\u00e9 cr\u00e8me br\u00fbl\u00e9e")).toEqual({ text: "CAFE CREME BRULEE" });
+    expect(text("\u0141ukasz")).toEqual({ unusable: "\u0141" });
+  });
+
+  it("folds full-width and other compatibility forms to their plain letters", () => {
+    expect(text("\uff48\uff45\uff59\u3000\uff43\uff4c\uff41\uff55\uff44\uff45")).toEqual({ text: "HEY CLAUDE" });
+    expect(text("\u2160 hey")).toEqual({ text: "I HEY" });
+    expect(text("hey\uff0c claude\uff01")).toEqual({ text: "HEY CLAUDE" });
+  });
+
+  it("reads the curly apostrophes as an apostrophe", () => {
+    expect(text("what\u2019s up")).toEqual({ text: "WHAT'S UP" });
+    expect(text("\u2018n\u2019")).toEqual({ text: "'N'" });
+    expect(text("don't stop")).toEqual({ text: "DON'T STOP" });
+  });
+
+  it("reads . , ! ? : ; as a space", () => {
+    expect(text("Hey, Claude!")).toEqual({ text: "HEY CLAUDE" });
+    expect(text("open: chat; now.")).toEqual({ text: "OPEN CHAT NOW" });
+    expect(text("hey?claude")).toEqual({ text: "HEY CLAUDE" });
+  });
+
+  it("reads any white space as a space, collapses runs, and trims", () => {
+    expect(text("  hey\t\tclaude\r\n")).toEqual({ text: "HEY CLAUDE" });
+    expect(text("hey\u00a0claude\u3000now")).toEqual({ text: "HEY CLAUDE NOW" });
+  });
+
+  it("keeps apostrophes and hyphens", () => {
+    expect(text("well-known rock 'n' roll")).toEqual({ text: "WELL-KNOWN ROCK 'N' ROLL" });
+  });
+
+  it("names the first run of characters a phrase cannot use", () => {
+    expect(text("route 66")).toEqual({ unusable: "66" });
+    expect(text("hey 2nd claude")).toEqual({ unusable: "2" });
+    expect(text("<blk>")).toEqual({ unusable: "<" });
+    expect(text("hey_claude")).toEqual({ unusable: "_" });
+    expect(text("hey/claude")).toEqual({ unusable: "/" });
+    expect(text("\u043f\u0440\u0438\u0432\u0435\u0442")).toEqual({
+      unusable: "\u041f\u0420\u0418\u0412\u0415\u0422",
+    });
+    expect(text("hey\u200bclaude")).toEqual({ unusable: "\u200b" });
+  });
+
+  it("has nothing to give for punctuation alone", () => {
+    expect(text("?!")).toEqual({ unusable: "" });
+    expect(text(" . , ")).toEqual({ unusable: "" });
   });
 });
 
-describe("parseVocabulary", () => {
-  it("reads one token per line, before the id", () => {
-    const vocabulary = parseVocabulary(`<blk> 0\n<unk> 2\r\nS 3\n${B}THE 5\n' 13\n${B} 20\n`);
-    expect([...vocabulary].sort()).toEqual(["'", "<blk>", "<unk>", "S", B, B + "THE"].sort());
-    expect(vocabulary.has("3")).toBe(false);
+describe("buildKeywordSpec and the clean-up rules", () => {
+  it("tokenises the cleaned-up text and keeps the phrase as configured", () => {
+    const seen: string[] = [];
+    const spec = buildKeywordSpec([{ phrase: "Hey, Claude!" }, { phrase: "what\u2019s up" }], (text) => {
+      seen.push(text);
+      return fakeEncodePieces(text);
+    });
+    expect(seen).toEqual(["HEY CLAUDE", "WHAT'S UP"]);
+    expect(spec.phraseMap).toEqual({ "HEY CLAUDE": "hey, claude!", "WHAT'S UP": "what\u2019s up" });
+    expect(spec.details.map((d) => d.phrase)).toEqual(["Hey, Claude!", "what\u2019s up"]);
   });
 
-  it("ignores lines with no id", () => {
-    expect([...parseVocabulary("\nA 1\nnoid\n")]).toEqual(["A"]);
+  it("gives phrases that differ only in case, punctuation, and accents the same line", () => {
+    const lines = (phrase: string) => buildKeywordSpec([{ phrase }], fakeEncodePieces).keywordLines;
+    expect(lines("Hey, Claude!")).toEqual(lines("hey claude"));
+    expect(lines("what\u2019s up")).toEqual(lines("what's up"));
+    expect(lines("Zo\u00eb")).toEqual(lines("zoe"));
+  });
+
+  it("sets aside a phrase the rules refuse without asking the encoder", () => {
+    const seen: string[] = [];
+    const spec = buildKeywordSpec([{ phrase: ["route 66", "<unk>", "?!", "hey claude"] }], (text) => {
+      seen.push(text);
+      return fakeEncodePieces(text);
+    });
+    expect(seen).toEqual(["HEY CLAUDE"]);
+    expect(spec.skipped).toEqual([
+      { phrase: "route 66", piece: "66" },
+      { phrase: "<unk>", piece: "<" },
+      { phrase: "?!", piece: "" },
+    ]);
+    expect(spec.keywordLines).toHaveLength(1);
+  });
+
+  it("sets aside a phrase the encoder has no split for", () => {
+    const spec = buildKeywordSpec([{ phrase: "hey claude" }], () => null);
+    expect(spec.keywordLines).toEqual([]);
+    expect(spec.skipped).toEqual([{ phrase: "hey claude", piece: "HEY CLAUDE" }]);
   });
 });
 
@@ -424,6 +489,19 @@ describe("skippedPhraseWarning", () => {
     expect(skippedPhraseWarning({ phrase: "route 66", piece: "66" })).toBe(
       'Phrase "route 66" skipped: "66" is not in the speech model\'s vocabulary. ' +
         "Phrases can use the letters A to Z, apostrophes, and hyphens; write numbers as words."
+    );
+  });
+
+  it("says so when a phrase is punctuation alone", () => {
+    expect(skippedPhraseWarning({ phrase: "?!", piece: "" })).toBe(
+      'Phrase "?!" skipped: it has no words, only punctuation. ' +
+        "Phrases can use the letters A to Z, apostrophes, and hyphens; write numbers as words."
+    );
+  });
+
+  it("writes a character that cannot be seen as its code point", () => {
+    expect(skippedPhraseWarning({ phrase: "hey\u200bclaude", piece: "\u200b" })).toMatch(
+      /^Phrase "hey.claude" skipped: "U\+200B" is not in the speech model's vocabulary\. /
     );
   });
 });
