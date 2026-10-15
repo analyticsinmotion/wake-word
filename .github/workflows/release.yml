@@ -10,6 +10,18 @@ jobs:
     # other tag, one that hosts the speech model or the engine archives, must
     # not build, upload, or publish the extension.
     if: startsWith(github.event.release.tag_name, 'v')
+    # The trusted publisher registered on Open VSX pins this environment, so
+    # the registry issues a publishing token only to a job that runs in it.
+    # Its deployment rule admits only tags matching v*, and it applies to
+    # every step of the job, the Marketplace publish included.
+    environment: open-vsx
+    # Declaring permissions withholds every permission not listed.
+    # contents: write lets checkout read the repository and the upload step
+    # attach the .vsix to the release. id-token: write lets the Open VSX step
+    # request the job's OIDC ID token. No other step needs a permission.
+    permissions:
+      contents: write
+      id-token: write
     # The same checks as ci.yml, all before anything is uploaded or published.
     # lint marks the one leg that runs the checks whose answer does not depend
     # on the platform: ESLint and rustfmt.
@@ -130,6 +142,12 @@ jobs:
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
-      # Publish to Open VSX Registry
+      # Publish to Open VSX Registry with trusted publishing: ovsx exchanges
+      # the job's OIDC ID token for a publishing token that expires within
+      # minutes and can publish only this extension, so the workflow needs no
+      # stored Open VSX token. --trusted-publishing fails the step when no ID
+      # token is available, rather than looking for a stored access token or
+      # asking for one. An access token given with -p, --pat, or OVSX_PAT
+      # takes precedence over trusted publishing, so the job sets none.
       - name: Publish to Open VSX
-        run: npx ovsx publish wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix -p ${{ secrets.OVSX_PAT }}
+        run: npx ovsx publish wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix --trusted-publishing

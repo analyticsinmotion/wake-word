@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.17.0] - 2026-10-15
+
+### Changed
+
+- Wake Word turns wake phrases into the speech model's word pieces with its own code. What Wake Word listens for is unchanged. Listening starts sooner, and the extension download is about 270 KB smaller.
+- The speech engine uses decibri 6.4.0. A microphone that fails while listening is reported once in the Wake Word output channel.
+
+### Removed
+
+- The extension's runtime npm dependency.
+
 ## [0.16.0] - 2026-09-24
 
 ### Added
