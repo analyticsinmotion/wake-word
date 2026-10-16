@@ -1,5 +1,7 @@
+import * as path from "path";
 import { afterEach, describe, expect, it } from "vitest";
 import { WORD_BOUNDARY, buildKeywordSpec } from "../../src/keywords";
+import { modelDirectory } from "../../src/speechModel";
 import { loadTokeniser } from "../../src/tokeniser";
 import type { WakePhrase } from "../../src/speechEngineInterface";
 import type { InstalledExtension } from "../../src/wakeWordCore";
@@ -17,7 +19,8 @@ import { Scopes, World, endSessions, startSession } from "../mocks/extensionSess
  * platform, the Node.js version, and the session's length.
  */
 
-const MODEL_DIR = process.env.WAKE_WORD_MODEL_DIR;
+/** The model the package carries, or the copy WAKE_WORD_MODEL_DIR names. */
+const MODEL_DIR = process.env.WAKE_WORD_MODEL_DIR || modelDirectory(path.join(__dirname, "..", ".."));
 
 const CLAUDE_CODE: InstalledExtension = {
   id: "anthropic.claude-code",
@@ -166,7 +169,7 @@ async function modelKeywordLines(configuration: Configuration, extraUser: Record
   });
   await session.run("wakeWord.enable");
   const engine = session.engine();
-  const tokeniser = await loadTokeniser(MODEL_DIR as string);
+  const tokeniser = await loadTokeniser(MODEL_DIR);
   return buildKeywordSpec(
     engine.startedWith[0] as WakePhrase[],
     (text) => tokeniser.encode(text),
@@ -207,9 +210,8 @@ const PINNED: Record<string, Outcome> = {
       "[info] State: listening",
       "[info] Listening: true",
       "[info] Paused: false",
-      "[info] Model: model (downloaded)",
+      "[info] Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
       "[info] Model dir: model",
-      "[info] Model SHA-256: 0000000000000000...",
       "[info] Audio device: (system default)",
       "[info] Input devices: none found",
       "[info] Threshold: 0.05",
@@ -259,9 +261,8 @@ const PINNED: Record<string, Outcome> = {
       "[info] State: listening",
       "[info] Listening: true",
       "[info] Paused: false",
-      "[info] Model: model (downloaded)",
+      "[info] Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
       "[info] Model dir: model",
-      "[info] Model SHA-256: 0000000000000000...",
       "[info] Audio device: (system default)",
       "[info] Input devices: none found",
       "[info] Threshold: 0.05",
@@ -310,9 +311,8 @@ const PINNED: Record<string, Outcome> = {
       "[info] State: listening",
       "[info] Listening: true",
       "[info] Paused: false",
-      "[info] Model: model (downloaded)",
+      "[info] Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
       "[info] Model dir: model",
-      "[info] Model SHA-256: 0000000000000000...",
       "[info] Audio device: (system default)",
       "[info] Input devices: none found",
       "[info] Threshold: 0.05",
@@ -361,9 +361,8 @@ const PINNED: Record<string, Outcome> = {
       "[info] State: listening",
       "[info] Listening: true",
       "[info] Paused: false",
-      "[info] Model: model (downloaded)",
+      "[info] Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
       "[info] Model dir: model",
-      "[info] Model SHA-256: 0000000000000000...",
       "[info] Audio device: (system default)",
       "[info] Input devices: none found",
       "[info] Threshold: 0.05",
@@ -413,9 +412,8 @@ const PINNED: Record<string, Outcome> = {
       "[info] State: listening",
       "[info] Listening: true",
       "[info] Paused: false",
-      "[info] Model: model (downloaded)",
+      "[info] Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
       "[info] Model dir: model",
-      "[info] Model SHA-256: 0000000000000000...",
       "[info] Audio device: (system default)",
       "[info] Input devices: none found",
       "[info] Threshold: 0.3",
@@ -477,9 +475,8 @@ const PINNED: Record<string, Outcome> = {
       "[info] State: listening",
       "[info] Listening: true",
       "[info] Paused: false",
-      "[info] Model: model (downloaded)",
+      "[info] Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
       "[info] Model dir: model",
-      "[info] Model SHA-256: 0000000000000000...",
       "[info] Audio device: (system default)",
       "[info] Input devices: none found",
       "[info] Threshold: 0.05",
@@ -537,9 +534,8 @@ const PINNED: Record<string, Outcome> = {
       "[info] State: listening",
       "[info] Listening: true",
       "[info] Paused: false",
-      "[info] Model: model (downloaded)",
+      "[info] Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
       "[info] Model dir: model",
-      "[info] Model SHA-256: 0000000000000000...",
       "[info] Audio device: (system default)",
       "[info] Input devices: none found",
       "[info] Threshold: 0.05",
@@ -621,7 +617,7 @@ describe("a configuration that switches no route off", () => {
   }
 });
 
-describe.runIf(MODEL_DIR)("a configuration that switches no route off, with the keyword spotting model", () => {
+describe("a configuration that switches no route off, with the keyword spotting model", () => {
   for (const configuration of CONFIGURATIONS) {
     it(`gives the pinned keyword lines: ${configuration.name}`, async () => {
       expect(await modelKeywordLines(configuration)).toEqual(MODEL_PINNED[configuration.name]);

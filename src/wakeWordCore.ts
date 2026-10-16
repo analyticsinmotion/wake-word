@@ -2407,7 +2407,7 @@ export function isVerboseLogLevel(level: number): boolean {
  * Replace the user's home directory with `~` wherever it appears in `text`.
  *
  * Diagnostics are meant to be pasted into an issue, and paths under the home
- * directory (the model's global storage, the installed extension) carry the
+ * directory (the installed extension and its model, global storage) carry the
  * account name. Only whole path segments match, so `/home/ann` does not
  * eat the start of `/home/anna`. A root or drive-only home would match every
  * path and is left alone.
@@ -2442,9 +2442,10 @@ export interface DiagnosticsInput {
   isListening: boolean;
   isPaused: boolean;
   modelName: string;
+  /** The model's directory in the installed extension. */
   modelDir: string;
-  modelPresent: boolean;
-  modelSha256: string;
+  /** What the check of the model's files found, in words. */
+  modelCheck: string;
   audioDevice: string;
   /** The engine's `--list-devices` answer. */
   devices: DeviceListing;
@@ -2507,9 +2508,8 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     `State: ${input.state}`,
     `Listening: ${input.isListening}`,
     `Paused: ${input.isPaused}`,
-    `Model: ${input.modelName} (${input.modelPresent ? "downloaded" : "not downloaded"})`,
+    `Model: ${input.modelName} (${input.modelCheck})`,
     `Model dir: ${input.modelDir}`,
-    `Model SHA-256: ${input.modelSha256.substring(0, 16)}...`,
     `Audio device: ${
       redactDeviceName(redactHome(input.audioDevice, input.homeDir, input.platform === "win32"), input.accountNames) ||
       "(system default)"

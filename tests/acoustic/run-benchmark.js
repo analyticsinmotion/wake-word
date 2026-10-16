@@ -22,7 +22,6 @@
  */
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const core = require('./lib/benchmark-core');
 const { modelPath } = require('./lib/model-path');
@@ -74,32 +73,18 @@ function listWavs(dir) {
 }
 
 /**
- * Find the model: the --model-dir given, otherwise the first editor global
- * storage directory that holds every model file.
+ * Find the model: the --model-dir given, otherwise the copy the package
+ * carries, in the repository's models/.
  */
 function resolveModelDir(explicit) {
-  const exists = (p) => fs.existsSync(p);
-  if (explicit) {
-    if (!core.hasModelFiles(explicit, exists)) {
-      throw new Error(
-        `--model-dir ${explicit} does not contain the model files (${core.MODEL_FILES.join(', ')}).`
-      );
-    }
-    return explicit;
-  }
-  const candidates = core.modelDirCandidates({ platform: process.platform, env: process.env, home: os.homedir() });
-  const found = candidates.find((dir) => core.hasModelFiles(dir, exists));
-  if (!found) {
+  const dir = explicit || core.bundledModelDir(repoDir);
+  if (!core.hasModelFiles(dir, (p) => fs.existsSync(p))) {
     throw new Error(
-      'No downloaded model found. Looked in:\n' +
-        candidates.map((c) => `  ${c}`).join('\n') +
-        '\nEither enable listening in the extension once so it downloads the model, ' +
-        'or pass --model-dir <path> pointing at an extracted copy of ' +
-        core.MODEL_NAME +
-        '.tar.gz (the URL is in src/sherpaEngine.ts).'
+      `${explicit ? `--model-dir ${explicit}` : dir} does not contain the model files ` +
+        `(${core.MODEL_FILES.join(', ')}).`
     );
   }
-  return found;
+  return dir;
 }
 
 function readFixture(file) {

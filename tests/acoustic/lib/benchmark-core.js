@@ -26,9 +26,9 @@ const CHUNK_SAMPLES = 1600;
 const DEFAULT_PHRASES = ['hey claude', 'hey chat', 'open chat', 'hey computer', 'open terminal'];
 
 /**
- * The model directory the extension downloads, and the files it needs.
- * Mirrors MODEL_NAME and MODEL_FILES in src/sherpaEngine.ts; the same test
- * checks these two against those.
+ * The model the package carries, in the repository's models/, and the files
+ * it needs. Mirrors KWS_MODEL in src/speechModel.ts; the same test checks
+ * these two against it.
  */
 const MODEL_NAME = 'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01';
 const MODEL_FILES = [
@@ -38,9 +38,6 @@ const MODEL_FILES = [
   'tokens.txt',
   'bpe.model',
 ];
-
-/** Editors whose global storage is searched for a downloaded model. */
-const EDITOR_DIRS = ['Code', 'Code - Insiders', 'Cursor', 'Windsurf', 'VSCodium'];
 
 // -- WAV ----------------------------------------------------------------
 
@@ -233,23 +230,9 @@ function resolveKeywords(defaults, fixturePhrases, override) {
 
 // -- Model location -----------------------------------------------------
 
-/**
- * Where the extension may have put the model on this machine: one
- * candidate per editor, under that editor's global storage for this
- * extension. The first candidate holding every model file wins.
- */
-function modelDirCandidates({ platform, env, home }) {
-  let base;
-  if (platform === 'win32') {
-    base = env.APPDATA || path.join(home, 'AppData', 'Roaming');
-  } else if (platform === 'darwin') {
-    base = path.join(home, 'Library', 'Application Support');
-  } else {
-    base = env.XDG_CONFIG_HOME || path.join(home, '.config');
-  }
-  return EDITOR_DIRS.map((editor) =>
-    path.join(base, editor, 'User', 'globalStorage', 'analytics-in-motion.wake-word', 'sherpa-onnx', MODEL_NAME)
-  );
+/** Where the model is in the repository whose root is `repoDir`: the copy the package carries. */
+function bundledModelDir(repoDir) {
+  return path.join(repoDir, 'models', MODEL_NAME);
 }
 
 /** True when every model file is present under `dir`. */
@@ -262,7 +245,7 @@ function hasModelFiles(dir, exists) {
 const USAGE = [
   'Usage: node tests/acoustic/run-benchmark.js [options]',
   '',
-  '  --model-dir <path>   Model directory. Default: search each editor\'s global storage.',
+  '  --model-dir <path>   Model directory. Default: the model in the repository\'s models/.',
   '  --threshold <n>      Keyword threshold, 0.01 to 0.9. Default: 0.05.',
   '  --phrases <list>     Comma-separated keyword list. Default: the default routes',
   '                       plus every phrase a positive fixture names.',
@@ -513,7 +496,6 @@ module.exports = {
   DEFAULT_PHRASES,
   MODEL_NAME,
   MODEL_FILES,
-  EDITOR_DIRS,
   USAGE,
   parseWav,
   encodeWav,
@@ -521,7 +503,7 @@ module.exports = {
   chunks,
   expectedPhrase,
   resolveKeywords,
-  modelDirCandidates,
+  bundledModelDir,
   hasModelFiles,
   parseArgs,
   mean,

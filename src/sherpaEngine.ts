@@ -1,25 +1,10 @@
 import { EventEmitter } from "events";
 import { spawn, ChildProcess, execFile } from "child_process";
-import { createHash } from "crypto";
-import {
-  accessSync,
-  chmodSync,
-  constants,
-  existsSync,
-  mkdirSync,
-  createWriteStream,
-  writeFileSync,
-  readFileSync,
-  unlinkSync,
-} from "fs";
-import type { ClientRequest, IncomingMessage } from "http";
+import { accessSync, chmodSync, constants, existsSync } from "fs";
 import * as path from "path";
-import * as https from "https";
-import { pipeline } from "stream/promises";
-import * as vscode from "vscode";
 import { buildKeywordSpec, skippedPhraseWarning } from "./keywords";
 import { EngineRestart, ISpeechEngine, WakePhrase } from "./speechEngineInterface";
-import { extractTarGz } from "./tarExtract";
+import { KWS_MODEL, checkModel, modelDirectory, modelProblemMessage } from "./speechModel";
 import { Tokeniser, loadTokeniser } from "./tokeniser";
 import {
   DEFAULT_THRESHOLD,
@@ -37,7 +22,9 @@ import {
  *
  * Spawns the engine as a child process: the native binary packaged in bin/,
  * which finds ONNX Runtime and the voice activity model beside itself and
- * needs nothing installed.
+ * needs nothing installed. The keyword spotting model is packaged too, under
+ * models/, and its files are checked before the first start of a session
+ * (see speechModel.ts), so a start needs no network access.
  *
  * Before spawning, the phrases are cleaned up and tokenised here (see
  * keywords.ts and tokeniser.ts), and the config line carries the finished
@@ -164,7 +151,6 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
    * system grants to the editor that started it.
    */
   constructor(
-    private readonly context: vscode.ExtensionContext,
     private readonly audioDevice: string = "",
     private readonly editorName: string = ""
   ) {
@@ -248,32 +234,30 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     this.currentThreshold = safeThreshold;
     this.currentDebugMode = debugMode;
 
-    // Ensure model is downloaded
-    let modelDir: string;
-    try {
-      modelDir = await ensureModel(this.context, (msg: string) => this.detail(msg));
-    } catch (err: unknown) {
-      if (generation !== this.startGeneration) {
-        // Stopped or superseded during the check: whatever the download
-        // came to is no longer this start's to report.
-        this.emit("debug", "Start abandoned: stopped during the model check");
-      } else if (err instanceof DownloadCancelledError) {
-        this.cancelStart();
-      } else {
-        const message = err instanceof Error ? err.message : String(err);
-        this.fail(new Error("Model unavailable: " + message));
-      }
-      return;
-    }
+    // The model ships in the package, beside bin/. Its files are read and
+    // checked against their pinned digests on the first start of a session,
+    // and the result is kept while they pass: see checkModel().
+    const modelDir = modelDirectory(path.dirname(__dirname));
+    const checkingSince = Date.now();
+    const modelProblem = await checkModel(modelDir);
 
     // A stop() or a newer start() landed while the check above was in
     // flight. Neither found a child to deal with, because there was none
     // yet, so this start has to be the one that stands down: spawning now
     // would reopen the microphone after a Disable, or put two children on
-    // it after a second start.
+    // it after a second start. Whatever the check found is no longer this
+    // start's to report.
     if (generation !== this.startGeneration) {
       this.emit("debug", "Start abandoned: stopped during the model check");
       return;
+    }
+    if (modelProblem) {
+      this.fail(new Error(modelProblemMessage(modelProblem)));
+      return;
+    }
+    if (this.currentDebugMode) {
+      this.detail(`Model: ${modelDir}, ${KWS_MODEL.files.length} files checked against their pinned SHA-256`);
+      this.detail(`Timing: model-check ${Math.max(0, Date.now() - checkingSince)}ms`);
     }
 
     // Reading the tokeniser's model is the one wait here; it happens once
@@ -453,19 +437,6 @@ export class SherpaEngine extends EventEmitter implements ISpeechEngine {
     this.hasListened = false;
     this.retryCount = 0;
     this.emit("error", error);
-  }
-
-  /**
-   * The user cancelled the start from the model download's progress
-   * notification. Nothing failed: `cancelled` tells the extension, which
-   * turns listening off, and the next start is free to download again.
-   */
-  private cancelStart(): void {
-    this._isStarting = false;
-    this.restartState = null;
-    this.hasListened = false;
-    this.retryCount = 0;
-    this.emit("cancelled");
   }
 
   /**
@@ -1076,446 +1047,4 @@ export function listInputDevices(binary: string, timeoutMs = 5000): Promise<Devi
       resolve(parseDeviceListing(String(stdout), err ? `the engine could not list them: ${err.message}` : undefined));
     });
   });
-}
-
-// ── Model management ─────────────────────────────────────────
-
-const MODEL_VERSION = "1";
-/** Exported for tests/acoustic, which carries its own copy and checks it against this. */
-export const MODEL_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
-/**
- * The model archive, from the `model-v1` release of the Wake Word repository.
- *
- * sherpa-onnx publishes this model as `.tar.bz2`; the release carries it
- * repacked as `.tar.gz`, which extractTarGz() reads with Node.js's own zlib
- * instead of a system `tar`. Every file inside is byte-identical to the
- * sherpa-onnx archive, so MODEL_VERSION did not change with it.
- */
-export const MODEL_URL =
-  "https://github.com/analyticsinmotion/wake-word/releases/download/model-v1/" +
-  MODEL_NAME + ".tar.gz";
-
-/**
- * SHA-256 of the model archive at MODEL_URL (17,272,719 bytes).
- *
- * The download follows HTTP redirects to a CDN host and the result is fed
- * straight into the keyword spotter, so nothing but this digest stands
- * between a hijacked redirect and a model of someone else's choosing loading
- * on the user's machine. Recompute and update this whenever MODEL_URL or
- * MODEL_VERSION changes:
- *
- *   curl -L -o model.tar.gz "<MODEL_URL>"
- *   shasum -a 256 model.tar.gz      # certutil -hashfile model.tar.gz SHA256
- */
-export const MODEL_SHA256 =
-  "2f3eccc60f6db87053f9fa32cd5749ff674e692520065e54ac0d86aeace731e0";
-
-/**
- * Redirect hops the model download will follow before giving up.
- *
- * GitHub answers a release asset with one 302 to a CDN host, so at least one
- * hop is required. The cap stops a redirect loop from recursing until the
- * extension host runs out of stack.
- */
-export const MAX_REDIRECTS = 5;
-
-export const MODEL_FILES = [
-  "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-  "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-  "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-  "tokens.txt",
-  "bpe.model",
-];
-
-/**
- * True when an HTTP response is a redirect the downloader should follow.
- *
- * GitHub release assets answer with a 302 to a CDN host, so the model
- * download has to follow at least one hop to reach the tarball.
- */
-export function shouldFollowRedirect(
-  statusCode: number | undefined,
-  location: string | undefined
-): boolean {
-  return (
-    statusCode !== undefined &&
-    statusCode >= 300 &&
-    statusCode < 400 &&
-    typeof location === "string" &&
-    location.length > 0
-  );
-}
-
-/** True once the downloader has followed as many redirects as it will. */
-export function redirectLimitExceeded(hops: number, max: number = MAX_REDIRECTS): boolean {
-  return hops >= max;
-}
-
-/**
- * How long the model download waits for data before it gives up: from the
- * request to the response, and between one chunk of the body and the next.
- *
- * It is a limit on silence, not on the whole download, so a slow connection
- * that keeps delivering is never cut off, however long the 17 MB takes. A
- * working connection is not silent for this long: a request is answered in
- * well under a second, and even a few kilobytes a second means a chunk every
- * second or two. Half a minute leaves room for a slow first connection, a
- * proxy, or a network switch mid-download, and is still short enough that a
- * stalled download is reported while the progress notification is on screen.
- */
-export const DOWNLOAD_INACTIVITY_MS = 30_000;
-
-/** The user cancelled the model download from its progress notification. */
-export class DownloadCancelledError extends Error {
-  constructor() {
-    super("The speech model download was cancelled.");
-    this.name = "DownloadCancelledError";
-  }
-}
-
-/** Where and how the model is downloaded from. Tests replace it with a local server. */
-export interface DownloadSource {
-  url: string;
-  /** `https.get`, or `http.get` for a server on the loopback interface. */
-  get: (url: string, callback: (res: IncomingMessage) => void) => ClientRequest;
-  /** See DOWNLOAD_INACTIVITY_MS. */
-  inactivityMs: number;
-}
-
-export const MODEL_SOURCE: DownloadSource = {
-  url: MODEL_URL,
-  get: (url, callback) => https.get(url, callback),
-  inactivityMs: DOWNLOAD_INACTIVITY_MS,
-};
-
-/** How downloadFile() reports progress, cancellation aside. */
-export interface DownloadOptions {
-  get: DownloadSource["get"];
-  inactivityMs: number;
-  /** Aborting it cancels the download: it rejects with DownloadCancelledError. */
-  signal?: AbortSignal;
-  /** Called for each chunk of the body, with the running total and the Content-Length, 0 if none. */
-  onData?: (received: number, total: number, chunk: number) => void;
-}
-
-/**
- * Download `url` to `dest`, following redirects up to MAX_REDIRECTS.
- *
- * It gives up when no data arrives for `inactivityMs`, whether the server
- * never answers or stops part way, and it stops when `signal` is aborted. Any
- * failure removes what was written to `dest`, once the file is closed:
- * Windows will not delete a file that is still open. A later download starts
- * from nothing.
- */
-export function downloadFile(url: string, dest: string, options: DownloadOptions): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    if (options.signal?.aborted) {
-      reject(new DownloadCancelledError());
-      return;
-    }
-
-    const file = createWriteStream(dest);
-    let request: ClientRequest | null = null;
-    let response: IncomingMessage | null = null;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let settled = false;
-
-    const stopTimer = (): void => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-
-    const armTimer = (): void => {
-      stopTimer();
-      timer = setTimeout(() => {
-        const seconds = Math.max(1, Math.round(options.inactivityMs / 1000));
-        fail(
-          new Error(
-            `no data arrived for ${seconds} second${seconds === 1 ? "" : "s"}, so the download was stopped. ` +
-              "Check the network connection and enable listening to try again."
-          )
-        );
-      }, options.inactivityMs);
-    };
-
-    const onAbort = (): void => fail(new DownloadCancelledError());
-
-    function finish(): void {
-      stopTimer();
-      options.signal?.removeEventListener("abort", onAbort);
-    }
-
-    function fail(error: Error): void {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      finish();
-      response?.destroy();
-      request?.destroy();
-      const removePartial = (): void => {
-        try {
-          unlinkSync(dest);
-        } catch {
-          // Nothing was written, or it is already gone.
-        }
-        reject(error);
-      };
-      if (file.closed) {
-        removePartial();
-      } else {
-        file.once("close", removePartial);
-        file.destroy();
-      }
-    }
-
-    function get(target: string, hops: number): void {
-      armTimer();
-      const req = options.get(target, (res) => {
-        if (settled) {
-          res.resume();
-          return;
-        }
-        if (shouldFollowRedirect(res.statusCode, res.headers.location)) {
-          res.resume();
-          if (redirectLimitExceeded(hops)) {
-            fail(new Error(`Too many redirects (over ${MAX_REDIRECTS}) downloading model`));
-            return;
-          }
-          get(new URL(res.headers.location as string, target).toString(), hops + 1);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          res.resume();
-          fail(new Error(`HTTP ${res.statusCode} downloading model`));
-          return;
-        }
-        response = res;
-        armTimer();
-        const total = parseInt(res.headers["content-length"] || "0", 10);
-        let received = 0;
-        res.on("data", (chunk: Buffer) => {
-          armTimer();
-          received += chunk.length;
-          options.onData?.(received, total, chunk.length);
-        });
-        pipeline(res, file).then(
-          () => {
-            if (!settled) {
-              settled = true;
-              finish();
-              resolve();
-            }
-          },
-          (err: unknown) => fail(err instanceof Error ? err : new Error(String(err)))
-        );
-      });
-      request = req;
-      req.on("error", (err) => fail(err));
-    }
-
-    file.on("error", (err) => fail(err));
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    get(url, 0);
-  });
-}
-
-/**
- * Throw unless the downloaded archive matches the expected digest.
- *
- * Runs before extraction, so a tampered or truncated download never reaches
- * the extractor and never reaches the keyword spotter. The message carries a
- * prefix of each digest: enough to tell a corrupted download from a
- * substituted one in a bug report, without a wall of hex in a notification.
- */
-export function verifyModelHash(actual: string, expected: string = MODEL_SHA256): void {
-  if (actual.toLowerCase() !== expected.toLowerCase()) {
-    throw new Error(
-      "Model integrity check failed. Expected SHA-256 " +
-        `${expected.substring(0, 16)}..., got ${actual.substring(0, 16)}...: ` +
-        "the download may be corrupted or tampered with."
-    );
-  }
-}
-
-/** Where the model lives in global storage, and whether a usable copy is there. */
-export interface ModelStatus {
-  dir: string;
-  versionFile: string;
-  /** Every model file exists and the version file matches MODEL_VERSION. */
-  present: boolean;
-}
-
-/**
- * Check for the model without downloading it. ensureModel() uses this before
- * it decides to download, and Show Diagnostics uses it to report the model.
- */
-export function modelStatus(storagePath: string): ModelStatus {
-  const dir = path.join(storagePath, "sherpa-onnx", MODEL_NAME);
-  const versionFile = path.join(storagePath, "sherpa-onnx", "version.txt");
-
-  const allFilesPresent = MODEL_FILES.every((f) => existsSync(path.join(dir, f)));
-  let present = false;
-  if (allFilesPresent && existsSync(versionFile)) {
-    try {
-      present = readFileSync(versionFile, "utf8").trim() === MODEL_VERSION;
-    } catch {
-      present = false;
-    }
-  }
-
-  return { dir, versionFile, present };
-}
-
-/**
- * Downloads in flight, by storage directory. A second start while the first
- * is still downloading, after a Disable and an Enable for instance, waits for
- * the same download instead of writing a second copy over the first.
- */
-const downloads = new Map<string, Promise<string>>();
-
-/**
- * Ensure the KWS model is downloaded to globalStorage.
- * Returns the path to the model directory.
- *
- * `source` is where the archive comes from; tests replace it with a server of
- * their own.
- */
-export async function ensureModel(
-  context: vscode.ExtensionContext,
-  debugLog?: (msg: string) => void,
-  source: DownloadSource = MODEL_SOURCE
-): Promise<string> {
-  const storagePath = context.globalStorageUri.fsPath;
-  const model = modelStatus(storagePath);
-
-  if (model.present) {
-    debugLog?.("Model already present at " + model.dir);
-    return model.dir;
-  }
-
-  const inFlight = downloads.get(storagePath);
-  if (inFlight) {
-    debugLog?.("Model download already in progress: waiting for it");
-    return inFlight;
-  }
-
-  // Model missing or outdated: download it.
-  const download = downloadModel(model.dir, model.versionFile, source, debugLog).finally(() => {
-    downloads.delete(storagePath);
-  });
-  downloads.set(storagePath, download);
-  return download;
-}
-
-async function downloadModel(
-  modelDir: string,
-  versionFile: string,
-  source: DownloadSource,
-  debugLog?: (msg: string) => void
-): Promise<string> {
-  return vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Wake Word: Downloading speech model (~17MB)...",
-      cancellable: true,
-    },
-    async (progress, token) => {
-      const storageDir = path.dirname(modelDir);
-      mkdirSync(storageDir, { recursive: true });
-
-      debugLog?.("Downloading model from " + source.url);
-      progress.report({ message: "Connecting..." });
-
-      const tarballPath = path.join(storageDir, MODEL_NAME + ".tar.gz");
-
-      // Cancel on the notification stops the download where it is.
-      const abort = new AbortController();
-      const cancellation = token.onCancellationRequested(() => abort.abort());
-      try {
-        // GitHub answers a release asset with a redirect to a CDN host.
-        await downloadFile(source.url, tarballPath, {
-          get: source.get,
-          inactivityMs: source.inactivityMs,
-          signal: abort.signal,
-          onData: (received, total, chunk) => {
-            if (total > 0) {
-              progress.report({
-                message: `${Math.round((received / total) * 100)}%`,
-                increment: (chunk / total) * 100,
-              });
-            }
-          },
-        });
-      } finally {
-        cancellation.dispose();
-      }
-
-      // A Cancel that lands once the last byte is in still counts: nothing
-      // has been extracted yet, and the archive is removed with it.
-      if (token.isCancellationRequested) {
-        try {
-          unlinkSync(tarballPath);
-        } catch {
-          // non-fatal
-        }
-        throw new DownloadCancelledError();
-      }
-
-      // Verify before extraction. The download followed redirects to a CDN
-      // host and the files inside are loaded straight into the keyword
-      // spotter, so a bad archive must never reach the extractor.
-      progress.report({ message: "Verifying..." });
-      const actualHash = createHash("sha256").update(readFileSync(tarballPath)).digest("hex");
-      debugLog?.("Model SHA-256: " + actualHash);
-      try {
-        verifyModelHash(actualHash);
-      } catch (err) {
-        // Leaving a rejected tarball on disk would have the next attempt
-        // resume against a file that is already known bad.
-        try {
-          unlinkSync(tarballPath);
-        } catch {
-          // non-fatal
-        }
-        throw err;
-      }
-
-      progress.report({ message: "Extracting..." });
-      debugLog?.("Extracting " + tarballPath);
-
-      // version.txt marks a complete extraction, and this one writes over the
-      // files of any earlier one in place. Remove it first, so an extraction
-      // that fails part way cannot leave half-written files that
-      // modelStatus() takes for a complete model.
-      if (existsSync(versionFile)) {
-        unlinkSync(versionFile);
-      }
-
-      // The archive's entries are all under a single MODEL_NAME directory, so
-      // this lands on modelDir directly. No system tar is involved: see
-      // tarExtract.ts.
-      try {
-        await extractTarGz(tarballPath, storageDir);
-      } catch (err: unknown) {
-        const detail = err instanceof Error ? err.message : String(err);
-        throw new Error(`Could not extract the speech model: ${detail}`, { cause: err });
-      }
-
-      // Write version file
-      writeFileSync(versionFile, MODEL_VERSION, "utf8");
-
-      // Clean up tarball
-      try {
-        unlinkSync(tarballPath);
-      } catch {
-        // non-fatal
-      }
-
-      debugLog?.("Model ready at " + modelDir);
-      return modelDir;
-    }
-  );
 }

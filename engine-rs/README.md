@@ -325,8 +325,9 @@ repository root reads the `.vsix` and fails unless:
   enough.
 
 The workflows then run `scripts/drive-protocol.mjs --no-microphone` against
-the unpacked binary, with the keyword spotting model downloaded and checked
-by `scripts/fetch-model.mjs` at the repository root. The scenarios that open
+the unpacked binary, with the keyword spotting model checked against its pins
+and copied out of the repository's `models/` by `scripts/fetch-model.mjs` at
+the repository root. The scenarios that open
 a microphone are skipped. The rest include loading the spotter and then a
 Silero session in one process, which puts both ONNX Runtimes in it. On Linux
 the workflow also fails if `nm -D --defined-only` finds a symbol matching
@@ -354,23 +355,15 @@ or publishes anything.
 
 ## The keyword spotting model
 
-`modelDir` in the config line is the extracted
+`modelDir` in the config line is the
 `sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01` directory. The engine
 reads four files from it: the three int8 networks and `tokens.txt`. The
 directory also holds `bpe.model`, the SentencePiece model the extension
-tokenises the phrases with. The extension downloads and verifies the archive (`MODEL_URL` and
-`MODEL_SHA256` in `src/sherpaEngine.ts`) the first time listening is enabled,
-so for local development the directory is already in the editor's global
-storage once the extension has run:
-
-| Platform | Location |
-| --- | --- |
-| Windows | `%APPDATA%\Code\User\globalStorage\analytics-in-motion.wake-word\sherpa-onnx\` |
-| macOS | `~/Library/Application Support/Code/User/globalStorage/analytics-in-motion.wake-word/sherpa-onnx/` |
-| Linux | `~/.config/Code/User/globalStorage/analytics-in-motion.wake-word/sherpa-onnx/` |
-
-Otherwise download the archive from `MODEL_URL`, check it against
-`MODEL_SHA256`, and extract it anywhere.
+tokenises the phrases with. The model ships in the extension package, and the
+repository keeps the same files in
+`models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01/`, each pinned
+by size and SHA-256 in `src/speechModel.ts`, so for local development
+`WAKE_WORD_MODEL_DIR` and the config line's `modelDir` can point there.
 
 ## ONNX Runtime and the Silero model
 

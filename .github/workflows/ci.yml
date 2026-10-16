@@ -62,10 +62,10 @@ jobs:
       - name: Compile
         run: npm run compile
 
-      # The keyword spotting model the extension downloads, 17 MB, cached by
-      # its pinned digest. With it, the tests that check the tokeniser against
-      # the real model run instead of being skipped, and so do the engine
-      # scenarios below that load the spotter.
+      # The keyword spotting model the package carries: models/ checked against
+      # its pinned digests and copied out, under a cache key made from them.
+      # The tests that check the tokeniser against the real model read it, and
+      # so do the engine scenarios below that load the spotter.
       - name: Model cache key
         id: model-key
         shell: bash

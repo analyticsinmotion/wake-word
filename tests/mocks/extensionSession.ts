@@ -193,12 +193,18 @@ export async function startSession(options: SessionOptions): Promise<Session> {
         engines.push(this);
       }
     },
-    MODEL_NAME: "model",
-    MODEL_SHA256: "0".repeat(64),
-    modelStatus: () => ({ dir: "model", versionFile: "version.txt", present: true }),
     nativeEnginePath: () => "wake-word-engine",
     probeNativeEngine: () => Promise.resolve("self-test OK"),
     listInputDevices: () => Promise.resolve({ kind: "listed", devices: [] }),
+  }));
+  // The bundled model passes its check, and there is no downloaded copy to
+  // remove. Its directory is a name with no separator, so a pinned report
+  // reads the same on every platform.
+  vi.doMock("../../src/speechModel", async () => ({
+    ...(await vi.importActual<typeof import("../../src/speechModel")>("../../src/speechModel")),
+    modelDirectory: () => "model",
+    checkModel: () => Promise.resolve(null),
+    removeDownloadedModel: () => Promise.resolve({ files: 0, bytes: 0 }),
   }));
   const lock = { held: false, releases: 0 };
   vi.doMock("../../src/lockFile", () => ({

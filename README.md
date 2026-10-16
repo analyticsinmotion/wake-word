@@ -43,7 +43,7 @@ https://github.com/user-attachments/assets/fb007095-5c4c-4927-aaa6-fa76550d7cb2
 
 ## How It Works
 
-1. Install the extension. A local speech model (~17MB) is downloaded on first use and cached.
+1. Install the extension. The speech model is included, so there is nothing to download.
 2. When your editor opens, the extension starts listening on your microphone
 3. Audio is processed locally -- through voice activity detection and keyword spotting -- and matched against your configured wake phrases
 4. If a phrase is detected, the extension **releases the mic** and then fires the mapped command
@@ -328,7 +328,7 @@ The log and the report never contain audio or anything you said, and device name
 
 ## Privacy
 
-All speech recognition runs locally on your machine. No audio data ever leaves your device. Nothing is recorded, stored, or transmitted. The only network request the extension makes is the one-time download of the speech model from GitHub.
+All speech recognition runs locally on your machine. No audio data ever leaves your device. Nothing is recorded, stored, or transmitted. Wake Word makes no network requests: the speech model comes with the extension.
 
 ## Dependencies
 

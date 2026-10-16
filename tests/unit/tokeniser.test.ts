@@ -3,6 +3,7 @@ import { readFile } from "fs/promises";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_ROUTES } from "../../src/extension";
 import { WORD_BOUNDARY, buildKeywordSpec, decodePieces, skippedPhraseWarning } from "../../src/keywords";
+import { modelDirectory } from "../../src/speechModel";
 import { Tokeniser, loadTokeniser, parseTokenTable, parseTokeniser } from "../../src/tokeniser";
 import { CategoryDigest, buildCorpus, digestCategory } from "./tokeniserCorpus";
 
@@ -10,10 +11,10 @@ import { CategoryDigest, buildCorpus, digestCategory } from "./tokeniserCorpus";
  * The tokeniser: reading bpe.model and tokens.txt, the search for the best
  * split, and the loader's cache. The models here are built in memory, and
  * readFile is wrapped so that a test can hand the loader files that are not
- * on disk. With WAKE_WORD_MODEL_DIR naming the extracted keyword spotting
- * model, the tests at the end check its pieces: a pinned table, the default
- * routes' keyword lines, and a digest of every input of the corpus in
- * tokeniserCorpus.ts. They are skipped without it.
+ * on disk. The tests at the end check the pieces of the keyword spotting
+ * model the package carries, in models/, or of the copy WAKE_WORD_MODEL_DIR
+ * names: a pinned table, the default routes' keyword lines, and a digest of
+ * every input of the corpus in tokeniserCorpus.ts.
  */
 
 const fakeFiles = vi.hoisted(() => new Map<string, Buffer>());
@@ -33,7 +34,8 @@ vi.mock("fs/promises", async (importOriginal) => {
 });
 
 const B = WORD_BOUNDARY;
-const MODEL_DIR = process.env.WAKE_WORD_MODEL_DIR;
+/** The model the package carries, or the copy WAKE_WORD_MODEL_DIR names. */
+const MODEL_DIR = process.env.WAKE_WORD_MODEL_DIR || modelDirectory(path.join(__dirname, "..", ".."));
 
 // -- Models built in memory ------------------------------------------------
 
@@ -402,8 +404,8 @@ const CORPUS_DIGESTS: Record<string, CategoryDigest> = {
   },
 };
 
-describe.runIf(MODEL_DIR)("with the keyword spotting model", () => {
-  const modelDir = MODEL_DIR as string;
+describe("with the keyword spotting model", () => {
+  const modelDir = MODEL_DIR;
   const spec = async (phrases: Array<{ phrase: unknown; confidenceThreshold?: unknown }>) => {
     const tokeniser = await loadTokeniser(modelDir);
     return buildKeywordSpec(phrases, (text) => tokeniser.encode(text), 0.05, tokeniser.vocabulary);

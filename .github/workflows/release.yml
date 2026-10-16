@@ -68,7 +68,7 @@ jobs:
           cargo fmt --check
 
       # Packaging compiles too; this is earlier because the model fetch below
-      # uses the extension's own archive extraction from dist/.
+      # reads the model's pins from dist/.
       - name: Compile
         run: npm run compile
 

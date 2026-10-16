@@ -17,6 +17,9 @@
  *     and on macOS and Linux is stored executable;
  *   - ONNX Runtime and the Silero model are present beside it, byte for byte
  *     the pinned files, with their license notices;
+ *   - the keyword spotting model, which the extension reads from the package,
+ *     is present under models/, each of its files byte for byte the one
+ *     pinned in src/speechModel.ts, and nothing else is there;
  *   - Windows: the binary imports no C runtime DLL, because it links the
  *     static runtime the sherpa-onnx libraries are built against, and does not
  *     import ONNX Runtime, which it loads by path; no Visual C++ runtime
@@ -35,11 +38,15 @@
  *
  * The package is unpacked into <dir>, with file modes restored as the editor
  * restores them on install, so later steps can drive the packaged binary.
+ *
+ * The model's pins are read from dist/speechModel.js, which packaging
+ * compiles from the same source as the package's own copy.
  */
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -293,6 +300,16 @@ export function onnxRuntimeExports(info) {
 
 // ── Checks ───────────────────────────────────────────────────────────────
 
+/** KWS_MODEL and MODELS_DIR as src/speechModel.ts defines them, from the compiled module. */
+function bundledModel() {
+  const compiled = fileURLToPath(new URL('../dist/speechModel.js', import.meta.url));
+  if (!existsSync(compiled)) {
+    throw new Error(`${compiled} does not exist; run "npm run compile" first`);
+  }
+  const { KWS_MODEL, MODELS_DIR } = createRequire(import.meta.url)(compiled);
+  return { model: KWS_MODEL, modelsDir: MODELS_DIR, dir: `${MODELS_DIR}/${KWS_MODEL.name}` };
+}
+
 function option(name) {
   const index = process.argv.indexOf(name);
   return index === -1 ? undefined : process.argv[index + 1];
@@ -334,6 +351,7 @@ function main() {
   const expected = EXPECTED[target];
   const exe = engineFileName(target);
   const ort = RUNTIME_FILES.onnxRuntime[target].library;
+  const bundled = bundledModel();
   const report = new Report();
 
   const zip = readFileSync(vsix);
@@ -387,6 +405,32 @@ function main() {
       checkArchitecture(report, ort.to, ortInfo, expected);
     }
   }
+
+  // The keyword spotting model, byte for byte, and nothing else beside it.
+  const modelEntry = (file) => `extension/${bundled.dir}/${file.name}`;
+  for (const file of bundled.model.files) {
+    const entry = entries.get(modelEntry(file));
+    if (!entry) {
+      report.fail(`${modelEntry(file)} is packaged`);
+      continue;
+    }
+    const content = zipRead(zip, entry);
+    const digest = createHash('sha256').update(content).digest('hex');
+    report.check(
+      content.length === file.bytes && digest === file.sha256,
+      `${modelEntry(file)} is the pinned file (${file.bytes} bytes)`,
+      `${content.length} bytes, SHA-256 ${digest}, expected ${file.bytes} bytes, SHA-256 ${file.sha256}`
+    );
+  }
+  const modelFiles = new Set(bundled.model.files.map(modelEntry));
+  const strays = [...entries.keys()].filter(
+    (name) => name.startsWith(`extension/${bundled.modelsDir}/`) && !name.endsWith('/') && !modelFiles.has(name)
+  );
+  report.check(
+    strays.length === 0,
+    `nothing but the model's ${bundled.model.files.length} files is packaged under extension/${bundled.modelsDir}/`,
+    `${strays.length} other files, the first ${strays[0]}`
+  );
 
   // The Visual C++ runtime on Windows. It is not part of Windows and is not
   // packaged: the installation notes name the redistributable as a
@@ -539,6 +583,12 @@ function main() {
   for (const entry of entries.values()) {
     if (entry.name.startsWith(`extension/${PACKAGE_DIR}/`)) {
       console.log(`  ${entry.name}  ${entry.size} bytes  mode ${(entry.mode & 0o7777).toString(8)}`);
+    }
+  }
+  console.log('\nPackaged model files:');
+  for (const entry of entries.values()) {
+    if (entry.name.startsWith(`extension/${bundled.dir}/`)) {
+      console.log(`  ${entry.name}  ${entry.size} bytes, ${entry.compressedSize} compressed`);
     }
   }
   console.log(`\n${path.basename(vsix)}: ${statSync(vsix).size} bytes`);

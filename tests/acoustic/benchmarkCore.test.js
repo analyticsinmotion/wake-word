@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import * as os from 'os';
+import * as fs from 'fs';
 import * as path from 'path';
 import {
   CHUNK_SAMPLES,
   DEFAULT_PHRASES,
   MODEL_FILES,
   SAMPLE_RATE,
+  bundledModelDir,
   checkFormat,
   chunks,
   encodeWav,
@@ -14,7 +15,6 @@ import {
   formatReport,
   hasModelFiles,
   median,
-  modelDirCandidates,
   parseArgs,
   parseWav,
   percentile,
@@ -226,33 +226,16 @@ describe('resolveKeywords', () => {
   });
 });
 
-describe('modelDirCandidates', () => {
-  it('uses APPDATA on Windows', () => {
-    const dirs = modelDirCandidates({ platform: 'win32', env: { APPDATA: 'C:\\Users\\me\\AppData\\Roaming' }, home: 'C:\\Users\\me' });
-    expect(dirs[0]).toBe(
-      path.join('C:\\Users\\me\\AppData\\Roaming', 'Code', 'User', 'globalStorage', 'analytics-in-motion.wake-word', 'sherpa-onnx', 'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01')
+describe('bundledModelDir', () => {
+  it('is the model the package carries, in the repository\'s models/', () => {
+    expect(bundledModelDir('/repo')).toBe(
+      path.join('/repo', 'models', 'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01')
     );
   });
 
-  it('falls back to AppData/Roaming under home when APPDATA is unset', () => {
-    const dirs = modelDirCandidates({ platform: 'win32', env: {}, home: 'C:\\Users\\me' });
-    expect(dirs[0].startsWith(path.join('C:\\Users\\me', 'AppData', 'Roaming', 'Code'))).toBe(true);
-  });
-
-  it('uses Application Support on macOS', () => {
-    const dirs = modelDirCandidates({ platform: 'darwin', env: {}, home: '/Users/me' });
-    expect(dirs[0].startsWith(path.join('/Users/me', 'Library', 'Application Support', 'Code'))).toBe(true);
-  });
-
-  it('uses XDG_CONFIG_HOME, then ~/.config, on Linux', () => {
-    expect(modelDirCandidates({ platform: 'linux', env: { XDG_CONFIG_HOME: '/xdg' }, home: '/home/me' })[0].startsWith(path.join('/xdg', 'Code'))).toBe(true);
-    expect(modelDirCandidates({ platform: 'linux', env: {}, home: '/home/me' })[0].startsWith(path.join('/home/me', '.config', 'Code'))).toBe(true);
-  });
-
-  it('lists one candidate per editor', () => {
-    const dirs = modelDirCandidates({ platform: 'linux', env: {}, home: os.homedir() });
-    expect(dirs.length).toBeGreaterThanOrEqual(4);
-    expect(new Set(dirs).size).toBe(dirs.length);
+  it('holds every model file in this repository', () => {
+    const dir = bundledModelDir(path.join(__dirname, '..', '..'));
+    expect(hasModelFiles(dir, (p) => fs.existsSync(p))).toBe(true);
   });
 });
 

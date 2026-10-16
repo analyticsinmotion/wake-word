@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventEmitter } from "events";
+import * as path from "path";
+import { KWS_MODEL } from "../../src/speechModel";
 import type { InstalledExtension } from "../../src/wakeWordCore";
 import { LEVEL, createLogChannel } from "../mocks/logChannel";
 import type { EngineRestart, WakePhrase } from "../../src/speechEngineInterface";
@@ -8,9 +10,10 @@ import type { EngineRestart, WakePhrase } from "../../src/speechEngineInterface"
  * What the status bar shows while the extension runs, driven through
  * activate() with the `vscode` module stubbed per session, a fake engine in
  * place of SherpaEngine, and a fake listener lock: the start, a pause for
- * focus, a handoff, a restart after the engine stopped, a failure, a
- * cancelled download, and a Calibrate run put back. Also the remote-window
- * availability rule and the editor's name, which reach the engine from here.
+ * focus, a handoff, a restart after the engine stopped, a failure, and a
+ * Calibrate run put back. Also the remote-window availability rule and the
+ * editor's name, which reach the engine from here, the bundled model in Show
+ * Diagnostics, and the removal of a copy an earlier version downloaded.
  *
  * After every step the fake engine says whether its microphone is open, and
  * the status bar is checked against it: Listening only while it is.
@@ -35,7 +38,6 @@ interface FakeEngine extends EventEmitter {
   ready(): void;
   crash(reason: string, attempt?: number): void;
   fail(message: string): void;
-  cancel(): void;
 }
 
 const engines = vi.hoisted(() => [] as FakeEngine[]);
@@ -123,10 +125,6 @@ vi.mock("../../src/sherpaEngine", async () => {
       this.restarting = null;
       this.emit("error", new Error(message));
     }
-    cancel(): void {
-      this.isStarting = false;
-      this.emit("cancelled");
-    }
     setDebugMode(on: boolean): void {
       this.debugModes.push(on);
     }
@@ -137,14 +135,34 @@ vi.mock("../../src/sherpaEngine", async () => {
   }
   return {
     SherpaEngine: Engine,
-    MODEL_NAME: "model",
-    MODEL_SHA256: "0".repeat(64),
-    modelStatus: () => ({ dir: "model", versionFile: "version.txt", present: true }),
     nativeEnginePath: () => "wake-word-engine",
     probeNativeEngine: () => Promise.resolve("self-test OK"),
     listInputDevices: () => Promise.resolve(deviceListing.answer),
   };
 });
+
+/**
+ * What the check of the bundled model finds and what the removal of a
+ * downloaded copy removes, per test, and the directories each was given.
+ */
+const model = vi.hoisted(() => ({
+  problem: null as unknown,
+  removed: { files: 0, bytes: 0 },
+  checked: [] as string[],
+  removedFrom: [] as string[],
+}));
+
+vi.mock("../../src/speechModel", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/speechModel")>()),
+  checkModel: (dir: string) => {
+    model.checked.push(dir);
+    return Promise.resolve(model.problem);
+  },
+  removeDownloadedModel: (storage: string) => {
+    model.removedFrom.push(storage);
+    return Promise.resolve(model.removed);
+  },
+}));
 
 vi.mock("../../src/lockFile", () => ({
   lockCheckDelay: () => 10_000,
@@ -391,6 +409,10 @@ beforeEach(() => {
   world.registered = [...WORKBENCH, "claude-vscode.focus"];
   world.installed = [CLAUDE_CODE];
   deviceListing.answer = { kind: "listed", devices: [] };
+  model.problem = null;
+  model.removed = { files: 0, bytes: 0 };
+  model.checked.length = 0;
+  model.removedFrom.length = 0;
 });
 
 afterEach(() => {
@@ -499,23 +521,6 @@ describe("the status bar", () => {
     await session.run("wakeWord.toggle");
     expect(session.engine().startedWith).toHaveLength(2);
     expect(session.status.text).toBe("$(loading~spin) Wake: Starting");
-  });
-
-  it("turns listening off with a log line, and no error, when the model download is cancelled", async () => {
-    const session = await startSession();
-    await session.run("wakeWord.enable");
-    session.engine().cancel();
-    expect(session.status.text).toBe("$(circle-slash) Wake: Off");
-    // The lock goes once the engine's stop has closed the microphone.
-    await settle();
-
-    expect(session.errors).toEqual([]);
-    expect(lock.held).toBe(false);
-    expect(
-      session.logs.some((line) =>
-        line.includes("Model download cancelled: listening is off. Enable listening to download the speech model again.")
-      )
-    ).toBe(true);
   });
 
   it("shows the handoff while the microphone is released, then the cooldown", async () => {
@@ -691,7 +696,7 @@ describe("the engine's context", () => {
   it("gives the engine the editor's name", async () => {
     const session = await startSession();
     await session.run("wakeWord.enable");
-    expect(session.engine().args[2]).toBe("Test Editor");
+    expect(session.engine().args[1]).toBe("Test Editor");
   });
 
   it("names the editor and the window in the start's log line", async () => {
@@ -825,9 +830,9 @@ describe("the verbose log", () => {
     const session = await startSession({}, undefined, LEVEL.Debug);
     await session.run("wakeWord.enable");
     session.engine().emit("debug", `Spawning: ${os.homedir()}/bin/wake-word-engine`);
-    session.engine().emit("detail", `Model already present at ${os.homedir()}/model`);
+    session.engine().emit("detail", `Model: ${os.homedir()}/model, 5 files checked against their pinned SHA-256`);
     expect(session.logs).toContain("[info] Spawning: ~/bin/wake-word-engine");
-    expect(session.details).toContain("[debug] Model already present at ~/model");
+    expect(session.details).toContain("[debug] Model: ~/model, 5 files checked against their pinned SHA-256");
   });
 });
 
@@ -862,6 +867,23 @@ describe("Show Diagnostics and reporting an issue", () => {
       )
     ).toBe(true);
     expect(session.logs.at(-1)).toBe("[info] === End Diagnostics ===");
+  });
+
+  it("names the bundled model, its directory in the installed extension, and what the check of its files found", async () => {
+    const session = await startSession();
+    await session.run("wakeWord.diagnostics");
+    const dir = path.join("extension", "models", KWS_MODEL.name);
+    expect(model.checked).toEqual([dir]);
+    expect(session.logs).toContain(`[info] Model: ${KWS_MODEL.name} (bundled, every file matches its pinned SHA-256)`);
+    expect(session.logs).toContain(`[info] Model dir: ${dir}`);
+    expect(session.logs.some((line) => line.includes("Model SHA-256"))).toBe(false);
+  });
+
+  it("says which file of the model is missing", async () => {
+    model.problem = { kind: "missing", file: path.join("extension", "models", KWS_MODEL.name, "tokens.txt") };
+    const session = await startSession();
+    await session.run("wakeWord.diagnostics");
+    expect(session.logs).toContain(`[info] Model: ${KWS_MODEL.name} (bundled, tokens.txt is missing)`);
   });
 
   it("says whether the terminal hands the toggle shortcut over", async () => {
@@ -903,5 +925,28 @@ describe("Show Diagnostics and reporting an issue", () => {
     expect(session.clipboard).toHaveLength(1);
     expect(session.clipboard[0].startsWith("=== Wake Word Diagnostics ===\n")).toBe(true);
     expect(session.opened).toEqual([]);
+  });
+});
+
+describe("the copy of the model an earlier version downloaded", () => {
+  const REMOVED = "Removed the copy of the speech model an earlier version downloaded";
+
+  it("is removed from global storage when the extension activates, with a log line", async () => {
+    model.removed = { files: 16, bytes: 20_126_637 };
+    const session = await startSession();
+    await settle();
+    expect(model.removedFrom).toEqual(["storage"]);
+    expect(session.logs).toContain(`[info] ${REMOVED}: 16 files, 20.1 MB in global storage`);
+  });
+
+  it("leaves no line where there was none to remove, and listening starts as before", async () => {
+    const session = await startSession();
+    await settle();
+    expect(model.removedFrom).toEqual(["storage"]);
+    expect(session.logs.some((line) => line.includes(REMOVED))).toBe(false);
+
+    await session.run("wakeWord.enable");
+    session.engine().ready();
+    expect(session.status.text).toBe("$(mic) Wake: Listening");
   });
 });

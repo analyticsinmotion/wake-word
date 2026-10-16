@@ -1,0 +1,5 @@
+# The speech model ships byte for byte as its publisher made it, and each
+# file's SHA-256 is pinned in src/speechModel.ts, so no line ending is ever
+# converted under models/: tokens.txt is text, and a checkout that rewrote its
+# line endings would change its digest.
+models/** binary

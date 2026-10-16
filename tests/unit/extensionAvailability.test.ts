@@ -87,14 +87,18 @@ vi.mock("../../src/sherpaEngine", async () => {
   }
   return {
     SherpaEngine: Engine,
-    MODEL_NAME: "model",
-    MODEL_SHA256: "0".repeat(64),
-    modelStatus: () => ({ dir: "model", versionFile: "version.txt", present: true }),
     nativeEnginePath: () => "wake-word-engine",
     probeNativeEngine: () => Promise.resolve("self-test OK"),
     listInputDevices: () => Promise.resolve(deviceListing.answer),
   };
 });
+
+// The bundled model passes its check, and there is no downloaded copy to remove.
+vi.mock("../../src/speechModel", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/speechModel")>()),
+  checkModel: () => Promise.resolve(null),
+  removeDownloadedModel: () => Promise.resolve({ files: 0, bytes: 0 }),
+}));
 
 vi.mock("../../src/lockFile", () => ({
   lockCheckDelay: () => 10_000,
