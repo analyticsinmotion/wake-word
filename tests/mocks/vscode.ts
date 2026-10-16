@@ -45,6 +45,12 @@ export enum LogLevel {
   Error = 5,
 }
 
+export enum ConfigurationTarget {
+  Global = 1,
+  Workspace = 2,
+  WorkspaceFolder = 3,
+}
+
 export class ThemeColor {
   constructor(public readonly id: string) {}
 }
@@ -96,6 +102,7 @@ export const window = {
   showInformationMessage: () => notImplemented("window.showInformationMessage"),
   showWarningMessage: () => notImplemented("window.showWarningMessage"),
   showErrorMessage: () => notImplemented("window.showErrorMessage"),
+  showQuickPick: () => notImplemented("window.showQuickPick"),
   withProgress: () => notImplemented("window.withProgress"),
   onDidChangeWindowState: () => notImplemented("window.onDidChangeWindowState"),
   get state(): never {

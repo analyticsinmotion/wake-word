@@ -30,6 +30,7 @@ const EVERY_STATE: StatusBarState[] = [
   { kind: "error", message: "No microphone found. Check your audio device settings." },
   { kind: "other-window", followsFocus: true },
   { kind: "no-commands" },
+  { kind: "routes-off" },
 ];
 
 const LISTENING_STATES = new Set(["listening", "confirming", "calibrating"]);
@@ -38,7 +39,7 @@ const HANDOFF_STATES = new Set(["handed-off", "cooldown", "paused"]);
 describe("statusBarView", () => {
   it("covers every state once", () => {
     expect(new Set(EVERY_STATE.map((state) => state.kind)).size).toBe(EVERY_STATE.length);
-    expect(EVERY_STATE).toHaveLength(13);
+    expect(EVERY_STATE).toHaveLength(14);
   });
 
   it("uses only icons known to be drawn by editors built on older VS Code releases", () => {
@@ -78,6 +79,7 @@ describe("statusBarView", () => {
     ["error", "$(error) Wake: Error", "error", false],
     ["other-window", "$(circle-slash) Wake: Other window", null, false],
     ["no-commands", "$(circle-slash) Wake: No commands", null, true],
+    ["routes-off", "$(circle-slash) Wake: Routes off", null, true],
   ])("shows %s as %s", (kind, text, background, settingsLink) => {
     const view = statusBarView(EVERY_STATE.find((state) => state.kind === kind) as StatusBarState);
     expect(view.text).toBe(text);
@@ -137,6 +139,15 @@ describe("statusBarView", () => {
     );
   });
 
+  it("says every route is switched off, that the microphone is off, and what a click does", () => {
+    const { tooltip } = statusBarView({ kind: "routes-off" });
+    expect(tooltip).toBe(
+      "Every route is switched off (wakeWord.routesSwitchedOff), so the microphone is off. " +
+        "Listening starts once a route is switched on. Click to choose the routes to listen for."
+    );
+    expect(describeStatus({ kind: "routes-off" })).toBe("waiting: every route is switched off");
+  });
+
   it("says a start has not opened the microphone yet", () => {
     expect(statusBarView({ kind: "starting" }).tooltip).toContain("Wake phrases are not heard until");
   });
@@ -187,6 +198,7 @@ const IDLE: StatusFacts = {
   error: null,
   standingBy: null,
   waitingForCommands: false,
+  everyRouteSwitchedOff: false,
 };
 
 /** Every combination of the facts, each either unset or set to a value. */
@@ -204,6 +216,7 @@ function everyCombination(): StatusFacts[] {
     ["error", "No microphone found."],
     ["standingBy", { followsFocus: true }],
     ["waitingForCommands", true],
+    ["everyRouteSwitchedOff", true],
   ];
   const all: StatusFacts[] = [];
   for (let mask = 0; mask < 1 << settings.length; mask++) {
@@ -221,8 +234,8 @@ function everyCombination(): StatusFacts[] {
 describe("deriveStatus", () => {
   const combinations = everyCombination();
 
-  it("checks all 4,096 combinations of the facts", () => {
-    expect(combinations).toHaveLength(4096);
+  it("checks all 8,192 combinations of the facts", () => {
+    expect(combinations).toHaveLength(8192);
   });
 
   it("says the microphone is listening exactly when the engine is listening", () => {
@@ -255,6 +268,7 @@ describe("deriveStatus", () => {
       expect(kind === "error" ? facts.error !== null : true).toBe(true);
       expect(kind === "other-window" ? facts.standingBy !== null : true).toBe(true);
       expect(kind === "no-commands" ? facts.waitingForCommands : true).toBe(true);
+      expect(kind === "routes-off" ? facts.everyRouteSwitchedOff : true).toBe(true);
     }
   });
 
@@ -273,6 +287,7 @@ describe("deriveStatus", () => {
     [{ standingBy: { followsFocus: true } }, "other-window"],
     [{ standingBy: { followsFocus: false } }, "other-window"],
     [{ waitingForCommands: true }, "no-commands"],
+    [{ everyRouteSwitchedOff: true }, "routes-off"],
   ] as Array<[Partial<StatusFacts>, string]>)("shows %o as %s", (facts, kind) => {
     expect(deriveStatus({ ...IDLE, ...facts }).kind).toBe(kind);
   });

@@ -502,8 +502,19 @@ export function formatSetAsideNotification(setAside: readonly SetAsideRoute[]): 
   );
 }
 
-/** The notification when every route is set aside, so nothing is listened for. */
-export function formatNothingToListenFor(setAside: readonly SetAsideRoute[]): string {
+/**
+ * The notification when every route switched on is set aside, so nothing is
+ * listened for. `switchedOff` counts the routes switched off, which the
+ * check does not cover: with any, the text says that the others are off.
+ */
+export function formatNothingToListenFor(setAside: readonly SetAsideRoute[], switchedOff = 0): string {
+  if (switchedOff > 0) {
+    return (
+      "Wake Word keeps the microphone closed: the routes switched on need commands that are missing from " +
+      `this editor, and the other routes are switched off. ${setAside.map(listItem).join(" ")} Listening ` +
+      "starts once a route's command is available, or another route is switched on."
+    );
+  }
   return (
     "Wake Word is not listening: none of the routes' commands are available in this editor. " +
     `${setAside.map(listItem).join(" ")} Listening starts once a route's command is available.`
@@ -527,12 +538,17 @@ export function formatNothingToListenFor(setAside: readonly SetAsideRoute[]): st
  * back raises none. When every route is set aside the notification says so,
  * and `explicit`, set when the user asked to listen, raises it even if they
  * were told before: their request would otherwise do nothing they can see.
+ *
+ * `availability` covers the routes switched on. `switchedOff` counts the
+ * routes switched off, which are never set aside: when none of the others
+ * can be listened for, the line and the notification say the rest are off.
  */
 export function planAvailabilityReport(
   availability: RouteAvailability,
   previous: (Pick<RouteAvailability, "setAside" | "declaredOnly"> & { unverified?: readonly UnverifiedRoute[] }) | null,
   told: unknown,
-  explicit: boolean
+  explicit: boolean,
+  switchedOff = 0
 ): AvailabilityReport {
   const lines: ReportLine[] = [];
   const before = new Set((previous?.setAside ?? []).map(entryOf));
@@ -585,8 +601,13 @@ export function planAvailabilityReport(
   if (nothingToListenFor) {
     lines.push({
       level: "warn",
-      text: "Not listening: none of the routes' commands are available in this editor. " +
-        "Listening starts once a route's command is available.",
+      text:
+        switchedOff > 0
+          ? "The routes switched on need commands that are missing from this editor, and the other routes are " +
+            "switched off, so the microphone stays closed. Listening starts once a route's command is " +
+            "available, or another route is switched on."
+          : "Not listening: none of the routes' commands are available in this editor. " +
+            "Listening starts once a route's command is available.",
     });
   }
 
@@ -595,7 +616,7 @@ export function planAvailabilityReport(
   let notification: string | null = null;
   if (nothingToListenFor) {
     if (explicit || untold.length > 0) {
-      notification = formatNothingToListenFor(availability.setAside);
+      notification = formatNothingToListenFor(availability.setAside, switchedOff);
     }
   } else if (untold.length > 0) {
     notification = formatSetAsideNotification(untold);
@@ -612,6 +633,314 @@ export function planAvailabilityReport(
           setAside.reason,
         ]),
   };
+}
+
+// -- Route switches -----------------------------------------------------
+
+/**
+ * A route that the user switched off in `wakeWord.routesSwitchedOff`.
+ *
+ * Switched off is the user's choice, and a reason of its own, apart from a
+ * route set aside because its command is missing: a route switched off is
+ * not listened for whatever its command does, its command does not take
+ * part in the check that decides what is listened for, and it is never
+ * reported as set aside.
+ */
+export interface SwitchedOffRoute {
+  /** The route as configured. */
+  route: WakePhrase;
+  label: string;
+  /**
+   * Set for Show Diagnostics only, when the route's command is missing as
+   * well: what the availability check would set aside if the route were
+   * switched on. See checkSwitchedOffCommands().
+   */
+  commandMissing?: SetAsideRoute;
+}
+
+/** The configured routes, split by `wakeWord.routesSwitchedOff`. See applyRouteSwitches(). */
+export interface RouteSwitches {
+  /** The routes switched on, in their configured order: the ones the availability check takes. */
+  on: WakePhrase[];
+  /** The routes switched off, in their configured order. */
+  off: SwitchedOffRoute[];
+  /**
+   * The setting's labels that name no route, trimmed, once each, in their
+   * order. They switch nothing off, and they are kept: the setting can be in
+   * the user settings, which every workspace shares, and name a route that
+   * only another workspace's settings define.
+   */
+  unmatched: string[];
+}
+
+/**
+ * How `wakeWord.routesSwitchedOff` names a route: by its label, trimmed and
+ * in lower case, so a label written by hand with another case still matches.
+ * Labels are not unique, so one entry switches off every route with that
+ * label, and the switch command lists such routes as one.
+ */
+export function routeKey(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+/**
+ * The setting's entries as a list: a list as it is, one label on its own as
+ * a list of one, since settings.json is not validated against the schema,
+ * and anything else as no entries.
+ */
+function switchEntries(value: unknown): unknown[] {
+  if (Array.isArray(value)) {
+    return [...value];
+  }
+  return typeof value === "string" ? [value] : [];
+}
+
+/** The entries that can name a route: strings that are not blank. */
+function switchLabels(value: unknown): string[] {
+  return switchEntries(value).filter(
+    (entry): entry is string => typeof entry === "string" && entry.trim().length > 0
+  );
+}
+
+/**
+ * Split the configured routes, from resolveRoutes(), into the ones switched
+ * on and the ones `switchedOff`, the setting's value, names. With nothing
+ * switched off, `on` holds every route, in the same order and as the same
+ * objects, which checkRouteAvailability() identifies the default routes by.
+ */
+export function applyRouteSwitches(routes: readonly WakePhrase[], switchedOff: unknown): RouteSwitches {
+  const labels = switchLabels(switchedOff);
+  const named = new Set(labels.map(routeKey));
+  const switches: RouteSwitches = { on: [], off: [], unmatched: [] };
+  for (const route of routes) {
+    if (named.has(routeKey(route.label))) {
+      switches.off.push({ route, label: route.label });
+    } else {
+      switches.on.push(route);
+    }
+  }
+  const configured = new Set(routes.map((route) => routeKey(route.label)));
+  const reported = new Set<string>();
+  for (const label of labels) {
+    const key = routeKey(label);
+    if (!configured.has(key) && !reported.has(key)) {
+      reported.add(key);
+      switches.unmatched.push(label.trim());
+    }
+  }
+  return switches;
+}
+
+/**
+ * The switched-off routes with their commands checked, for Show Diagnostics:
+ * a route whose command is missing as well carries what the check would set
+ * aside if it were switched on.
+ */
+export function checkSwitchedOffCommands(
+  off: readonly SwitchedOffRoute[],
+  defaults: readonly WakePhrase[],
+  sources: CommandSources | null
+): SwitchedOffRoute[] {
+  const setAside = checkRouteAvailability(
+    off.map((switched) => switched.route),
+    defaults,
+    sources
+  ).setAside;
+  return off.map((switched) => {
+    const missing = setAside.find((entry) => entry.route === switched.route);
+    return missing ? { ...switched, commandMissing: missing } : switched;
+  });
+}
+
+/**
+ * The settings `wakeWord.routesSwitchedOff` is written to: the user settings,
+ * or the settings of the workspace open in this window.
+ */
+export type SettingsScope = "user" | "workspace";
+
+/**
+ * Where the switch command writes. A workspace value overrides the user
+ * value, as for any setting, and a list in one is not merged with a list in
+ * the other. So when the workspace settings set the value, the command edits
+ * that value, and a write to the user settings would change nothing in this
+ * window. Otherwise it edits the user settings: it never adds a value to
+ * workspace settings that have none, which would replace the user value in
+ * that workspace from then on.
+ */
+export function routeSwitchScope(inspected: { workspaceValue?: unknown } | undefined): SettingsScope {
+  return inspected?.workspaceValue !== undefined ? "workspace" : "user";
+}
+
+/**
+ * The value of `wakeWord.routesSwitchedOff` after the user chose which routes
+ * are on, from `current`, its value in the scope being written. Entries keep
+ * their spelling and their order. Those that name a route in `switchedOn`, by
+ * routeKey(), are removed. The label of each route in `routes` that is not in
+ * `switchedOn`, and that no entry names yet, is added at the end. Every other
+ * entry stays as it is, a label that names no route in this window included.
+ */
+export function updateRoutesSwitchedOff(
+  current: unknown,
+  routes: readonly WakePhrase[],
+  switchedOn: ReadonlySet<string>
+): unknown[] {
+  const next = switchEntries(current).filter(
+    (entry) => typeof entry !== "string" || !switchedOn.has(routeKey(entry))
+  );
+  const named = new Set(switchLabels(next).map(routeKey));
+  for (const route of routes) {
+    const key = routeKey(route.label);
+    if (!switchedOn.has(key) && !named.has(key)) {
+      named.add(key);
+      next.push(route.label.trim());
+    }
+  }
+  return next;
+}
+
+/** What the switch command writes: see planRouteSwitchWrite(). */
+export interface RouteSwitchWrite {
+  scope: SettingsScope;
+  /**
+   * The new list. Undefined removes the value from the user settings once
+   * nothing is switched off there, rather than leaving an empty list. An
+   * empty list in the workspace settings is kept, because it overrides a
+   * list in the user settings.
+   */
+  value: unknown[] | undefined;
+}
+
+/**
+ * What the switch command writes when the user has chosen the routes in
+ * `switchedOn` (routeKey() of each route picked) out of `routes`, or null when
+ * the choice leaves the setting as it is. `inspected` is the setting's
+ * `inspect()` result, read after the choice.
+ */
+export function planRouteSwitchWrite(
+  inspected: { globalValue?: unknown; workspaceValue?: unknown } | undefined,
+  routes: readonly WakePhrase[],
+  switchedOn: ReadonlySet<string>
+): RouteSwitchWrite | null {
+  const scope = routeSwitchScope(inspected);
+  const current = scope === "workspace" ? inspected?.workspaceValue : inspected?.globalValue;
+  const next = updateRoutesSwitchedOff(current, routes, switchedOn);
+  if (JSON.stringify(next) === JSON.stringify(switchEntries(current))) {
+    return null;
+  }
+  return { scope, value: next.length === 0 && scope === "user" ? undefined : next };
+}
+
+/** One entry of the switch command's list. */
+export interface RouteSwitchItem {
+  /** routeKey() of the label: the entry switches every route with this label. */
+  key: string;
+  label: string;
+  /** The phrases, as the spotter is given them. */
+  description: string;
+  /** Routes that share the label, and a command that is missing; absent when there is neither. */
+  detail?: string;
+  /** Switched on. */
+  picked: boolean;
+}
+
+/**
+ * The switch command's list: one entry per label, in the order the routes
+ * are configured, checked when the routes with that label are switched on.
+ * `setAside` is the availability check of every configured route, switched
+ * off or not, so an entry whose route is not listened for while its command
+ * is missing says so, whichever way it is switched.
+ */
+export function routeSwitchItems(
+  routes: readonly WakePhrase[],
+  switches: RouteSwitches,
+  setAside: readonly SetAsideRoute[]
+): RouteSwitchItem[] {
+  const off = new Set(switches.off.map((switched) => routeKey(switched.label)));
+  const byKey = new Map<string, WakePhrase[]>();
+  for (const route of routes) {
+    const key = routeKey(route.label);
+    byKey.set(key, [...(byKey.get(key) ?? []), route]);
+  }
+  return [...byKey].map(([key, members]) => {
+    const phrases = [...new Set(members.flatMap((route) => normalizePhrases(route.phrase)))];
+    const notes: string[] = [];
+    if (members.length > 1) {
+      notes.push(`${members.length} routes have this label, and are switched on and off together.`);
+    }
+    for (const member of members) {
+      const missing = setAside.find((entry) => entry.route === member);
+      if (missing) {
+        notes.push(`Listened for once its command is available: ${describeMissingCommand(missing)}.`);
+      }
+    }
+    const item: RouteSwitchItem = {
+      key,
+      label: members[0].label.trim(),
+      description: phrases.map((phrase) => `"${phrase}"`).join(", "),
+      picked: !off.has(key),
+    };
+    if (notes.length > 0) {
+      item.detail = notes.join(" ");
+    }
+    return item;
+  });
+}
+
+/** A route's identity when the switches of two starts are compared: label and command. */
+function switchedEntry(route: WakePhrase): string {
+  return JSON.stringify([route.label, route.command]);
+}
+
+/**
+ * What to log about the route switches at a start: a line for each route
+ * newly switched off and each one switched on again, compared with the
+ * previous start of this session (`previous`, null before the first, so each
+ * session's log says which routes are off), a line for each label that names
+ * no route, again only when it is new, and a line whenever no route is
+ * switched on. No notification: the user chose the switches.
+ */
+export function planSwitchReport(switches: RouteSwitches, previous: RouteSwitches | null): ReportLine[] {
+  const lines: ReportLine[] = [];
+  const offBefore = new Set((previous?.off ?? []).map((switched) => switchedEntry(switched.route)));
+  for (const switched of switches.off) {
+    if (!offBefore.has(switchedEntry(switched.route))) {
+      lines.push({
+        level: "info",
+        text: `Route "${switched.label}" switched off (wakeWord.routesSwitchedOff): Wake Word listens for the routes switched on.`,
+      });
+    }
+  }
+  const onNow = new Set(switches.on.map(switchedEntry));
+  for (const switched of previous?.off ?? []) {
+    if (onNow.has(switchedEntry(switched.route))) {
+      lines.push({ level: "info", text: `Route "${switched.label}" switched on again.` });
+    }
+  }
+  const unmatchedBefore = new Set((previous?.unmatched ?? []).map(routeKey));
+  for (const label of switches.unmatched) {
+    if (!unmatchedBefore.has(routeKey(label))) {
+      lines.push({
+        level: "info",
+        text:
+          `wakeWord.routesSwitchedOff names "${label}", which matches no route's label. ` +
+          "It is kept, and switches off a route given that label.",
+      });
+    }
+  }
+  if (switches.on.length === 0) {
+    lines.push({
+      level: "info",
+      text:
+        "Every route is switched off (wakeWord.routesSwitchedOff), so the microphone stays closed. " +
+        "Listening starts once a route is switched on.",
+    });
+  }
+  return lines;
+}
+
+/** The notification when the user asks to listen and every route is switched off. */
+export function formatEveryRouteSwitchedOff(): string {
+  return "Wake Word keeps the microphone closed: every route is switched off. Switch a route on to listen for its phrases.";
 }
 
 // -- Threshold ----------------------------------------------------------
@@ -650,17 +979,20 @@ export function describeThreshold(threshold: number, routes: readonly WakePhrase
  *
  * The routes and the threshold are read in startListening() and sent in the
  * engine's config line: the routes become its keyword lines, and the
- * threshold becomes every line's trigger value. `availability` is a change
- * in which routes' commands are available, found when an extension is
- * installed, removed, enabled or disabled: it changes which routes become
- * keyword lines. An engine already running was given the old ones, so any
- * of the three has to reach it through a start.
+ * threshold becomes every line's trigger value. `switches` is a change to
+ * `wakeWord.routesSwitchedOff`, which decides which of the routes are
+ * listened for. `availability` is a change in which routes' commands are
+ * available, found when an extension is installed, removed, enabled or
+ * disabled: it changes which routes become keyword lines. An engine already
+ * running was given the old ones, so any of the four has to reach it
+ * through a start.
  *
  * `wakeWord.audioDevice` is not here: the engine is built with the
  * microphone it listens on, so that setting replaces the engine itself.
  */
 export interface ListenSettingsChange {
   routes: boolean;
+  switches: boolean;
   threshold: boolean;
   availability: boolean;
 }
@@ -678,7 +1010,8 @@ export interface ListeningState {
   /** A manual handoff is waiting for the user to resume. */
   manualPause: boolean;
   /**
-   * None of the routes' commands was available at the last start, so no
+   * Nothing could be listened for at the last start, because none of the
+   * routes' commands was available or every route is switched off, so no
    * engine was started and the microphone is closed.
    */
   waiting: boolean;
@@ -692,8 +1025,8 @@ export interface ListeningState {
  * goes through a full start. `apply-when-started` holds them until the
  * start in flight reports READY, because that engine was given the old
  * ones. `start` checks the routes again while nothing is listened for,
- * which starts listening if a route's command is now available. `none`
- * leaves them for the next start to read.
+ * which starts listening if a route's command is now available or a route
+ * is now switched on. `none` leaves them for the next start to read.
  */
 export type ListenSettingsAction = "none" | "restart" | "apply-on-resume" | "apply-when-started" | "start";
 
@@ -717,7 +1050,7 @@ export function decideListenSettingsChange(
   change: ListenSettingsChange,
   state: ListeningState
 ): ListenSettingsAction {
-  if (!change.routes && !change.threshold && !change.availability) {
+  if (!change.routes && !change.switches && !change.threshold && !change.availability) {
     return "none";
   }
   if (state.listening) {
@@ -746,6 +1079,9 @@ export function describeListenSettingsChange(change: ListenSettingsChange): stri
   if (change.routes) {
     subjects.push("routes");
   }
+  if (change.switches) {
+    subjects.push("route switches");
+  }
   if (change.threshold) {
     subjects.push("confidence threshold");
   }
@@ -757,14 +1093,18 @@ export function describeListenSettingsChange(change: ListenSettingsChange): stri
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+/** What listening waits for when nothing could be listened for: a route's command, or a route switched on. */
+export type WaitingFor = "commands" | "routes";
+
 /**
  * The output channel line for a settings change: what changed, and when it
  * will take effect. Null for a change the extension does not act on, which
- * is not worth a line.
+ * is not worth a line. `waitingFor` says what a `start` follows on from.
  */
 export function formatListenSettingsChange(
   change: ListenSettingsChange,
-  action: ListenSettingsAction
+  action: ListenSettingsAction,
+  waitingFor: WaitingFor = "commands"
 ): string | null {
   if (action === "none") {
     return null;
@@ -777,7 +1117,9 @@ export function formatListenSettingsChange(
     return `${subject} changed while listening was paused: applied when listening resumes`;
   }
   if (action === "start") {
-    return `${subject} changed while waiting for a route's command: checking the routes again`;
+    return waitingFor === "routes"
+      ? `${subject} changed while every route was switched off: checking the routes again`
+      : `${subject} changed while waiting for a route's command: checking the routes again`;
   }
   return `${subject} changed while the engine was starting: applied as soon as it is listening`;
 }
@@ -1468,7 +1810,8 @@ export type StatusBarState =
   | { kind: "restarting"; attempt: number; attempts: number }
   | { kind: "error"; message: string }
   | { kind: "other-window"; followsFocus: boolean }
-  | { kind: "no-commands" };
+  | { kind: "no-commands" }
+  | { kind: "routes-off" };
 
 /** What the extension knows, from which deriveStatus() picks the state. */
 export interface StatusFacts {
@@ -1501,6 +1844,8 @@ export interface StatusFacts {
   standingBy: { followsFocus: boolean } | null;
   /** No route's command is available, so nothing is listened for. */
   waitingForCommands: boolean;
+  /** Every route is switched off, so nothing is listened for. */
+  everyRouteSwitchedOff: boolean;
 }
 
 /**
@@ -1548,7 +1893,10 @@ export function deriveStatus(facts: StatusFacts): StatusBarState {
   if (facts.standingBy) {
     return { kind: "other-window", followsFocus: facts.standingBy.followsFocus };
   }
-  return facts.waitingForCommands ? { kind: "no-commands" } : { kind: "off" };
+  if (facts.waitingForCommands) {
+    return { kind: "no-commands" };
+  }
+  return facts.everyRouteSwitchedOff ? { kind: "routes-off" } : { kind: "off" };
 }
 
 /** How the status bar item renders a state. */
@@ -1567,10 +1915,10 @@ export interface StatusBarView {
 }
 
 /**
- * The icon of the four states in which this window's microphone is simply
- * closed: Off, Unfocused, Other window, and No commands. `mic-off` would say
- * it better, but it is a recent icon: an editor built on an older VS Code
- * release does not have it and draws nothing in its place.
+ * The icon of the five states in which this window's microphone is simply
+ * closed: Off, Unfocused, Other window, No commands, and Routes off.
+ * `mic-off` would say it better, but it is a recent icon: an editor built on
+ * an older VS Code release does not have it and draws nothing in its place.
  */
 const MICROPHONE_CLOSED_ICON = "$(circle-slash)";
 
@@ -1681,6 +2029,15 @@ export function statusBarView(state: StatusBarState): StatusBarView {
         settingsLink: true,
         background: null,
       };
+    case "routes-off":
+      return {
+        text: `${MICROPHONE_CLOSED_ICON} Wake: Routes off`,
+        tooltip:
+          "Every route is switched off (wakeWord.routesSwitchedOff), so the microphone is off. " +
+          "Listening starts once a route is switched on. Click to choose the routes to listen for.",
+        settingsLink: true,
+        background: null,
+      };
   }
 }
 
@@ -1715,6 +2072,8 @@ export function describeStatus(state: StatusBarState): string {
         : "standing by: another window is listening";
     case "no-commands":
       return "waiting: none of the routes' commands are available";
+    case "routes-off":
+      return "waiting: every route is switched off";
   }
 }
 
@@ -2109,6 +2468,12 @@ export interface DiagnosticsInput {
   unverified?: readonly UnverifiedRoute[];
   /** The routes set aside, listed apart from the ones listened for. */
   setAside: readonly SetAsideRoute[];
+  /** The routes switched off, with their commands checked: see checkSwitchedOffCommands(). */
+  switchedOff?: readonly SwitchedOffRoute[];
+  /** The labels in wakeWord.routesSwitchedOff that name no route. */
+  unmatchedSwitches?: readonly string[];
+  /** The settings wakeWord.routesSwitchedOff is read from, for the routes switched off. */
+  switchesScope?: SettingsScope;
   usingDefaultRoutes: boolean;
   /** Lines from formatPhraseChecks(), for the routes listened for. */
   phraseChecks: readonly string[];
@@ -2161,7 +2526,9 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
         ? "handled by Wake Word"
         : "sent to the shell (wakeWord.toggle is not in terminal.integrated.commandsToSkipShell)"
     }`,
-    `Routes: ${input.routes.length + input.setAside.length}${input.usingDefaultRoutes ? " (defaults)" : ""}`,
+    `Routes: ${input.routes.length + input.setAside.length + (input.switchedOff?.length ?? 0)}${
+      input.usingDefaultRoutes ? " (defaults)" : ""
+    }`,
   ];
 
   const describeRoute = (route: WakePhrase): string => {
@@ -2197,6 +2564,31 @@ export function formatDiagnostics(input: DiagnosticsInput): string[] {
     lines.push(`Set aside: ${plural(input.setAside.length, "route")}, not listened for`);
     for (const setAside of input.setAside) {
       lines.push(`${describeRoute(setAside.route)}: ${setAside.reason}, ${describeMissingCommand(setAside)}`);
+    }
+  }
+
+  // Only when a route is switched off or a label names no route, so a
+  // configuration that switches nothing off gives exactly the report it
+  // would give without the setting.
+  const switchedOff = input.switchedOff ?? [];
+  const unmatched = input.unmatchedSwitches ?? [];
+  if (switchedOff.length > 0 || unmatched.length > 0) {
+    const where = `wakeWord.routesSwitchedOff, in the ${input.switchesScope ?? "user"} settings`;
+    lines.push(
+      switchedOff.length === 0
+        ? `Switched off: none (${where})`
+        : `Switched off: ${plural(switchedOff.length, "route")} (${where})`
+    );
+    for (const switched of switchedOff) {
+      lines.push(
+        switched.commandMissing
+          ? `${describeRoute(switched.route)}: its command is missing as well, ` +
+              describeMissingCommand(switched.commandMissing)
+          : describeRoute(switched.route)
+      );
+    }
+    for (const label of unmatched) {
+      lines.push(`  "${label}": matches no route's label`);
     }
   }
 
