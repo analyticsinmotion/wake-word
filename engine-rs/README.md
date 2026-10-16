@@ -147,6 +147,16 @@ that chose the length). A pause replaces the stream instead of flushing it,
 because a detection from audio heard before the microphone was handed over must
 not arrive after it.
 
+The flush stops early in two cases. A keyword that completes inside it ends it
+there, since its search has just started again and the extension answers a
+detection with a pause, which replaces the stream; a stream that is fed
+anything before that is first fed the rest of the flush, so it decodes later
+audio exactly as it would have after the whole flush. And a close ends it: the
+spotter checks whether the microphone is closing before each chunk it decodes,
+in the flush and in the lead-in alike, so a `pause` or a `stop` waits for the
+chunk in hand, not for the rest of the flush, whose five decode steps take over
+a hundred milliseconds on a slow or power-throttled core.
+
 ## Building
 
 ```bash
@@ -652,8 +662,10 @@ runs the capture loop, keyword spotting included, until the microphone is
 closed. Everything a microphone reports, a detection included, carries the id
 of the open that produced it, and the state machine ignores reports from a
 microphone it has closed. Closing a microphone waits for its thread to finish,
-so nothing from a closed microphone reaches the spotter, and the spotter's
-stream can be replaced safely once a pause has closed the microphone.
+which takes no longer than the chunk the thread is decoding, since the spotter
+checks for the close before each one. So nothing from a closed microphone
+reaches the spotter, and the spotter's stream can be replaced safely once a
+pause has closed the microphone.
 
 ## Dependencies
 

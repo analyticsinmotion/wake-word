@@ -67,12 +67,15 @@ pub const SILENCE_HOLDOFF_MS: u32 = 300;
 /// How often debug mode checks the stream's overrun counter.
 pub const OVERRUN_CHECK_MS: u64 = 30_000;
 /// How long one read waits for a chunk before the loop checks whether its
-/// microphone has been closed. This bounds how long a close waits for the
-/// capture thread.
+/// microphone has been closed. This bounds how long a close waits for a
+/// capture thread that is waiting for audio.
 const READ_TIMEOUT: Duration = Duration::from_millis(20);
 /// Upper bound on how long closing a microphone waits for its capture thread.
-/// The thread notices a close within one read timeout plus one Silero
-/// inference; the bound only matters if an inference never returns.
+/// The thread notices a close within one read timeout, one Silero inference,
+/// or the decoding of one chunk, whichever it is doing: the keyword spotter
+/// checks for the close before each chunk it decodes, in the lead-in and the
+/// segment-end flush too. The bound only matters if an inference or a decode
+/// step never returns.
 const CLOSE_WAIT: Duration = Duration::from_millis(500);
 
 /// The `MicrophoneConfig` the engine opens every microphone with: mono 16 kHz,
@@ -109,9 +112,19 @@ pub fn vad_config(request: &OpenRequest) -> VadConfig {
 /// Where gated audio goes: every chunk of a speech segment in order, then the
 /// end of that segment, so two segments are never joined into one phrase. The
 /// keyword spotter implements it (see `crate::spotter`).
+///
+/// `closing` says whether the microphone is being closed. A pause or a stop
+/// waits for the capture thread, so once it says so the sink decodes nothing
+/// more: it finishes the chunk in hand and returns, part way through the
+/// segment-end flush or a lead-in included.
 pub trait SpeechSink: Send {
-    fn accept(&mut self, samples: &[f32], report: &mut dyn FnMut(CaptureReport));
-    fn end_segment(&mut self, report: &mut dyn FnMut(CaptureReport));
+    fn accept(
+        &mut self,
+        samples: &[f32],
+        closing: &dyn Fn() -> bool,
+        report: &mut dyn FnMut(CaptureReport),
+    );
+    fn end_segment(&mut self, closing: &dyn Fn() -> bool, report: &mut dyn FnMut(CaptureReport));
     /// Listening paused: forget everything accepted so far, decoded or not.
     /// Called from the event loop, never from a capture thread.
     fn reset(&mut self);
@@ -222,10 +235,10 @@ fn stream_closed() -> CaptureError {
 /// on a microphone that is already running.
 ///
 /// `closed` is set by [`CaptureDevice::close`] before it stops the stream.
-/// It is checked after every read and again under the sink's lock, so once it
-/// is set nothing further reaches the sink, including the tail decibri
-/// flushes after the stream stops, and a stream that then reports closed is
-/// not taken for a failure.
+/// It is checked after every read, again under the sink's lock, and by the
+/// sink before each chunk it decodes, so once it is set nothing further
+/// reaches the sink, including the tail decibri flushes after the stream
+/// stops, and a stream that then reports closed is not taken for a failure.
 pub fn run_capture(
     source: &dyn ChunkSource,
     detector: &mut dyn SpeechDetector,
@@ -247,6 +260,7 @@ pub fn run_capture(
     let mut gate: VadGate<Vec<f32>> = VadGate::new(PREROLL_CHUNKS - 1);
     let mut hysteresis = SpeechHysteresis::new(SPEECH_THRESHOLD, SILENCE_HOLDOFF_MS, SAMPLE_RATE);
     let mut overruns = OverrunReporter::new(now_ms());
+    let closing = || closed.load(Ordering::SeqCst);
 
     loop {
         if closed.load(Ordering::SeqCst) {
@@ -307,25 +321,25 @@ pub fn run_capture(
                     gate.preroll_len() + 1
                 )));
                 for held in gate.speech_started() {
-                    sink.accept(&held, &mut report);
+                    sink.accept(&held, &closing, &mut report);
                 }
                 if let Some(chunk) = gate.push(chunk) {
-                    sink.accept(&chunk, &mut report);
+                    sink.accept(&chunk, &closing, &mut report);
                 }
             }
             Some(Transition::Silence) => {
                 // The chunk that completes the holdoff is the tail of the
                 // segment, so it is delivered before the segment ends.
                 if let Some(chunk) = gate.push(chunk) {
-                    sink.accept(&chunk, &mut report);
+                    sink.accept(&chunk, &closing, &mut report);
                 }
                 gate.speech_ended();
                 report(CaptureReport::Debug("VAD: silence".to_string()));
-                sink.end_segment(&mut report);
+                sink.end_segment(&closing, &mut report);
             }
             None => {
                 if let Some(chunk) = gate.push(chunk) {
-                    sink.accept(&chunk, &mut report);
+                    sink.accept(&chunk, &closing, &mut report);
                 }
             }
         }
@@ -477,6 +491,9 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
+    use crate::config::PhraseMap;
+    use crate::spotter::{KeywordEngine, KeywordHit, Spotter, SpotterSlot};
+
     /// One scripted step of a fake stream.
     enum Step {
         /// A chunk whose samples are all `marker`, scored at `probability`.
@@ -611,12 +628,21 @@ mod tests {
     }
 
     impl SpeechSink for RecordingSink {
-        fn accept(&mut self, samples: &[f32], _report: &mut dyn FnMut(CaptureReport)) {
+        fn accept(
+            &mut self,
+            samples: &[f32],
+            _closing: &dyn Fn() -> bool,
+            _report: &mut dyn FnMut(CaptureReport),
+        ) {
             self.events.push(format!("{}", samples[0]));
             self.samples.push(samples.to_vec());
         }
 
-        fn end_segment(&mut self, report: &mut dyn FnMut(CaptureReport)) {
+        fn end_segment(
+            &mut self,
+            _closing: &dyn Fn() -> bool,
+            report: &mut dyn FnMut(CaptureReport),
+        ) {
             self.events.push("end".to_string());
             report(CaptureReport::Debug("sink: segment ended".to_string()));
         }
@@ -634,7 +660,12 @@ mod tests {
     }
 
     impl SpeechSink for DetectingSink {
-        fn accept(&mut self, _samples: &[f32], report: &mut dyn FnMut(CaptureReport)) {
+        fn accept(
+            &mut self,
+            _samples: &[f32],
+            _closing: &dyn Fn() -> bool,
+            report: &mut dyn FnMut(CaptureReport),
+        ) {
             self.accepted += 1;
             if self.accepted == self.detect_on {
                 report(CaptureReport::Debug("KWS result: {}".to_string()));
@@ -642,7 +673,12 @@ mod tests {
             }
         }
 
-        fn end_segment(&mut self, _report: &mut dyn FnMut(CaptureReport)) {}
+        fn end_segment(
+            &mut self,
+            _closing: &dyn Fn() -> bool,
+            _report: &mut dyn FnMut(CaptureReport),
+        ) {
+        }
 
         fn reset(&mut self) {}
     }
@@ -1062,7 +1098,12 @@ mod tests {
     }
 
     impl SpeechSink for SwitchingSink {
-        fn accept(&mut self, _samples: &[f32], report: &mut dyn FnMut(CaptureReport)) {
+        fn accept(
+            &mut self,
+            _samples: &[f32],
+            _closing: &dyn Fn() -> bool,
+            report: &mut dyn FnMut(CaptureReport),
+        ) {
             self.accepted += 1;
             if self.accepted == self.flip_on {
                 self.switch.set(self.to);
@@ -1070,7 +1111,12 @@ mod tests {
             report(CaptureReport::Debug(format!("chunk {}", self.accepted)));
         }
 
-        fn end_segment(&mut self, _report: &mut dyn FnMut(CaptureReport)) {}
+        fn end_segment(
+            &mut self,
+            _closing: &dyn Fn() -> bool,
+            _report: &mut dyn FnMut(CaptureReport),
+        ) {
+        }
 
         fn reset(&mut self) {}
     }
@@ -1120,6 +1166,251 @@ mod tests {
             ["VAD: speech (1 pre-roll chunks)", "chunk 1", "chunk 2"],
             "turned off part way: nothing after"
         );
+    }
+
+    /// A keyword engine for running the capture loop into the real spotter.
+    /// Each chunk makes one decode step ready, as the spotter's own stand-in
+    /// has it. It logs each chunk by its first sample, numbers the chunks of
+    /// silence a segment end feeds it, completes "HEY CLAUDE" on decode step
+    /// `complete_on`, and sets `close` while it takes the chunk named in
+    /// `close_on`: a close from the event loop landing while the capture
+    /// thread decodes that chunk.
+    struct NamingEngine {
+        log: Arc<Mutex<Vec<String>>>,
+        pending: usize,
+        decoded: usize,
+        silence: usize,
+        complete_on: Option<usize>,
+        close_on: Option<(&'static str, Arc<AtomicBool>)>,
+    }
+
+    impl NamingEngine {
+        fn new(log: &Arc<Mutex<Vec<String>>>) -> NamingEngine {
+            NamingEngine {
+                log: Arc::clone(log),
+                pending: 0,
+                decoded: 0,
+                silence: 0,
+                complete_on: None,
+                close_on: None,
+            }
+        }
+
+        fn note(&self, entry: String) {
+            self.log.lock().expect("log").push(entry);
+        }
+    }
+
+    impl KeywordEngine for NamingEngine {
+        fn accept_waveform(&mut self, _sample_rate: i32, samples: &[f32]) {
+            self.pending += 1;
+            let name = if samples.iter().all(|sample| *sample == 0.0) {
+                self.silence += 1;
+                format!("silence {}", self.silence)
+            } else {
+                format!("{}", samples[0])
+            };
+            if let Some((on, close)) = &self.close_on {
+                if *on == name {
+                    close.store(true, Ordering::SeqCst);
+                }
+            }
+            self.note(name);
+        }
+
+        fn is_ready(&mut self) -> bool {
+            self.pending > 0
+        }
+
+        fn decode(&mut self) {
+            self.pending -= 1;
+            self.decoded += 1;
+        }
+
+        fn result(&mut self) -> Option<KeywordHit> {
+            (self.complete_on == Some(self.decoded)).then(|| KeywordHit {
+                keyword: "HEY CLAUDE".to_string(),
+                json: "{}".to_string(),
+            })
+        }
+
+        fn reset(&mut self) {
+            self.note("reset".to_string());
+        }
+
+        fn replace_stream(&mut self) {
+            self.pending = 0;
+            self.silence = 0;
+            self.note("new stream".to_string());
+        }
+    }
+
+    impl Drop for NamingEngine {
+        fn drop(&mut self) {
+            self.note("dropped".to_string());
+        }
+    }
+
+    /// A slot holding the real spotter over `engine`, listening for "hey
+    /// claude", as preparation leaves it.
+    fn slot_with(engine: NamingEngine) -> Mutex<SpotterSlot> {
+        let mut phrases = PhraseMap::default();
+        phrases.insert("HEY CLAUDE".to_string(), "hey claude".to_string());
+        Mutex::new(SpotterSlot::holding(Spotter::new(
+            Box::new(engine),
+            phrases,
+        )))
+    }
+
+    /// Run a scripted stream through the capture loop into `slot`, the way a
+    /// microphone's thread does, and return the reports.
+    fn capture_into(slot: &Mutex<SpotterSlot>, source: &FakeSource) -> Vec<CaptureReport> {
+        let mut detector = FakeDetector {
+            scores: Rc::clone(&source.scores),
+            seen: Vec::new(),
+            fail_on_call: None,
+        };
+        let clock = Rc::clone(&source.clock);
+        let mut reports = Vec::new();
+        run_capture(
+            source,
+            &mut detector,
+            slot,
+            &source.closed,
+            &DebugSwitch::new(false),
+            &|| clock.get(),
+            &mut |report| reports.push(report),
+        );
+        reports
+    }
+
+    fn logged(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().expect("log").clone()
+    }
+
+    /// One segment: a loud chunk, then the four quiet chunks whose last ends
+    /// it, and `after`.
+    fn segment_then(after: Vec<Step>) -> Vec<Step> {
+        let mut steps = vec![loud(0.1), quiet(0.2), quiet(0.3), quiet(0.4), quiet(0.5)];
+        steps.extend(after);
+        steps
+    }
+
+    const SEGMENT: [&str; 5] = ["0.1", "0.2", "0.3", "0.4", "0.5"];
+
+    #[test]
+    fn a_pause_during_the_segment_end_flush_waits_for_one_chunk_and_the_resume_starts_clean() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeSource::new(segment_then(vec![quiet(0.6), quiet(0.7)]));
+        let mut engine = NamingEngine::new(&log);
+        engine.close_on = Some(("silence 3", Arc::clone(&source.closed)));
+        let slot = slot_with(engine);
+
+        let reports = capture_into(&slot, &source);
+        // The pause lands while the third chunk of silence decodes. That chunk
+        // is finished, and then the flush and the capture loop stop: the two
+        // chunks the stream still holds are never read.
+        assert_eq!(
+            logged(&log),
+            [&SEGMENT[..], &["silence 1", "silence 2", "silence 3"]].concat()
+        );
+        assert_eq!(source.steps.borrow().len(), 2);
+        assert!(reports.is_empty(), "a close is not a failure");
+
+        // The pause gives the spotter a new stream; the resume opens a new
+        // microphone, with a new capture loop, into the same spotter.
+        slot.lock().expect("slot").reset();
+        let resumed = FakeSource::new(vec![quiet(0.8), loud(0.9), loud(1.0)]);
+        capture_into(&slot, &resumed);
+        // Nothing from before the pause comes back: no silence is owed to the
+        // new stream, and the gate and the hysteresis start from nothing, so
+        // the lead-in is the resumed microphone's own.
+        assert_eq!(logged(&log)[8..], ["new stream", "0.8", "0.9", "1"]);
+    }
+
+    #[test]
+    fn a_stop_during_the_segment_end_flush_waits_for_one_chunk() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeSource::new(segment_then(vec![quiet(0.6)]));
+        let mut engine = NamingEngine::new(&log);
+        engine.close_on = Some(("silence 1", Arc::clone(&source.closed)));
+        let slot = slot_with(engine);
+
+        let reports = capture_into(&slot, &source);
+        assert!(reports.is_empty(), "a close is not a failure");
+        // The stop releases the spotter once the microphone is closed.
+        slot.lock().expect("slot").release();
+        assert_eq!(
+            logged(&log),
+            [&SEGMENT[..], &["silence 1", "dropped"]].concat()
+        );
+        assert_eq!(source.steps.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_detection_inside_the_segment_end_flush_ends_the_flush_there() {
+        // The segment's five chunks are decode steps 1 to 5, so the phrase
+        // completes on the second chunk of silence. The extension's pause then
+        // closes the microphone; here it lands with the next chunk read.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeSource::new(segment_then(vec![Step::CloseThenChunk { marker: 0.6 }]));
+        let mut engine = NamingEngine::new(&log);
+        engine.complete_on = Some(7);
+        let slot = slot_with(engine);
+
+        let reports = capture_into(&slot, &source);
+        assert_eq!(reports, [CaptureReport::Detected("hey claude".to_string())]);
+        assert_eq!(
+            logged(&log),
+            [&SEGMENT[..], &["silence 1", "silence 2", "reset"]].concat()
+        );
+    }
+
+    #[test]
+    fn audio_after_a_flush_a_detection_stopped_is_decoded_as_after_the_whole_flush() {
+        // No pause comes, and speech starts again on the same stream. The rest
+        // of the flush goes first, so the stream is fed what it was always fed:
+        // sixteen chunks of silence, the reset that ends them, then the lead-in.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeSource::new(segment_then(vec![quiet(0.6), loud(0.7)]));
+        let mut engine = NamingEngine::new(&log);
+        engine.complete_on = Some(7);
+        let slot = slot_with(engine);
+
+        let reports = capture_into(&slot, &source);
+        assert!(reports.contains(&CaptureReport::Detected("hey claude".to_string())));
+        let owed: Vec<String> = (3..=16).map(|chunk| format!("silence {chunk}")).collect();
+        let owed: Vec<&str> = owed.iter().map(String::as_str).collect();
+        assert_eq!(
+            logged(&log),
+            [
+                &SEGMENT[..],
+                &["silence 1", "silence 2", "reset"],
+                &owed,
+                &["reset", "0.6", "0.7"]
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn a_close_during_the_lead_in_stops_it_after_the_chunk_in_hand() {
+        // The lead-in is five chunks handed over at once. The close lands while
+        // the second decodes.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeSource::new(vec![
+            quiet(0.01),
+            quiet(0.02),
+            quiet(0.03),
+            quiet(0.04),
+            loud(0.05),
+        ]);
+        let mut engine = NamingEngine::new(&log);
+        engine.close_on = Some(("0.02", Arc::clone(&source.closed)));
+        let slot = slot_with(engine);
+
+        capture_into(&slot, &source);
+        assert_eq!(logged(&log), ["0.01", "0.02"]);
     }
 
     #[test]

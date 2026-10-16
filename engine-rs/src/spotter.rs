@@ -89,9 +89,14 @@ pub const KEYWORDS_SCORE: f32 = 1.0;
 /// gain stops at 1,600 ms. The one false positive in 14 minutes of speech that contains no
 /// phrase is the same clip at every length, including no flush, and the median
 /// delay from the end of speech to the detection goes from 352 ms to 380 ms.
-/// The flush is five decode steps, which on a desktop processor is about 20 ms
-/// of work on the capture thread at each segment end, and a pause waits for it:
-/// it closes the microphone, which joins that thread.
+///
+/// The flush is five decode steps of work on the capture thread at each
+/// segment end: tens of milliseconds on a fast core, and well over a hundred
+/// on a slow or power-throttled one. A pause or a stop closes the microphone,
+/// which waits for that thread, so the flush checks before each chunk whether
+/// the microphone is closing and stops there; the close waits for the chunk in
+/// hand, not for the rest of the flush. A keyword completing inside the flush
+/// stops it too (see `Spotter::flush_owed`).
 const SEGMENT_FLUSH_MS: usize = 1600;
 
 /// The flush, as the chunks a microphone would have delivered: a whole number
@@ -124,28 +129,45 @@ pub trait KeywordEngine: Send {
     fn replace_stream(&mut self);
 }
 
+/// One chunk of the silence a segment end feeds the stream.
+const SILENCE: [f32; CHUNK_SAMPLES] = [0.0; CHUNK_SAMPLES];
+
 /// The decode loop and the lookup from a decoded keyword to its phrase.
 pub struct Spotter {
     engine: Box<dyn KeywordEngine>,
     phrase_map: PhraseMap,
+    /// Chunks of segment-end silence the stream is still owed, and with them
+    /// the reset that ends the flush. The flush stops early when a keyword
+    /// completes inside it, because the search has just started again and the
+    /// extension answers a detection with a pause, which replaces the stream;
+    /// and when the microphone is closing. A stream that is fed anything before
+    /// it is replaced gets the rest of the flush first, so it decodes later
+    /// audio exactly as it would have after the whole flush. A pause drops
+    /// what is owed along with the stream.
+    flush_owed: usize,
 }
 
 impl Spotter {
     pub fn new(engine: Box<dyn KeywordEngine>, phrase_map: PhraseMap) -> Spotter {
-        Spotter { engine, phrase_map }
+        Spotter {
+            engine,
+            phrase_map,
+            flush_owed: 0,
+        }
     }
-}
 
-impl SpeechSink for Spotter {
-    /// Feed one chunk and report every keyword it completes.
-    fn accept(&mut self, samples: &[f32], report: &mut dyn FnMut(CaptureReport)) {
+    /// Feed one chunk and decode every step it makes ready. Each keyword that
+    /// completes is reported and starts a new search; returns whether one did.
+    fn decode(&mut self, samples: &[f32], report: &mut dyn FnMut(CaptureReport)) -> bool {
         self.engine.accept_waveform(SAMPLE_RATE as i32, samples);
 
+        let mut completed = false;
         while self.engine.is_ready() {
             self.engine.decode();
             let Some(hit) = self.engine.result() else {
                 continue;
             };
+            completed = true;
             match self.phrase_map.get(js_trim(&hit.keyword)) {
                 Some(phrase) => {
                     report(CaptureReport::Debug(format!("KWS result: {}", hit.json)));
@@ -158,20 +180,68 @@ impl SpeechSink for Spotter {
             }
             self.engine.reset();
         }
+        completed
+    }
+
+    /// Feed the stream the flush silence it is owed, one chunk at a time, and
+    /// start a new search after the last chunk. Stops before a chunk once
+    /// `closing` says the microphone is being closed, and, with
+    /// `stop_at_keyword`, after a chunk that completed a keyword; whatever is
+    /// left stays owed. Returns whether the stream is owed nothing.
+    fn flush(
+        &mut self,
+        closing: &dyn Fn() -> bool,
+        stop_at_keyword: bool,
+        report: &mut dyn FnMut(CaptureReport),
+    ) -> bool {
+        while self.flush_owed > 0 {
+            if closing() {
+                return false;
+            }
+            self.flush_owed -= 1;
+            let completed = self.decode(&SILENCE, report);
+            if self.flush_owed == 0 {
+                self.engine.reset();
+            } else if completed && stop_at_keyword {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl SpeechSink for Spotter {
+    /// Feed one chunk and report every keyword it completes. The rest of a
+    /// flush that a keyword stopped goes first, all of it.
+    fn accept(
+        &mut self,
+        samples: &[f32],
+        closing: &dyn Fn() -> bool,
+        report: &mut dyn FnMut(CaptureReport),
+    ) {
+        if self.flush(closing, false, report) && !closing() {
+            self.decode(samples, report);
+        }
     }
 
     /// Finish the segment: decode what its tail left behind, report anything
-    /// that completes, and start a new search. Only a segment end flushes; a
-    /// pause takes the other path, `reset`, because audio heard before the
-    /// microphone was handed over must not produce a detection after it.
-    fn end_segment(&mut self, report: &mut dyn FnMut(CaptureReport)) {
-        for _ in 0..SEGMENT_FLUSH_CHUNKS {
-            self.accept(&[0.0; CHUNK_SAMPLES], report);
+    /// that completes, and start a new search (see `SEGMENT_FLUSH_MS`). The
+    /// flush stops early when a keyword completes inside it, and when the
+    /// microphone is closing, because a pause or a stop is waiting for this
+    /// thread and replaces or drops the stream anyway.
+    ///
+    /// Only a segment end flushes; a pause takes the other path, `reset`,
+    /// because audio heard before the microphone was handed over must not
+    /// produce a detection after it.
+    fn end_segment(&mut self, closing: &dyn Fn() -> bool, report: &mut dyn FnMut(CaptureReport)) {
+        if self.flush(closing, false, report) {
+            self.flush_owed = SEGMENT_FLUSH_CHUNKS;
+            self.flush(closing, true, report);
         }
-        self.engine.reset();
     }
 
     fn reset(&mut self) {
+        self.flush_owed = 0;
         self.engine.replace_stream();
     }
 }
@@ -206,18 +276,31 @@ impl SpotterSlot {
     pub fn is_released(&self) -> bool {
         self.released
     }
+
+    /// A slot holding this spotter, as preparation leaves it.
+    #[cfg(test)]
+    pub fn holding(spotter: Spotter) -> SpotterSlot {
+        let mut slot = SpotterSlot::default();
+        slot.install(spotter);
+        slot
+    }
 }
 
 impl SpeechSink for SpotterSlot {
-    fn accept(&mut self, samples: &[f32], report: &mut dyn FnMut(CaptureReport)) {
+    fn accept(
+        &mut self,
+        samples: &[f32],
+        closing: &dyn Fn() -> bool,
+        report: &mut dyn FnMut(CaptureReport),
+    ) {
         if let Some(spotter) = self.spotter.as_mut() {
-            spotter.accept(samples, report);
+            spotter.accept(samples, closing, report);
         }
     }
 
-    fn end_segment(&mut self, report: &mut dyn FnMut(CaptureReport)) {
+    fn end_segment(&mut self, closing: &dyn Fn() -> bool, report: &mut dyn FnMut(CaptureReport)) {
         if let Some(spotter) = self.spotter.as_mut() {
-            spotter.end_segment(report);
+            spotter.end_segment(closing, report);
         }
     }
 
@@ -712,6 +795,22 @@ mod tests {
         }
     }
 
+    /// The microphone stays open: nothing is closing it.
+    fn staying_open() -> bool {
+        false
+    }
+
+    /// A close that lands while the `chunks`th chunk decodes: the check made
+    /// before each chunk finds the microphone open `chunks` times, and closing
+    /// from then on.
+    fn closing_after(chunks: usize) -> impl Fn() -> bool {
+        let asked = std::cell::Cell::new(0);
+        move || {
+            asked.set(asked.get() + 1);
+            asked.get() > chunks
+        }
+    }
+
     fn phrase_map(entries: &[(&str, &str)]) -> PhraseMap {
         let mut map = PhraseMap::default();
         for (decoded, phrase) in entries {
@@ -745,12 +844,31 @@ mod tests {
         fn accept(&mut self, marker: f32) {
             let reports = &mut self.reports;
             self.spotter
-                .accept(&[marker; 1600], &mut |report| reports.push(report));
+                .accept(&[marker; 1600], &staying_open, &mut |report| {
+                    reports.push(report)
+                });
+        }
+
+        /// Feed a chunk while a close lands after `chunks` chunks.
+        fn accept_closing_after(&mut self, marker: f32, chunks: usize) {
+            let reports = &mut self.reports;
+            self.spotter
+                .accept(&[marker; 1600], &closing_after(chunks), &mut |report| {
+                    reports.push(report)
+                });
         }
 
         fn end_segment(&mut self) {
             let reports = &mut self.reports;
-            self.spotter.end_segment(&mut |report| reports.push(report));
+            self.spotter
+                .end_segment(&staying_open, &mut |report| reports.push(report));
+        }
+
+        /// End the segment while a close lands after `chunks` chunks.
+        fn end_segment_closing_after(&mut self, chunks: usize) {
+            let reports = &mut self.reports;
+            self.spotter
+                .end_segment(&closing_after(chunks), &mut |report| reports.push(report));
         }
 
         fn calls(&self) -> Vec<Call> {
@@ -779,6 +897,11 @@ mod tests {
     /// One chunk of the silence a segment end feeds the stream, and the decode
     /// step it makes ready, repeated for the whole flush.
     fn flush() -> Vec<Call> {
+        flush_chunks(SEGMENT_FLUSH_CHUNKS)
+    }
+
+    /// The first `chunks` chunks of the flush, each with its decode step.
+    fn flush_chunks(chunks: usize) -> Vec<Call> {
         std::iter::repeat_with(|| {
             [
                 Call::Accept {
@@ -789,7 +912,7 @@ mod tests {
                 Call::Decode,
             ]
         })
-        .take(SEGMENT_FLUSH_CHUNKS)
+        .take(chunks)
         .flatten()
         .collect()
     }
@@ -829,7 +952,7 @@ mod tests {
             calls: Arc::clone(&calls),
         };
         let mut spotter = Spotter::new(Box::new(engine), PhraseMap::default());
-        spotter.accept(&[0.0; 1600], &mut |_| {});
+        spotter.accept(&[0.0; 1600], &staying_open, &mut |_| {});
         let decodes = calls
             .lock()
             .expect("calls")
@@ -866,8 +989,12 @@ mod tests {
         };
         let mut spotter = Spotter::new(Box::new(engine), config.phrase_map);
         let mut reports = Vec::new();
-        spotter.accept(&[0.0; 1600], &mut |report| reports.push(report));
-        spotter.accept(&[0.0; 1600], &mut |report| reports.push(report));
+        spotter.accept(&[0.0; 1600], &staying_open, &mut |report| {
+            reports.push(report)
+        });
+        spotter.accept(&[0.0; 1600], &staying_open, &mut |report| {
+            reports.push(report)
+        });
         let detected: Vec<CaptureReport> = reports
             .into_iter()
             .filter(|report| matches!(report, CaptureReport::Detected(_)))
@@ -951,14 +1078,141 @@ mod tests {
         assert!(rig.detections().is_empty());
         rig.end_segment();
         assert_eq!(rig.detections(), ["hey claude"]);
-        // The detection resets the search inside the flush, and the segment
-        // end resets it again at the end.
-        let resets = rig
-            .calls()
-            .iter()
-            .filter(|call| **call == Call::Reset)
-            .count();
-        assert_eq!(resets, 2);
+        assert_eq!(
+            rig.reports,
+            [
+                CaptureReport::Debug("KWS result: {\"keyword\":\"HEY CLAUDE\"}".to_string()),
+                CaptureReport::Detected("hey claude".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_flush_stops_once_a_keyword_completes_inside_it() {
+        // The phrase completes on the second chunk of silence. Its search has
+        // started again, and the extension answers a detection with a pause,
+        // which replaces the stream: nothing more is fed, so the pause does
+        // not wait for the rest of the flush.
+        let mut rig = Rig::new(&["", "", "HEY CLAUDE"]);
+        rig.accept(0.1);
+        rig.end_segment();
+        assert_eq!(rig.detections(), ["hey claude"]);
+        assert_eq!(
+            rig.calls(),
+            calls(&[
+                &[accept(0.1), Call::Decode],
+                &flush_chunks(2),
+                &[Call::Reset]
+            ])
+        );
+    }
+
+    #[test]
+    fn a_stream_fed_again_after_a_stopped_flush_gets_the_rest_of_the_flush_first() {
+        // No pause came, as when the extension holds a detection for
+        // confirmation. Before the next chunk the stream is fed the fourteen
+        // chunks of silence and the reset it is owed: the calls are the ones a
+        // flush that ran to the end would have made, in the same order, so the
+        // stream decodes what follows exactly as it would have.
+        let mut rig = Rig::new(&["", "", "HEY CLAUDE"]);
+        rig.accept(0.1);
+        rig.end_segment();
+        rig.accept(0.2);
+        assert_eq!(
+            rig.calls(),
+            calls(&[
+                &[accept(0.1), Call::Decode],
+                &flush_chunks(2),
+                &[Call::Reset],
+                &flush_chunks(14),
+                &[Call::Reset, accept(0.2), Call::Decode]
+            ])
+        );
+        assert_eq!(rig.detections(), ["hey claude"]);
+    }
+
+    #[test]
+    fn a_pause_drops_the_rest_of_a_flush_a_keyword_stopped() {
+        let mut rig = Rig::new(&["", "", "HEY CLAUDE"]);
+        rig.accept(0.1);
+        rig.end_segment();
+        rig.spotter.reset();
+        rig.accept(0.2);
+        // The new stream has heard nothing and is owed nothing.
+        assert_eq!(
+            rig.calls(),
+            calls(&[
+                &[accept(0.1), Call::Decode],
+                &flush_chunks(2),
+                &[Call::Reset, Call::ReplaceStream, accept(0.2), Call::Decode]
+            ])
+        );
+    }
+
+    #[test]
+    fn a_close_during_the_flush_stops_it_after_the_chunk_in_hand() {
+        // The close lands while the third chunk of silence decodes. That chunk
+        // is finished and nothing is fed after it, not even the reset: a pause
+        // replaces the stream and a stop drops it.
+        let mut rig = Rig::new(&[]);
+        rig.accept(0.1);
+        rig.end_segment_closing_after(3);
+        assert_eq!(
+            rig.calls(),
+            calls(&[&[accept(0.1), Call::Decode], &flush_chunks(3)])
+        );
+    }
+
+    #[test]
+    fn a_close_before_the_flush_feeds_it_nothing() {
+        let mut rig = Rig::new(&[]);
+        rig.accept(0.1);
+        rig.end_segment_closing_after(0);
+        assert_eq!(rig.calls(), [accept(0.1), Call::Decode]);
+    }
+
+    #[test]
+    fn a_resume_after_a_close_stopped_the_flush_starts_on_a_stream_owed_nothing() {
+        let mut rig = Rig::new(&[]);
+        rig.accept(0.1);
+        rig.end_segment_closing_after(3);
+        // The pause replaces the stream, and the resume feeds it its own audio.
+        rig.spotter.reset();
+        rig.accept(0.2);
+        assert_eq!(
+            rig.calls(),
+            calls(&[
+                &[accept(0.1), Call::Decode],
+                &flush_chunks(3),
+                &[Call::ReplaceStream, accept(0.2), Call::Decode]
+            ])
+        );
+    }
+
+    #[test]
+    fn the_rest_of_a_stopped_flush_stops_at_a_close_too() {
+        let mut rig = Rig::new(&["", "", "HEY CLAUDE"]);
+        rig.accept(0.1);
+        rig.end_segment();
+        // A close lands while the fifth of the fourteen chunks still owed
+        // decodes: the chunk the call was given is not decoded at all.
+        rig.accept_closing_after(0.2, 5);
+        assert_eq!(
+            rig.calls(),
+            calls(&[
+                &[accept(0.1), Call::Decode],
+                &flush_chunks(2),
+                &[Call::Reset],
+                &flush_chunks(5)
+            ])
+        );
+    }
+
+    #[test]
+    fn nothing_is_decoded_once_the_microphone_is_closing() {
+        let mut rig = Rig::new(&[]);
+        rig.accept_closing_after(0.1, 0);
+        assert!(rig.calls().is_empty());
     }
 
     #[test]
@@ -1012,16 +1266,20 @@ mod tests {
     fn an_empty_slot_drops_audio_and_a_filled_one_passes_it_on() {
         let mut slot = SpotterSlot::default();
         let mut reports = Vec::new();
-        slot.accept(&[0.0; 1600], &mut |report| reports.push(report));
-        slot.end_segment(&mut |report| reports.push(report));
+        slot.accept(&[0.0; 1600], &staying_open, &mut |report| {
+            reports.push(report)
+        });
+        slot.end_segment(&staying_open, &mut |report| reports.push(report));
         slot.reset();
         assert!(reports.is_empty());
 
         let rig = Rig::new(&["HEY CLAUDE"]);
         let engine_calls = Arc::clone(&rig.calls);
         slot.install(rig.spotter);
-        slot.accept(&[0.5; 1600], &mut |report| reports.push(report));
-        slot.end_segment(&mut |report| reports.push(report));
+        slot.accept(&[0.5; 1600], &staying_open, &mut |report| {
+            reports.push(report)
+        });
+        slot.end_segment(&staying_open, &mut |report| reports.push(report));
         slot.reset();
         assert!(reports.contains(&CaptureReport::Detected("hey claude".to_string())));
         assert_eq!(
@@ -1042,13 +1300,17 @@ mod tests {
         assert!(slot.is_released());
 
         let mut reports = Vec::new();
-        slot.accept(&[0.5; 1600], &mut |report| reports.push(report));
+        slot.accept(&[0.5; 1600], &staying_open, &mut |report| {
+            reports.push(report)
+        });
         assert!(reports.is_empty(), "the spotter is gone");
 
         let late = Rig::new(&["HEY CLAUDE"]);
         let calls = Arc::clone(&late.calls);
         slot.install(late.spotter);
-        slot.accept(&[0.5; 1600], &mut |report| reports.push(report));
+        slot.accept(&[0.5; 1600], &staying_open, &mut |report| {
+            reports.push(report)
+        });
         assert!(reports.is_empty());
         assert!(calls.lock().expect("calls").is_empty());
     }
@@ -1604,7 +1866,9 @@ mod tests {
         let mut reports = Vec::new();
         slot.lock()
             .expect("slot")
-            .accept(&[0.0; 1600], &mut |report| reports.push(report));
+            .accept(&[0.0; 1600], &staying_open, &mut |report| {
+                reports.push(report)
+            });
         assert!(reports.is_empty());
     }
 }
