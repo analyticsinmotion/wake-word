@@ -72,11 +72,7 @@ export interface ISpeechEngine {
    * nothing usable, so it omits the value rather than inventing a 1.0.
    */
   on(event: "detected", cb: (phrase: WakePhrase, confidence?: number) => void): this;
-  /**
-   * `cancelled`: the user cancelled the start, from the model download's
-   * progress notification. Nothing failed, so no error follows.
-   */
-  on(event: "started" | "stopped" | "paused" | "cancelled", cb: () => void): this;
+  on(event: "started" | "stopped" | "paused", cb: () => void): this;
   /** The engine stopped on its own and a restart is scheduled. */
   on(event: "restarting", cb: (restart: EngineRestart) => void): this;
   /**
@@ -96,8 +92,8 @@ export interface ISpeechEngine {
   readonly isPaused: boolean;
   /**
    * A start or a resume the extension asked for is under way: the model check,
-   * a download, the tokenising, the model load, or the microphone opening. It
-   * ends when the engine says it is listening, fails, or is stopped.
+   * the tokenising, the model load, or the microphone opening. It ends when
+   * the engine says it is listening, fails, or is stopped.
    */
   readonly isStarting: boolean;
   /** The restart in progress after the engine stopped on its own, or null. */

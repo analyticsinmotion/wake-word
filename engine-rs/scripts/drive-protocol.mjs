@@ -18,8 +18,9 @@
  * binary. One that needs `microphone` opens the default microphone as well,
  * so it needs one; --no-microphone says there is none, as on a CI runner. One
  * that needs `model` loads the keyword spotting model, which
- * WAKE_WORD_MODEL_DIR must point at: the extracted
- * sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 directory. Everything
+ * WAKE_WORD_MODEL_DIR must point at: the
+ * sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 directory, which the
+ * repository keeps under models/. Everything
  * that gets as far as the voice activity detector needs the model too,
  * because the spotter loads first. The script reads the engine's self-test
  * first and skips, saying why, any scenario whose prerequisite is missing.

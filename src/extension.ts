@@ -2,15 +2,8 @@ import * as vscode from "vscode";
 import * as os from "os";
 import * as path from "path";
 import { EngineRestart, WakePhrase, ISpeechEngine } from "./speechEngineInterface";
-import {
-  MODEL_NAME,
-  MODEL_SHA256,
-  SherpaEngine,
-  listInputDevices,
-  modelStatus,
-  nativeEnginePath,
-  probeNativeEngine,
-} from "./sherpaEngine";
+import { SherpaEngine, listInputDevices, nativeEnginePath, probeNativeEngine } from "./sherpaEngine";
+import { KWS_MODEL, checkModel, describeModelCheck, modelDirectory, removeDownloadedModel } from "./speechModel";
 import {
   CALIBRATION_DURATION_MS,
   CONFIRMATION_WINDOW_MS,
@@ -240,11 +233,11 @@ export const DEFAULT_ROUTES: WakePhrase[] = [
  * decibri for capture and a keyword spotter, in the packaged engine's child
  * process.
  */
-function createEngine(context: vscode.ExtensionContext): ISpeechEngine {
+function createEngine(): ISpeechEngine {
   const config = vscode.workspace.getConfiguration("wakeWord");
   // The editor's own name, for a message about microphone permission, which
   // the operating system grants to the editor that started the engine.
-  const engine = new SherpaEngine(context, readAudioDevice(config), vscode.env.appName);
+  const engine = new SherpaEngine(readAudioDevice(config), vscode.env.appName);
   engine.setDebugMode(verboseLog);
   return engine;
 }
@@ -303,10 +296,6 @@ function wireEngine(engine: ISpeechEngine, context: vscode.ExtensionContext): vo
     engineStarting = false;
     refreshStatusBar();
   });
-  engine.on("cancelled", () => {
-    log("info", "Model download cancelled: listening is off. Enable listening to download the speech model again.");
-    stopListening();
-  });
   // The engine stopped on its own and is being brought back: logged, and
   // shown in the status bar, but not raised as an error, because it may
   // recover. The error event follows if it does not.
@@ -361,7 +350,20 @@ export function activate(context: vscode.ExtensionContext) {
   // With wakeWord.pauseOnFocusLoss on, only a focused window listens.
   windowFocused = vscode.window.state.focused;
 
-  speechEngine = createEngine(context);
+  // Listening uses the model the package carries, so a copy an earlier
+  // version downloaded into global storage is removed: only its own files,
+  // and nothing else there. See removeDownloadedModel().
+  void removeDownloadedModel(context.globalStorageUri.fsPath).then((removed) => {
+    if (removed.files > 0) {
+      log(
+        "info",
+        "Removed the copy of the speech model an earlier version downloaded: " +
+          `${removed.files} files, ${(removed.bytes / 1_000_000).toFixed(1)} MB in global storage`
+      );
+    }
+  });
+
+  speechEngine = createEngine();
   wireEngine(speechEngine, context);
 
   // Status bar
@@ -458,7 +460,7 @@ export function activate(context: vscode.ExtensionContext) {
         lastDetectionTime = 0;
         clearConfirmation();
         speechEngine.dispose();
-        speechEngine = createEngine(context);
+        speechEngine = createEngine();
         wireEngine(speechEngine, context);
         log("info", "Engine rebuilt due to settings change");
         // The counters describe one engine's run. Write them out before
@@ -1780,7 +1782,7 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
         }
 
         // The window opens once the engine reports READY, so a slow start,
-        // a model download on a first run included, does not eat into it.
+        // the model load included, does not eat into it.
         progress.report({ message: "Starting the speech engine..." });
         refreshStatusBar();
         run.onEngineStarted = () => {
@@ -1972,9 +1974,11 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("wakeWord");
   const terminal = vscode.workspace.getConfiguration("terminal.integrated");
   const engineBinaryPath = nativeEnginePath(context.extensionPath);
-  const [engineBinaryStatus, devices] = await Promise.all([
+  const modelDir = modelDirectory(context.extensionPath);
+  const [engineBinaryStatus, devices, modelProblem] = await Promise.all([
     probeNativeEngine(engineBinaryPath),
     listInputDevices(engineBinaryPath),
+    checkModel(modelDir),
   ]);
   // Checked now, whatever the extension is doing: the report says which
   // routes a start would listen for, why the others are set aside, and which
@@ -1984,7 +1988,6 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   const availability = checkRouteAvailability(switches.on, DEFAULT_ROUTES, sources);
   const switchedOff = checkSwitchedOffCommands(switches.off, DEFAULT_ROUTES, sources);
   const switchesShown = switchedOff.length > 0 || switches.unmatched.length > 0;
-  const model = modelStatus(context.globalStorageUri.fsPath);
 
   const lines = formatDiagnostics({
     extensionVersion: String(context.extension.packageJSON.version),
@@ -2000,10 +2003,9 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     state: describeState(),
     isListening: speechEngine.isListening,
     isPaused: speechEngine.isPaused,
-    modelName: MODEL_NAME,
-    modelDir: model.dir,
-    modelPresent: model.present,
-    modelSha256: MODEL_SHA256,
+    modelName: KWS_MODEL.name,
+    modelDir,
+    modelCheck: describeModelCheck(modelProblem),
     audioDevice: readAudioDevice(config),
     devices,
     accountNames: accountNames(),

@@ -86,14 +86,11 @@ npm run compile                              # dist/, for the keyword builder
 npm install --no-save sherpa-onnx@<version>  # the version engine-rs/Cargo.toml pins
 ```
 
-and the keyword spotting model. The engine links sherpa-onnx as a C
-library, so the npm package is installed only to run this benchmark;
-`--no-save` keeps it out of the manifest. Without `--model-dir` the
-script looks in each editor's global storage for the copy the extension
-downloads when the engine first starts, so the simplest way to get the
-model is to enable listening once and let the extension fetch it. To use
-a copy elsewhere, extract the tarball named in `src/sherpaEngine.ts` and
-pass its directory.
+and the keyword spotting model, which is in the repository: `models/`
+holds the copy the package carries, and the script uses it unless
+`--model-dir` names another directory. The engine links sherpa-onnx as a
+C library, so the npm package is installed only to run this benchmark;
+`--no-save` keeps it out of the manifest.
 
 - `--threshold` is the keyword threshold, 0.01 to 0.9, default 0.05, the
   same range and default as `wakeWord.confidenceThreshold`. Like the

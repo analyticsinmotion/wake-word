@@ -53,9 +53,8 @@ function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
     isPaused: false,
     modelName: "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
     modelDir:
-      "C:\\Users\\Ann\\AppData\\Roaming\\Code\\User\\globalStorage\\analytics-in-motion.wake-word\\sherpa-onnx\\sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
-    modelPresent: true,
-    modelSha256: "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a",
+      "C:\\Users\\Ann\\.vscode\\extensions\\analytics-in-motion.wake-word\\models\\sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
+    modelCheck: "bundled, every file matches its pinned SHA-256",
     audioDevice: "",
     devices: { kind: "listed", devices: DEVICES },
     accountNames: ["Ann"],
@@ -94,9 +93,8 @@ describe("formatDiagnostics", () => {
       "State: listening",
       "Listening: true",
       "Paused: false",
-      "Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (downloaded)",
-      "Model dir: ~\\AppData\\Roaming\\Code\\User\\globalStorage\\analytics-in-motion.wake-word\\sherpa-onnx\\sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
-      "Model SHA-256: f170013b4716e41b...",
+      "Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, every file matches its pinned SHA-256)",
+      "Model dir: ~\\.vscode\\extensions\\analytics-in-motion.wake-word\\models\\sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
       "Audio device: (system default)",
       "Input devices: 2 (a name that looks like a person's is shown as <name>; check the names before posting)",
       "  0: Microphone Array, 2 ch, 48000 Hz (system default, selected)",
@@ -201,10 +199,10 @@ describe("formatDiagnostics", () => {
     expect(formatDiagnostics(input({ usingDefaultRoutes: true }))).toContain("Routes: 3 (defaults)");
   });
 
-  it("names a configured audio device and a missing model", () => {
-    const lines = formatDiagnostics(input({ audioDevice: "USB", modelPresent: false }));
+  it("names a configured audio device and a model file that is missing", () => {
+    const lines = formatDiagnostics(input({ audioDevice: "USB", modelCheck: "bundled, tokens.txt is missing" }));
     expect(lines).toContain("Audio device: USB");
-    expect(lines).toContain("Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (not downloaded)");
+    expect(lines).toContain("Model: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (bundled, tokens.txt is missing)");
   });
 
   it("lists phrase check lines under a count", () => {
@@ -279,13 +277,13 @@ describe("formatDiagnostics", () => {
         platform: "linux",
         homeDir: "/home/ann",
         engineBinaryPath: "/home/ann/.vscode/extensions/wake-word/bin/wake-word-engine",
-        modelDir: "/home/ann/.config/Code/User/globalStorage/x",
+        modelDir: "/home/ann/.vscode/extensions/wake-word/models/x",
       })
     );
     expect(lines).toContain(
       "Engine binary: ~/.vscode/extensions/wake-word/bin/wake-word-engine (self-test OK, sherpa-onnx=1.13.8)"
     );
-    expect(lines).toContain("Model dir: ~/.config/Code/User/globalStorage/x");
+    expect(lines).toContain("Model dir: ~/.vscode/extensions/wake-word/models/x");
   });
 });
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_ROUTES } from "../../src/extension";
-import { MODEL_FILES, MODEL_NAME } from "../../src/sherpaEngine";
+import { KWS_MODEL } from "../../src/speechModel";
 import { normalizePhrases } from "../../src/wakeWordCore";
 import {
   DEFAULT_PHRASES,
@@ -11,9 +11,10 @@ import {
 /**
  * The acoustic benchmark is a plain Node script and cannot import the
  * extension's TypeScript, so it carries its own copies of the default
- * phrases and the model file list. These tests are what keeps those copies
- * honest: a change to DEFAULT_ROUTES or to the model in sherpaEngine.ts
- * fails here until tests/acoustic/lib/benchmark-core.js follows.
+ * phrases and the model's directory and files. These tests are what keeps
+ * those copies honest: a change to DEFAULT_ROUTES or to KWS_MODEL in
+ * speechModel.ts fails here until tests/acoustic/lib/benchmark-core.js
+ * follows.
  */
 describe("benchmark constants", () => {
   it("lists exactly the default routes' phrases, in order", () => {
@@ -21,11 +22,11 @@ describe("benchmark constants", () => {
     expect(DEFAULT_PHRASES).toEqual(phrases);
   });
 
-  it("names the same model directory as the sherpa engine", () => {
-    expect(BENCHMARK_MODEL_NAME).toBe(MODEL_NAME);
+  it("names the same model directory as the package carries", () => {
+    expect(BENCHMARK_MODEL_NAME).toBe(KWS_MODEL.name);
   });
 
-  it("requires the same model files as the sherpa engine", () => {
-    expect(BENCHMARK_MODEL_FILES).toEqual(MODEL_FILES);
+  it("requires the same model files as the package carries", () => {
+    expect(BENCHMARK_MODEL_FILES).toEqual(KWS_MODEL.files.map((file) => file.name));
   });
 });

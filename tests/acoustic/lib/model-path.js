@@ -11,8 +11,8 @@ const path = require('path');
  * "does not exist" / "Errors in config!", still returns a handle, and the
  * unusable spotter then dies with "null function or function signature
  * mismatch" on first use. Forward slashes resolve on every platform, and the
- * model directory comes from the editor's global storage, which is spelled
- * with backslashes on Windows.
+ * model directory, the repository's models/ or one --model-dir names, is
+ * spelled with backslashes on Windows.
  *
  * Separators are rewritten before joining, and the join is the POSIX one, so
  * the result is identical whichever platform the benchmark runs on.

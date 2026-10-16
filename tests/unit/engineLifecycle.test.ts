@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as path from "path";
-import type * as vscode from "vscode";
 import { MockChildProcess } from "../mocks/childProcess";
 
 /**
@@ -11,9 +10,10 @@ import { MockChildProcess } from "../mocks/childProcess";
  * that stop() and pause() must perform, the pause and resume commands that
  * keep one child alive across handoffs, and the PAUSED and RELEASED
  * handshakes with their timeouts. `spawn` is replaced with a factory for
- * MockChildProcess, `fs` says the model is already downloaded, the tokeniser
- * splits phrases into one piece per word against a token table without
- * digits, and the timers are faked so a ten second backoff costs nothing.
+ * MockChildProcess, the check of the bundled model passes unless a test says
+ * otherwise, the tokeniser splits phrases into one piece per word against a
+ * token table without digits, and the timers are faked so a ten second
+ * backoff costs nothing.
  *
  * setImmediate is left real on purpose: `start()` is async because of the
  * model check and the tokeniser's load, and one real macrotask turn is the
@@ -23,10 +23,10 @@ import { MockChildProcess } from "../mocks/childProcess";
 const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
   existsSync: vi.fn(),
-  readFileSync: vi.fn(),
   accessSync: vi.fn(),
   chmodSync: vi.fn(),
   loadTokeniser: vi.fn(),
+  checkModel: vi.fn(),
 }));
 
 vi.mock("child_process", () => ({
@@ -35,23 +35,23 @@ vi.mock("child_process", () => ({
 
 vi.mock("fs", () => ({
   existsSync: mocks.existsSync,
-  readFileSync: mocks.readFileSync,
   accessSync: mocks.accessSync,
   chmodSync: mocks.chmodSync,
   constants: { X_OK: 1 },
-  mkdirSync: vi.fn(),
-  createWriteStream: vi.fn(),
-  writeFileSync: vi.fn(),
-  unlinkSync: vi.fn(),
 }));
 
 vi.mock("../../src/tokeniser", () => ({
   loadTokeniser: mocks.loadTokeniser,
 }));
 
-import * as vscodeApi from "vscode";
-import { DownloadCancelledError, SherpaEngine, nativeEnginePath, prepareNativeEngine } from "../../src/sherpaEngine";
+vi.mock("../../src/speechModel", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/speechModel")>()),
+  checkModel: mocks.checkModel,
+}));
+
+import { SherpaEngine, nativeEnginePath, prepareNativeEngine } from "../../src/sherpaEngine";
 import { EngineRestart, WakePhrase } from "../../src/speechEngineInterface";
+import { KWS_MODEL, modelDirectory, modelProblemMessage } from "../../src/speechModel";
 import { releaseThenFire } from "../../src/wakeWordCore";
 
 const ROUTES: WakePhrase[] = [
@@ -113,7 +113,6 @@ interface Captured {
   started: number;
   stopped: number;
   paused: number;
-  cancelled: number;
   detected: Array<{ phrase: WakePhrase; confidence: number | undefined }>;
   restarts: EngineRestart[];
   warnings: string[];
@@ -129,7 +128,6 @@ function capture(engine: SherpaEngine): Captured {
     started: 0,
     stopped: 0,
     paused: 0,
-    cancelled: 0,
     detected: [],
     restarts: [],
     warnings: [],
@@ -140,7 +138,6 @@ function capture(engine: SherpaEngine): Captured {
   engine.on("started", () => c.started++);
   engine.on("stopped", () => c.stopped++);
   engine.on("paused", () => c.paused++);
-  engine.on("cancelled", () => c.cancelled++);
   engine.on("detected", (phrase, confidence) => c.detected.push({ phrase, confidence }));
   engine.on("restarting", (restart) => c.restarts.push({ ...restart }));
   engine.on("warning", (msg) => c.warnings.push(msg));
@@ -151,12 +148,15 @@ function capture(engine: SherpaEngine): Captured {
 }
 
 function makeEngine(audioDevice = ""): { engine: SherpaEngine; events: Captured } {
-  const context = {
-    globalStorageUri: { fsPath: "/fake/storage" },
-  } as unknown as vscode.ExtensionContext;
-  const engine = new SherpaEngine(context, audioDevice);
+  const engine = new SherpaEngine(audioDevice);
   return { engine, events: capture(engine) };
 }
+
+/**
+ * Where the engine finds the bundled model: in the extension it runs from,
+ * beside bin/. Under test that is the repository.
+ */
+const MODEL_DIR = modelDirectory(path.join(__dirname, "..", ".."));
 
 /** One real macrotask turn: lets start()'s promise chain settle. */
 function flush(): Promise<void> {
@@ -202,13 +202,14 @@ beforeEach(() => {
     spawned.push(proc);
     return proc;
   });
-  // The model is already on disk: every file exists and the version matches.
+  // The engine binary is there, and every file of the bundled model is the
+  // one pinned.
   mocks.existsSync.mockReset();
   mocks.existsSync.mockReturnValue(true);
   mocks.accessSync.mockReset();
   mocks.chmodSync.mockReset();
-  mocks.readFileSync.mockReset();
-  mocks.readFileSync.mockReturnValue("1");
+  mocks.checkModel.mockReset();
+  mocks.checkModel.mockResolvedValue(null);
   mocks.loadTokeniser.mockReset();
   mocks.loadTokeniser.mockImplementation(async () => standInTokeniser());
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
@@ -425,17 +426,6 @@ describe("start", () => {
     expect(mocks.spawn).toHaveBeenCalledTimes(1);
     expect(configLine(latest()).threshold).toBe(0.5);
   });
-
-  it("reports the model being unavailable without spawning", async () => {
-    // Model files missing and the download path is not something a unit
-    // test can exercise, so ensureModel's failure surfaces as an error.
-    mocks.existsSync.mockReturnValue(false);
-    const { engine, events } = makeEngine();
-    await engine.start(ROUTES, 0.3, false);
-    expect(mocks.spawn).not.toHaveBeenCalled();
-    expect(events.errors).toHaveLength(1);
-    expect(events.errors[0].message).toMatch(/^Model unavailable: /);
-  });
 });
 
 // ── tokenising the phrases ──────────────────────────────────
@@ -453,7 +443,7 @@ describe("tokenising the phrases", () => {
     await engine.start([...ROUTES, { label: "Again", phrase: "Hey, Claude!", command: "x.y" }], 0.3, false);
     expect(mocks.loadTokeniser).toHaveBeenCalledTimes(1);
     const [modelDir] = mocks.loadTokeniser.mock.calls[0];
-    expect(modelDir).toMatch(/sherpa-onnx/);
+    expect(modelDir).toBe(MODEL_DIR);
     expect(tokeniser.encode.mock.calls.map(([text]) => text)).toEqual([
       "HEY CLAUDE",
       "HEY COMPUTER",
@@ -566,7 +556,8 @@ describe("tokenising the phrases", () => {
   it("logs the tokenising phases and each phrase's pieces in debug mode", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, true);
-    const lines = events.detail.filter((d) => !d.startsWith("Model already present"));
+    // The model check's two lines come first; "the bundled model" covers them.
+    const lines = events.detail.filter((d) => !d.startsWith("Model: ") && !d.startsWith("Timing: model-check"));
     expect(lines).toEqual([
       expect.stringMatching(/^Timing: bpe-load \d+ms$/),
       expect.stringMatching(/^Timing: tokenise \d+ms$/),
@@ -848,57 +839,89 @@ describe("isStarting", () => {
   });
 });
 
-describe("the model download", () => {
-  // The model is not on disk, so the start downloads it; the download's
-  // progress notification is where the outcome comes from.
-  beforeEach(() => {
-    mocks.existsSync.mockImplementation((file: string) => String(file).endsWith("wake-word-engine"));
-  });
-
-  it("ends a start cancelled from the download notification with cancelled, not an error", async () => {
-    vi.spyOn(vscodeApi.window, "withProgress").mockRejectedValue(new DownloadCancelledError());
-    const { engine, events } = makeEngine();
+describe("the bundled model", () => {
+  it("checks the model in the extension before spawning, and gives the engine that directory", async () => {
+    const { engine } = makeEngine();
     await engine.start(ROUTES, 0.3, false);
 
-    expect(events.cancelled).toBe(1);
+    const [binary] = mocks.spawn.mock.calls[0];
+    expect(MODEL_DIR).toBe(modelDirectory(path.dirname(path.dirname(binary))));
+    expect(mocks.checkModel).toHaveBeenCalledTimes(1);
+    expect(mocks.checkModel).toHaveBeenCalledWith(MODEL_DIR);
+    expect(mocks.loadTokeniser).toHaveBeenCalledWith(MODEL_DIR);
+    expect(configLine(latest()).modelDir).toBe(MODEL_DIR);
+  });
+
+  it("listens from the first start with no network request", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const { engine, events } = makeEngine();
+    await startAndReady(engine);
+
+    expect(engine.isListening).toBe(true);
     expect(events.errors).toEqual([]);
-    expect(engine.isStarting).toBe(false);
-    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("reports a stalled download as the model being unavailable", async () => {
-    vi.spyOn(vscodeApi.window, "withProgress").mockRejectedValue(
-      new Error("no data arrived for 30 seconds, so the download was stopped.")
+  it("says in the verbose log which model it checked, and how long the check took", async () => {
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, true);
+    expect(events.detail).toContain(
+      `Model: ${MODEL_DIR}, ${KWS_MODEL.files.length} files checked against their pinned SHA-256`
     );
+    expect(events.detail.some((line) => /^Timing: model-check \d+ms$/.test(line))).toBe(true);
+  });
+
+  it("reports a missing model file by its path, without spawning", async () => {
+    const problem = { kind: "missing" as const, file: path.join(MODEL_DIR, "tokens.txt") };
+    mocks.checkModel.mockResolvedValue(problem);
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, false);
 
-    expect(events.errors.map((e) => e.message)).toEqual([
-      "Model unavailable: no data arrived for 30 seconds, so the download was stopped.",
-    ]);
-    expect(events.cancelled).toBe(0);
     expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(mocks.loadTokeniser).not.toHaveBeenCalled();
+    expect(events.errors.map((e) => e.message)).toEqual([modelProblemMessage(problem)]);
+    expect(engine.isStarting).toBe(false);
   });
 
-  it("says nothing of a download that fails once the start has been stopped", async () => {
-    const download = deferred<string>();
-    vi.spyOn(vscodeApi.window, "withProgress").mockReturnValue(download.promise as never);
+  it("reports a model file that is not the one pinned, without spawning", async () => {
+    const problem = { kind: "changed" as const, file: path.join(MODEL_DIR, KWS_MODEL.files[0].name) };
+    mocks.checkModel.mockResolvedValue(problem);
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(events.errors.map((e) => e.message)).toEqual([modelProblemMessage(problem)]);
+  });
+
+  it("says nothing of a problem the check finds once the start has been stopped", async () => {
+    const check = deferred<unknown>();
+    mocks.checkModel.mockReturnValue(check.promise);
     const { engine, events } = makeEngine();
     const starting = engine.start(ROUTES, 0.3, false);
     engine.stop();
-    download.reject(new Error("no data arrived for 30 seconds, so the download was stopped."));
+    check.resolve({ kind: "missing", file: path.join(MODEL_DIR, "tokens.txt") });
     await starting;
 
     expect(events.errors).toEqual([]);
-    expect(events.cancelled).toBe(0);
+    expect(mocks.spawn).not.toHaveBeenCalled();
     expect(events.debug).toContain("Start abandoned: stopped during the model check");
+  });
+
+  it("starts on the next attempt once the check passes", async () => {
+    mocks.checkModel.mockResolvedValueOnce({ kind: "missing", file: path.join(MODEL_DIR, "bpe.model") });
+    const { engine, events } = makeEngine();
+    await engine.start(ROUTES, 0.3, false);
+    expect(events.errors).toHaveLength(1);
+
+    await engine.start(ROUTES, 0.3, false);
+    expect(mocks.checkModel).toHaveBeenCalledTimes(2);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("the config line", () => {
   it("names the editor that started the engine", async () => {
-    const context = { globalStorageUri: { fsPath: "/fake/storage" } } as unknown as vscode.ExtensionContext;
-    const engine = new SherpaEngine(context, "", "Example Editor");
+    const engine = new SherpaEngine("", "Example Editor");
     capture(engine);
     await engine.start(ROUTES, 0.3, false);
     expect(configLine(latest()).editorName).toBe("Example Editor");
@@ -969,8 +992,8 @@ describe("stop", () => {
   it("abandons a start that is still checking the model", async () => {
     // start() awaits the model check before it spawns. A stop that lands in
     // that window finds no child to kill and, before this was fixed, the
-    // spawn then went ahead anyway: Disable during a first-run model
-    // download ended with the engine listening and the status bar on Off.
+    // spawn then went ahead anyway: a Disable during the check ended with
+    // the engine listening and the status bar on Off.
     const { engine, events } = makeEngine();
     const starting = engine.start(ROUTES, 0.3, false);
     engine.stop();
@@ -1822,7 +1845,7 @@ describe("start while paused", () => {
 // ── debug timing ────────────────────────────────────────────
 
 describe("debug timing", () => {
-  it("logs bpe-load, tokenise, start-to-ready, pause-to-ack, and resume-to-ready in debug mode", async () => {
+  it("logs model-check, bpe-load, tokenise, start-to-ready, pause-to-ack, and resume-to-ready in debug mode", async () => {
     const { engine, events } = makeEngine();
     await engine.start(ROUTES, 0.3, true);
     const proc = latest();
@@ -1832,12 +1855,13 @@ describe("debug timing", () => {
     engine.resume();
     proc.sendLine("READY");
     const timing = events.detail.filter((d) => d.startsWith("Timing:"));
-    expect(timing).toHaveLength(5);
-    expect(timing[0]).toMatch(/^Timing: bpe-load \d+ms$/);
-    expect(timing[1]).toMatch(/^Timing: tokenise \d+ms$/);
-    expect(timing[2]).toMatch(/^Timing: start-to-ready \d+ms$/);
-    expect(timing[3]).toMatch(/^Timing: pause-to-ack \d+ms$/);
-    expect(timing[4]).toMatch(/^Timing: resume-to-ready \d+ms$/);
+    expect(timing).toHaveLength(6);
+    expect(timing[0]).toMatch(/^Timing: model-check \d+ms$/);
+    expect(timing[1]).toMatch(/^Timing: bpe-load \d+ms$/);
+    expect(timing[2]).toMatch(/^Timing: tokenise \d+ms$/);
+    expect(timing[3]).toMatch(/^Timing: start-to-ready \d+ms$/);
+    expect(timing[4]).toMatch(/^Timing: pause-to-ack \d+ms$/);
+    expect(timing[5]).toMatch(/^Timing: resume-to-ready \d+ms$/);
   });
 
   it("logs no timing outside debug mode", async () => {
@@ -2195,7 +2219,6 @@ describe("dispose", () => {
       "started",
       "stopped",
       "paused",
-      "cancelled",
       "restarting",
       "error",
       "warning",

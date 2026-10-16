@@ -493,12 +493,15 @@ export async function openWindow(
         engines.push(this);
       }
     },
-    MODEL_NAME: "model",
-    MODEL_SHA256: "0".repeat(64),
-    modelStatus: () => ({ dir: "model", versionFile: "version.txt", present: true }),
     nativeEnginePath: () => "wake-word-engine",
     probeNativeEngine: () => Promise.resolve("self-test OK"),
     listInputDevices: () => Promise.resolve({ kind: "listed", devices: [] }),
+  }));
+  // The bundled model passes its check, and there is no downloaded copy to remove.
+  vi.doMock("../../src/speechModel", async () => ({
+    ...(await vi.importActual<typeof import("../../src/speechModel")>("../../src/speechModel")),
+    checkModel: () => Promise.resolve(null),
+    removeDownloadedModel: () => Promise.resolve({ files: 0, bytes: 0 }),
   }));
   vi.doMock("../../src/lockFile", async () => {
     const real = await vi.importActual<typeof import("../../src/lockFile")>("../../src/lockFile");

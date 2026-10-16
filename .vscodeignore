@@ -20,3 +20,5 @@ test-*.js
 # The native engine's source. The built engine and the runtime files it loads
 # are staged into bin/, which ships, so no line here may exclude bin/.
 engine-rs/**
+# The keyword spotting model in models/ ships as well, and the extension reads
+# it from the package, so no line here may exclude models/ either.
