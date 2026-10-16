@@ -136,9 +136,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Publish to VS Code Marketplace
+      # Publish to the VS Code Marketplace the .vsix that the Package step
+      # wrote and the Verify step checked: the file the upload step attached
+      # to the release and the file the Open VSX step publishes. vsce reads
+      # the target platform from the package's manifest and refuses --target
+      # beside --packagePath, so the step gives none. On a re-run attempt,
+      # --skip-duplicate ends the step with success, and publishes nothing,
+      # when the Marketplace already has this version for this target, so a
+      # re-run of the release, or of one of its legs, does not fail on a
+      # target that an earlier attempt published. The first attempt leaves
+      # the flag out, so a version that is already published, such as one
+      # that package.json was not raised for, fails the step.
       - name: Publish to VS Code Marketplace
-        run: npx vsce publish --target ${{ matrix.target }}
+        run: npx vsce publish --packagePath wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix ${{ github.run_attempt != '1' && '--skip-duplicate' || '' }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
@@ -149,5 +159,9 @@ jobs:
       # token is available, rather than looking for a stored access token or
       # asking for one. An access token given with -p, --pat, or OVSX_PAT
       # takes precedence over trusted publishing, so the job sets none.
+      # On a re-run attempt, --skip-duplicate ends the step with success, and
+      # publishes nothing, when the registry answers that this version is
+      # already published for this target. The first attempt leaves the flag
+      # out, as the Marketplace step does.
       - name: Publish to Open VSX
-        run: npx ovsx publish wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix --trusted-publishing
+        run: npx ovsx publish wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix --trusted-publishing ${{ github.run_attempt != '1' && '--skip-duplicate' || '' }}
