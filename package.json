@@ -55,6 +55,10 @@
         "title": "Wake Word: Reset Microphone Consent"
       },
       {
+        "command": "wakeWord.switchRoutes",
+        "title": "Wake Word: Switch Routes On or Off"
+      },
+      {
         "command": "wakeWord.openSettings",
         "title": "Wake Word: Open Settings"
       },
@@ -87,7 +91,7 @@
         "wakeWord.routes": {
           "type": "array",
           "default": [],
-          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Claude, Hey Chat, Hey Computer).",
+          "description": "Wake phrase routing table. Each entry maps a spoken phrase to an editor command. If empty, default routes are used (Hey Claude, Hey Chat, Hey Computer). Use wakeWord.routesSwitchedOff to switch any route off and on again, the default routes included: the routes stay as they are.",
           "items": {
             "type": "object",
             "required": [
@@ -144,6 +148,15 @@
               }
             }
           }
+        },
+        "wakeWord.routesSwitchedOff": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "default": [],
+          "description": "Labels of the routes to switch off, such as \"Terminal\". Wake Word listens for the routes that are switched on. This applies to the default routes and to the routes in wakeWord.routes, and switching a default route off keeps the other default routes in place. Labels match in any case. Run Wake Word: Switch Routes On or Off to choose from a list."
         },
         "wakeWord.cooldownSeconds": {
           "type": "number",

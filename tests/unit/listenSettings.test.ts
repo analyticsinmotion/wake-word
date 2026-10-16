@@ -21,11 +21,12 @@ function state(over: Partial<ListeningState> = {}): ListeningState {
   };
 }
 
-const ROUTES: ListenSettingsChange = { routes: true, threshold: false, availability: false };
-const THRESHOLD: ListenSettingsChange = { routes: false, threshold: true, availability: false };
-const BOTH: ListenSettingsChange = { routes: true, threshold: true, availability: false };
-const AVAILABILITY: ListenSettingsChange = { routes: false, threshold: false, availability: true };
-const NEITHER: ListenSettingsChange = { routes: false, threshold: false, availability: false };
+const ROUTES: ListenSettingsChange = { routes: true, switches: false, threshold: false, availability: false };
+const SWITCHES: ListenSettingsChange = { routes: false, switches: true, threshold: false, availability: false };
+const THRESHOLD: ListenSettingsChange = { routes: false, switches: false, threshold: true, availability: false };
+const BOTH: ListenSettingsChange = { routes: true, switches: false, threshold: true, availability: false };
+const AVAILABILITY: ListenSettingsChange = { routes: false, switches: false, threshold: false, availability: true };
+const NEITHER: ListenSettingsChange = { routes: false, switches: false, threshold: false, availability: false };
 
 /** Every combination of the six state flags. */
 function allStates(): ListeningState[] {
@@ -64,6 +65,16 @@ describe("decideListenSettingsChange", () => {
       const routes = decideListenSettingsChange(ROUTES, s);
       expect(decideListenSettingsChange(THRESHOLD, s)).toBe(routes);
       expect(decideListenSettingsChange(BOTH, s)).toBe(routes);
+    }
+  });
+
+  it("treats a change to the route switches exactly as a routes change, in every state", () => {
+    // wakeWord.routesSwitchedOff decides which routes become keyword lines,
+    // which is what a routes change does, so it reaches the engine the same
+    // way: a restart while listening, held during a handoff or a start.
+    for (const s of allStates()) {
+      expect(decideListenSettingsChange(SWITCHES, s)).toBe(decideListenSettingsChange(ROUTES, s));
+      expect(decideListenSettingsChange({ ...ROUTES, switches: true }, s)).toBe(decideListenSettingsChange(ROUTES, s));
     }
   });
 
@@ -159,7 +170,7 @@ describe("decideListenSettingsChange", () => {
     // The rule the whole decision exists for: a paused engine is paused for
     // a handoff, and a handoff means an assistant has the microphone. Only
     // an engine that already holds it may be restarted where it stands.
-    for (const change of [ROUTES, THRESHOLD, BOTH, AVAILABILITY]) {
+    for (const change of [ROUTES, SWITCHES, THRESHOLD, BOTH, AVAILABILITY]) {
       for (const s of allStates()) {
         if (!s.listening) {
           expect(decideListenSettingsChange(change, s)).not.toBe("restart");
@@ -177,11 +188,16 @@ describe("decideListenSettingsChange", () => {
     expect(decideListenSettingsChange(NEITHER, state({ waiting: true }))).toBe("none");
   });
 
+  it("Every route switched off: switching one on checks the routes again", () => {
+    // The same wait as for a missing command: no engine, no handoff.
+    expect(decideListenSettingsChange(SWITCHES, state({ waiting: true }))).toBe("start");
+  });
+
   it("never interrupts a handoff: a paused engine is never started or restarted", () => {
     // A command appearing during a cooldown or a manual handoff is applied
     // when listening resumes, not by taking the microphone back from the
     // assistant it was handed to.
-    for (const change of [ROUTES, THRESHOLD, BOTH, AVAILABILITY]) {
+    for (const change of [ROUTES, SWITCHES, THRESHOLD, BOTH, AVAILABILITY]) {
       for (const s of allStates()) {
         if (handedOff(s)) {
           const action = decideListenSettingsChange(change, s);
@@ -198,7 +214,7 @@ describe("decideListenSettingsChange", () => {
   });
 
   it("starts only while waiting, with no engine listening, starting, or paused", () => {
-    for (const change of [ROUTES, THRESHOLD, BOTH, AVAILABILITY]) {
+    for (const change of [ROUTES, SWITCHES, THRESHOLD, BOTH, AVAILABILITY]) {
       for (const s of allStates()) {
         if (decideListenSettingsChange(change, s) === "start") {
           expect(s).toEqual(state({ waiting: true }));
@@ -209,7 +225,7 @@ describe("decideListenSettingsChange", () => {
 
   it("returns one of the five actions for every state", () => {
     const actions: ListenSettingsAction[] = ["none", "restart", "apply-on-resume", "apply-when-started", "start"];
-    for (const change of [NEITHER, ROUTES, THRESHOLD, BOTH, AVAILABILITY]) {
+    for (const change of [NEITHER, ROUTES, SWITCHES, THRESHOLD, BOTH, AVAILABILITY]) {
       for (const s of allStates()) {
         expect(actions).toContain(decideListenSettingsChange(change, s));
       }
@@ -224,9 +240,14 @@ describe("describeListenSettingsChange", () => {
     expect(describeListenSettingsChange(BOTH)).toBe("Routes and confidence threshold");
   });
 
+  it("names a change to the route switches", () => {
+    expect(describeListenSettingsChange(SWITCHES)).toBe("Route switches");
+    expect(describeListenSettingsChange({ ...ROUTES, switches: true })).toBe("Routes and route switches");
+  });
+
   it("names a change in which commands are available", () => {
     expect(describeListenSettingsChange(AVAILABILITY)).toBe("Command availability");
-    expect(describeListenSettingsChange({ routes: true, threshold: true, availability: true })).toBe(
+    expect(describeListenSettingsChange({ routes: true, switches: false, threshold: true, availability: true })).toBe(
       "Routes, confidence threshold and command availability"
     );
   });
@@ -269,6 +290,19 @@ describe("formatListenSettingsChange", () => {
     );
     expect(formatListenSettingsChange(AVAILABILITY, "start")).toBe(
       "Command availability changed while waiting for a route's command: checking the routes again"
+    );
+  });
+
+  it("says what a change to the route switches does, and what a start follows on from", () => {
+    expect(formatListenSettingsChange(SWITCHES, "restart")).toBe("Route switches changed: restarting listening");
+    expect(formatListenSettingsChange(SWITCHES, "apply-on-resume")).toBe(
+      "Route switches changed while listening was paused: applied when listening resumes"
+    );
+    expect(formatListenSettingsChange(SWITCHES, "start", "routes")).toBe(
+      "Route switches changed while every route was switched off: checking the routes again"
+    );
+    expect(formatListenSettingsChange(SWITCHES, "start", "commands")).toBe(
+      "Route switches changed while waiting for a route's command: checking the routes again"
     );
   });
 });

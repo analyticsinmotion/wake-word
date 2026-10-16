@@ -98,6 +98,22 @@ The Claude route uses manual handoff (see [Handoff mode](#handoff-mode)): after 
 
 The Claude route needs the Claude Code extension. Without it, that route is set aside and the other two still work: see [Routes whose command is not available](#routes-whose-command-is-not-available).
 
+To stop listening for one of these routes, switch it off: see [Switching a route off](#switching-a-route-off).
+
+### Switching a route off
+
+Switch any route off and back on, a default route or one of your own. Run **Wake Word: Switch Routes On or Off**, uncheck a route and press Enter. Listening restarts with the routes still checked.
+
+Your choice is saved as a list of route labels. Switching off a default route adds only its label, and the other default routes stay as they are:
+
+```json
+{
+  "wakeWord.routesSwitchedOff": ["Terminal"]
+}
+```
+
+**Wake Word: Show Diagnostics** lists the routes that are switched off. When every route is switched off, the status bar shows **Wake: Routes off**. Click it to choose a route to switch back on.
+
 ### Custom routes
 
 Add your own phrases in `settings.json`. Any spoken English phrase works:
@@ -157,7 +173,7 @@ Warnings never block a phrase. They are shown once per session, and again when y
 
 ### Routes whose command is not available
 
-When listening starts, Wake Word checks that each route's command exists in your editor. A route whose command is not available, such as the default Claude route when Claude Code is not installed, is not listened for. A notification names the route, its command, and the extension to install. It appears once, not every time the editor starts, and **Wake Word: Show Diagnostics** lists these routes under "Set aside".
+When listening starts, Wake Word checks that each route's command exists in your editor. A route whose command is not available, such as the default Claude route when Claude Code is not installed, is not listened for. A notification names the route, its command, and the extension to install. It appears once, not every time the editor starts, and **Wake Word: Show Diagnostics** lists these routes under "Set aside". Wake Word checks the commands of the routes that are switched on, so switching a route off also ends the notification about its command: switch off the Claude route if you work without Claude Code.
 
 Install or enable the extension a route needs and the route is listened for again, without restarting the editor. If none of your routes' commands are available, the microphone is not opened, and the status bar shows **Wake: No commands** until one is.
 
@@ -236,12 +252,14 @@ Wake Word works in remote windows: SSH, WSL, dev containers, and Codespaces open
 | Wake: Off | Not listening. Click, or press the toggle shortcut, to start |
 | Wake: Other window | Another window of the same editor has the microphone: it is still pausing, or a wake phrase handed it to an assistant there. This window listens as soon as it is released |
 | Wake: No commands | None of the routes' commands are available in this editor |
+| Wake: Routes off | Every route is switched off. Click it to choose the routes to listen for |
 
 ## Settings
 
 | Setting | Default | Description |
 | --- | --- | --- |
 | `wakeWord.routes` | `[]` | Wake phrase routing table. Uses defaults if empty. |
+| `wakeWord.routesSwitchedOff` | `[]` | Labels of the routes to switch off, the default routes included, which stay in place. **Wake Word: Switch Routes On or Off** sets it |
 | `wakeWord.cooldownSeconds` | `30` | Seconds to pause after handoff before resuming. Routes with `handoff: "manual"` wait for you instead |
 | `wakeWord.enableOnStartup` | `true` | Start listening when the editor opens |
 | `wakeWord.showNotificationOnDetection` | `true` | Show notification when wake phrase is heard |
@@ -271,6 +289,7 @@ Every command is in the Command Palette under **Wake Word**. Toggle Listening al
 | Wake Word: Enable Listening | Start listening, or resume after a handoff |
 | Wake Word: Disable Listening | Stop listening and release the microphone |
 | Wake Word: Toggle Listening | The status bar click: turn listening off or on, or resume after a manual handoff |
+| Wake Word: Switch Routes On or Off | Choose which routes are listened for, the default routes included |
 | Wake Word: Calibrate | Listen for 15 seconds and report each phrase heard, without running any route |
 | Wake Word: Show Diagnostics | Write a report to the Wake Word output channel, with Show Log, Copy to Clipboard, and Report Issue |
 | Wake Word: Open Settings | Open the Settings editor at Wake Word's settings |

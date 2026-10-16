@@ -23,10 +23,14 @@ import {
   MicrophoneUse,
   PendingConfirmation,
   RouteAvailability,
+  RouteSwitches,
   SessionStats,
   StatusBarState,
   StatusFacts,
+  WaitingFor,
+  applyRouteSwitches,
   checkRouteAvailability,
+  checkSwitchedOffCommands,
   clampThreshold,
   commandSources,
   createSessionStats,
@@ -42,6 +46,7 @@ import {
   formatCalibrationReport,
   formatConfidence,
   formatDiagnostics,
+  formatEveryRouteSwitchedOff,
   formatListenSettingsChange,
   formatPhraseChecks,
   formatPhraseChecksSummary,
@@ -54,11 +59,15 @@ import {
   needsListenerLock,
   phraseChecksKey,
   planAvailabilityReport,
+  planRouteSwitchWrite,
+  planSwitchReport,
   recordDetection,
   redactHome,
   releaseThenFire,
   resolveHandoff,
   resolveRoutes,
+  routeSwitchItems,
+  routeSwitchScope,
   setAsideKey,
   shouldDebounce,
   statusBarView,
@@ -146,12 +155,16 @@ let extensionState: vscode.Memento | null = null;
 let appliedSetAsideKey: string | null = null;
 /** The last check reported this session; null before the first. */
 let reportedAvailability: RouteAvailability | null = null;
+/** The route switches the last start reported this session; null before the first. */
+let reportedSwitches: RouteSwitches | null = null;
 /**
- * None of the routes' commands was available at the last start, so no
- * engine was started and the microphone is closed. An extension change or a
- * routes change starts listening again. See startListening().
+ * Nothing could be listened for at the last start, so no engine was started
+ * and the microphone is closed: none of the routes' commands was available,
+ * or every route is switched off. An extension change, a routes change, or a
+ * change to the switches starts listening again. Null otherwise. See
+ * startListening().
  */
-let waitingForCommands = false;
+let waitingFor: WaitingFor | null = null;
 /**
  * Advanced by every start, resume, stop, and calibration run. A start or a
  * resume reads the editor's commands, which takes a round trip, and
@@ -162,6 +175,15 @@ let listenRequest = 0;
 
 /** Global state key for the set-aside routes the user was last told about. */
 const TOLD_SET_ASIDE_KEY = "wakeWord.setAsideNotified";
+
+/**
+ * The setting that lists the routes switched off, by label, within the
+ * `wakeWord` section. See applyRouteSwitches().
+ */
+const ROUTES_SWITCHED_OFF = "routesSwitchedOff";
+
+/** The switch command's title, which also names its button in notifications. */
+const SWITCH_ROUTES = "Switch Routes On or Off";
 
 /** How long Calibrate waits for an engine it had to start before giving up. */
 const CALIBRATION_START_TIMEOUT_MS = 30_000;
@@ -373,10 +395,15 @@ export function activate(context: vscode.ExtensionContext) {
         // for focus or for the other window's lock: a click turns it off, as
         // each of those tooltips says.
         stopListening();
+      } else if (waitingFor === "routes") {
+        // Every route is switched off: a click chooses the routes to listen
+        // for, as the tooltip says.
+        return chooseRouteSwitches();
       } else {
         return handleConsentThenStart(context, true);
       }
     }),
+    vscode.commands.registerCommand("wakeWord.switchRoutes", () => chooseRouteSwitches()),
     vscode.commands.registerCommand("wakeWord.openSettings", () => {
       vscode.commands.executeCommand("workbench.action.openSettings", "wakeWord");
     }),
@@ -456,12 +483,13 @@ export function activate(context: vscode.ExtensionContext) {
         applyFocusSetting();
       }
 
-      // The routes and the threshold are read at the start and sent in the
-      // engine's config line, so a running engine has the old ones. What
-      // that means here depends on what the extension is doing: see
-      // decideListenSettingsChange().
+      // The routes, the switches, and the threshold are read at the start and
+      // sent in the engine's config line, so a running engine has the old
+      // ones. What that means here depends on what the extension is doing:
+      // see decideListenSettingsChange().
       applyListenSettingsChange(context, {
         routes: e.affectsConfiguration("wakeWord.routes"),
+        switches: e.affectsConfiguration(`wakeWord.${ROUTES_SWITCHED_OFF}`),
         threshold: e.affectsConfiguration("wakeWord.confidenceThreshold"),
         availability: false,
       });
@@ -616,7 +644,8 @@ function logSessionStats(): void {
 // ── Core logic ──────────────────────────────────────────────
 
 /**
- * Start listening for the routes whose commands are available.
+ * Start listening for the routes that are switched on and whose commands are
+ * available.
  *
  * The editor's commands are read first, which is the one wait in a start.
  * Everything after it, from reading the settings to starting the engine,
@@ -625,7 +654,8 @@ function logSessionStats(): void {
  * start, which then stands down.
  *
  * `explicit` is set when the user asked to listen. If no route's command is
- * available, they are then told so even if they were told before.
+ * available, they are then told so even if they were told before, and if
+ * every route is switched off, they are told that.
  */
 async function startListening(explicit = false): Promise<void> {
   cancelPendingHandoff();
@@ -637,7 +667,7 @@ async function startListening(explicit = false): Promise<void> {
   if (consentWithdrawn()) {
     return;
   }
-  waitingForCommands = false;
+  waitingFor = null;
   // This start decides afresh what the status bar says: a failure before it
   // is behind it, and the engine is marked as starting only once it is asked
   // to start, below.
@@ -673,8 +703,12 @@ async function startListening(explicit = false): Promise<void> {
   }
   stopLockWatcher();
 
-  const availability = checkRouteAvailability(routes, DEFAULT_ROUTES, sources);
-  reportAvailability(availability, explicit);
+  // A route the user switched off is not listened for, and its command is
+  // not checked, so it is never reported as set aside either.
+  const switches = applyRouteSwitches(routes, config.get<unknown>(ROUTES_SWITCHED_OFF, []));
+  const availability = checkRouteAvailability(switches.on, DEFAULT_ROUTES, sources);
+  reportSwitches(switches);
+  reportAvailability(availability, explicit, switches.off.length);
   // The settings this start carries are the ones just read, so a change
   // still waiting on a start or a resume is spent, and a change that arrives
   // before the engine says READY is what the next one is for.
@@ -682,8 +716,15 @@ async function startListening(explicit = false): Promise<void> {
   listenSettingsChangedWhileStarting = false;
   appliedSetAsideKey = setAsideKey(availability.setAside);
 
+  if (switches.on.length === 0) {
+    waitToListen("routes");
+    if (explicit) {
+      tellEveryRouteSwitchedOff();
+    }
+    return;
+  }
   if (availability.listened.length === 0) {
-    waitForCommands();
+    waitToListen("commands");
     return;
   }
 
@@ -692,10 +733,11 @@ async function startListening(explicit = false): Promise<void> {
   const audioDevice = readAudioDevice(config);
   const deviceNote = audioDevice ? `, device="${audioDevice}"` : "";
   const setAsideNote = availability.setAside.length > 0 ? `, ${availability.setAside.length} set aside` : "";
+  const switchedOffNote = switches.off.length > 0 ? `, ${switches.off.length} switched off` : "";
   log(
     "info",
-    `Starting: ${listened.length} routes${setAsideNote}, threshold=${describeThreshold(threshold, listened)}, ` +
-      `verbose log=${verboseLog ? "on" : "off"}${deviceNote}`
+    `Starting: ${listened.length} routes${setAsideNote}${switchedOffNote}, ` +
+      `threshold=${describeThreshold(threshold, listened)}, verbose log=${verboseLog ? "on" : "off"}${deviceNote}`
   );
   log(
     "info",
@@ -710,16 +752,30 @@ async function startListening(explicit = false): Promise<void> {
 }
 
 /**
- * No route's command is available, so there is nothing to listen for. Stop
- * the engine, which only matters for a paused one left from a handoff, give
- * the listener lock up so another window can listen, and wait: an extension
- * change or a routes change starts listening again, through
+ * There is nothing to listen for: no route's command is available
+ * (`commands`), or every route is switched off (`routes`). Stop the engine,
+ * which only matters for a paused one left from a handoff, give the listener
+ * lock up so another window can listen, and wait: an extension change, a
+ * routes change, or a change to the switches starts listening again, through
  * decideListenSettingsChange(), and so does Enable or a status bar click.
  */
-function waitForCommands(): void {
+function waitToListen(reason: WaitingFor): void {
   releaseLockWhenClosed(speechEngine.stop());
-  waitingForCommands = true;
+  waitingFor = reason;
   refreshStatusBar();
+}
+
+/**
+ * The user asked to listen and every route is switched off. They switched
+ * the routes off themselves, so this is said only when they ask, with the
+ * way to switch one on.
+ */
+function tellEveryRouteSwitchedOff(): void {
+  vscode.window.showInformationMessage(formatEveryRouteSwitchedOff(), SWITCH_ROUTES).then((choice) => {
+    if (choice === SWITCH_ROUTES) {
+      void chooseRouteSwitches();
+    }
+  });
 }
 
 /**
@@ -747,13 +803,13 @@ function listeningState(): ListeningState {
     paused: speechEngine.isPaused,
     cooldown: countdownTimer !== null,
     manualPause: isManuallyPaused,
-    waiting: waitingForCommands,
+    waiting: waitingFor !== null,
   };
 }
 
 /**
- * Act on a change to what the engine listens for: the routes, the
- * threshold, or which routes' commands are available. What that means
+ * Act on a change to what the engine listens for: the routes, the switches,
+ * the threshold, or which routes' commands are available. What that means
  * depends on what the extension is doing: see decideListenSettingsChange().
  */
 function applyListenSettingsChange(
@@ -762,7 +818,7 @@ function applyListenSettingsChange(
   state: ListeningState = listeningState()
 ): void {
   const action = decideListenSettingsChange(change, state);
-  const line = formatListenSettingsChange(change, action);
+  const line = formatListenSettingsChange(change, action, waitingFor ?? "commands");
   if (line) {
     log("info", line);
   }
@@ -825,7 +881,7 @@ function stopListening() {
   listenSettingsChangedWhileStarting = false;
   engineStarting = false;
   engineFailure = null;
-  waitingForCommands = false;
+  waitingFor = null;
   lastDetectionTime = 0;
   releaseLockWhenClosed(speechEngine.stop());
   refreshStatusBar();
@@ -1065,6 +1121,22 @@ function buildRoutes(config: vscode.WorkspaceConfiguration): WakePhrase[] {
   return resolveRoutes(userRoutes, DEFAULT_ROUTES);
 }
 
+/** The configured routes, split by wakeWord.routesSwitchedOff. See applyRouteSwitches(). */
+function readRouteSwitches(config: vscode.WorkspaceConfiguration): RouteSwitches {
+  return applyRouteSwitches(buildRoutes(config), config.get<unknown>(ROUTES_SWITCHED_OFF, []));
+}
+
+/**
+ * Log which routes are switched off, and which labels name no route, when
+ * that differs from the last start this session. See planSwitchReport().
+ */
+function reportSwitches(switches: RouteSwitches): void {
+  for (const line of planSwitchReport(switches, reportedSwitches)) {
+    log(line.level, line.text);
+  }
+  reportedSwitches = switches;
+}
+
 /** Phrase quality warnings and collisions for these routes, as log lines. */
 function checkPhrases(routes: readonly WakePhrase[]): string[] {
   return formatPhraseChecks(validatePhraseQuality(routes), detectPhraseCollisions(routes));
@@ -1097,6 +1169,66 @@ function reportPhraseChecks(routes: readonly WakePhrase[]): void {
   });
 }
 
+// ── Route switches ──────────────────────────────────────────
+
+/**
+ * Let the user switch routes on and off from a list, one entry per label,
+ * and save the choice in wakeWord.routesSwitchedOff. The routes themselves
+ * are never written: a default route switched off stays a default route,
+ * and the other defaults go on coming from the extension.
+ *
+ * The setting is written where its value is read from: the workspace
+ * settings if they set it, the user settings otherwise (see
+ * routeSwitchScope()). The change reaches the engine as any change to the
+ * setting does, through the configuration change handler.
+ */
+async function chooseRouteSwitches(): Promise<void> {
+  const config = vscode.workspace.getConfiguration("wakeWord");
+  const routes = buildRoutes(config);
+  const switches = applyRouteSwitches(routes, config.get<unknown>(ROUTES_SWITCHED_OFF, []));
+  const scope = routeSwitchScope(config.inspect<unknown>(ROUTES_SWITCHED_OFF));
+  // Every route's command is checked, switched off or not, so an entry
+  // whose route would not be listened for says why.
+  const setAside = checkRouteAvailability(routes, DEFAULT_ROUTES, await readCommandSources()).setAside;
+  const picked = await vscode.window.showQuickPick(routeSwitchItems(routes, switches, setAside), {
+    title: `Wake Word: ${SWITCH_ROUTES}`,
+    placeHolder: `Check the routes to listen for. Saved in the ${scope} settings.`,
+    canPickMany: true,
+    matchOnDescription: true,
+  });
+  if (!picked) {
+    return;
+  }
+  // Read again: the setting can have changed while the list was open.
+  const latest = vscode.workspace.getConfiguration("wakeWord");
+  const write = planRouteSwitchWrite(
+    latest.inspect<unknown>(ROUTES_SWITCHED_OFF),
+    routes,
+    new Set(picked.map((item) => item.key))
+  );
+  if (!write) {
+    return;
+  }
+  // Logged before the write: the change event it raises logs what listening
+  // does about it.
+  log(
+    "info",
+    `Saving the route switches in the ${write.scope} settings: ` +
+      `wakeWord.${ROUTES_SWITCHED_OFF} becomes ${JSON.stringify(write.value ?? [])}`
+  );
+  try {
+    await latest.update(
+      ROUTES_SWITCHED_OFF,
+      write.value,
+      write.scope === "workspace" ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global
+    );
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", `Could not save the route switches in the ${write.scope} settings: ${message}`);
+    vscode.window.showErrorMessage(`Wake Word: Could not save the route switches. ${message}`);
+  }
+}
+
 // ── Route availability ──────────────────────────────────────
 
 /**
@@ -1123,10 +1255,11 @@ async function readCommandSources(): Promise<CommandSources | null> {
   }
 }
 
-/** Check the configured routes' commands. */
-async function checkConfiguredRoutes(): Promise<RouteAvailability> {
+/** Check the commands of the configured routes that are switched on. */
+async function checkConfiguredRoutes(): Promise<{ switches: RouteSwitches; availability: RouteAvailability }> {
   const sources = await readCommandSources();
-  return checkRouteAvailability(buildRoutes(vscode.workspace.getConfiguration("wakeWord")), DEFAULT_ROUTES, sources);
+  const switches = readRouteSwitches(vscode.workspace.getConfiguration("wakeWord"));
+  return { switches, availability: checkRouteAvailability(switches.on, DEFAULT_ROUTES, sources) };
 }
 
 /**
@@ -1135,14 +1268,16 @@ async function checkConfiguredRoutes(): Promise<RouteAvailability> {
  * again while it stays set aside, restarts included. What they were told
  * is kept in global state, which stays on this machine. Settings would
  * carry it to other machines through Settings Sync, where the command may
- * be there. See planAvailabilityReport().
+ * be there. See planAvailabilityReport(), which `switchedOff`, the number of
+ * routes switched off, is passed on to.
  */
-function reportAvailability(availability: RouteAvailability, explicit: boolean): void {
+function reportAvailability(availability: RouteAvailability, explicit: boolean, switchedOff: number): void {
   const report = planAvailabilityReport(
     availability,
     reportedAvailability,
     extensionState?.get(TOLD_SET_ASIDE_KEY),
-    explicit
+    explicit,
+    switchedOff
   );
   reportedAvailability = availability;
   for (const line of report.lines) {
@@ -1169,18 +1304,18 @@ function reportAvailability(availability: RouteAvailability, explicit: boolean):
  * window, there is nothing to do: the next start checks for itself.
  */
 async function onExtensionsChanged(context: vscode.ExtensionContext): Promise<void> {
-  const change: ListenSettingsChange = { routes: false, threshold: false, availability: true };
+  const change: ListenSettingsChange = { routes: false, switches: false, threshold: false, availability: true };
   if (decideListenSettingsChange(change, listeningState()) === "none") {
     return;
   }
-  const availability = await checkConfiguredRoutes();
+  const { switches, availability } = await checkConfiguredRoutes();
   // The state can have moved while the commands were read.
   const state = listeningState();
   change.availability = setAsideKey(availability.setAside) !== appliedSetAsideKey;
   if (decideListenSettingsChange(change, state) === "none") {
     return;
   }
-  reportAvailability(availability, false);
+  reportAvailability(availability, false, switches.off.length);
   applyListenSettingsChange(context, change, state);
 }
 
@@ -1445,7 +1580,7 @@ async function resumeListening(): Promise<void> {
   // aside, which can change during a pause with no extension changing, when
   // a command is registered late, so the commands are checked first.
   if (speechEngine.isPaused && !listenSettingsChangedWhilePaused) {
-    const availability = await checkConfiguredRoutes();
+    const { availability } = await checkConfiguredRoutes();
     if (request !== listenRequest) {
       return;
     }
@@ -1506,7 +1641,7 @@ function capturePriorState(): PriorState {
   if (isPausedByFocus) {
     return { kind: "focus-paused" };
   }
-  if (waitingForCommands) {
+  if (waitingFor !== null) {
     return { kind: "waiting" };
   }
   return { kind: "off" };
@@ -1528,8 +1663,9 @@ function capturePriorState(): PriorState {
  * click, when listening is disabled or the engine is rebuilt (nothing is
  * restored then: those have settled the state themselves), or when the
  * engine reports an error. A run that starts the engine starts it for the
- * routes whose commands are available, and ends before it starts if there
- * are none.
+ * routes that are switched on and whose commands are available, and ends
+ * before it starts if there are none. With every route switched off there
+ * is nothing to calibrate, and no run begins.
  */
 async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
   if (calibration) {
@@ -1559,6 +1695,20 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
     );
     return;
   }
+  const switches = applyRouteSwitches(routes, config.get<unknown>(ROUTES_SWITCHED_OFF, []));
+  if (switches.on.length === 0) {
+    vscode.window
+      .showWarningMessage(
+        "Wake Word: Calibrate listens for the routes that are switched on, and every route is switched off.",
+        SWITCH_ROUTES
+      )
+      .then((choice) => {
+        if (choice === SWITCH_ROUTES) {
+          void chooseRouteSwitches();
+        }
+      });
+    return;
+  }
   const threshold = clampThreshold(config.get<number>("confidenceThreshold", DEFAULT_THRESHOLD));
   const seconds = CALIBRATION_DURATION_MS / 1000;
 
@@ -1577,7 +1727,7 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
   engineFailure = null;
   log(
     "info",
-    `Calibration: starting (${seconds}s, threshold=${describeThreshold(threshold, routes)}, was ${prior.kind})`
+    `Calibration: starting (${seconds}s, threshold=${describeThreshold(threshold, switches.on)}, was ${prior.kind})`
   );
 
   const run: CalibrationRun = {
@@ -1641,7 +1791,7 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
           openWindow();
         };
         timer = setTimeout(() => run.finish("start-timeout"), CALIBRATION_START_TIMEOUT_MS);
-        void startCalibrationEngine(run, routes, threshold);
+        void startCalibrationEngine(run, switches, threshold);
       })
   );
 
@@ -1650,15 +1800,16 @@ async function runCalibration(context: vscode.ExtensionContext): Promise<void> {
 }
 
 /**
- * Start the engine for a calibration run, for the routes whose commands are
- * available, as a start for listening does. The engine keeps those routes
- * after the run and a resume replays them, so a route set aside must not
- * reach it here either. With nothing to listen for, the run ends without
- * starting anything, and the user is told why: they asked for the run.
+ * Start the engine for a calibration run, for the routes switched on whose
+ * commands are available, as a start for listening does. The engine keeps
+ * those routes after the run and a resume replays them, so a route set
+ * aside or switched off must not reach it here either. With nothing to
+ * listen for, the run ends without starting anything, and the user is told
+ * why: they asked for the run.
  */
 async function startCalibrationEngine(
   run: CalibrationRun,
-  routes: WakePhrase[],
+  switches: RouteSwitches,
   threshold: number
 ): Promise<void> {
   const sources = await readCommandSources();
@@ -1666,8 +1817,9 @@ async function startCalibrationEngine(
     // Cancelled, or listening was disabled, while the commands were read.
     return;
   }
-  const availability = checkRouteAvailability(routes, DEFAULT_ROUTES, sources);
-  reportAvailability(availability, true);
+  const availability = checkRouteAvailability(switches.on, DEFAULT_ROUTES, sources);
+  reportSwitches(switches);
+  reportAvailability(availability, true, switches.off.length);
   if (availability.listened.length === 0) {
     run.finish("no-commands");
     return;
@@ -1762,8 +1914,9 @@ function restorePriorState(prior: PriorState, outcome: CalibrationOutcome): void
       enterManualPause();
       break;
     case "waiting":
-      // Listening was waiting for a route's command. A start checks the
-      // commands again and either listens or goes back to waiting.
+      // Listening was waiting for a route's command, or for a route to be
+      // switched on. A start checks the routes again and either listens or
+      // goes back to waiting.
       speechEngine.stop();
       void startListening();
       break;
@@ -1824,8 +1977,13 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     listInputDevices(engineBinaryPath),
   ]);
   // Checked now, whatever the extension is doing: the report says which
-  // routes a start would listen for, and why the others are set aside.
-  const availability = await checkConfiguredRoutes();
+  // routes a start would listen for, why the others are set aside, and which
+  // are switched off, with the commands of those checked as well.
+  const sources = await readCommandSources();
+  const switches = readRouteSwitches(config);
+  const availability = checkRouteAvailability(switches.on, DEFAULT_ROUTES, sources);
+  const switchedOff = checkSwitchedOffCommands(switches.off, DEFAULT_ROUTES, sources);
+  const switchesShown = switchedOff.length > 0 || switches.unmatched.length > 0;
   const model = modelStatus(context.globalStorageUri.fsPath);
 
   const lines = formatDiagnostics({
@@ -1863,6 +2021,9 @@ async function runDiagnostics(context: vscode.ExtensionContext): Promise<void> {
     routes: availability.listened,
     unverified: availability.unverified,
     setAside: availability.setAside,
+    switchedOff,
+    unmatchedSwitches: switches.unmatched,
+    switchesScope: switchesShown ? routeSwitchScope(config.inspect<unknown>(ROUTES_SWITCHED_OFF)) : undefined,
     usingDefaultRoutes: filterValidRoutes(config.get<WakePhrase[]>("routes", [])).length === 0,
     phraseChecks: checkPhrases(availability.listened),
     lock: describeLock(readLock(lockPath)),
@@ -1947,7 +2108,8 @@ function statusFacts(): StatusFacts {
     starting: engineStarting || Boolean(speechEngine.isStarting) || (calibration !== null && !calibrationOpen),
     error: engineFailure,
     standingBy: lockWatchTimer !== null ? { followsFocus: pausesOnFocusLoss() } : null,
-    waitingForCommands,
+    waitingForCommands: waitingFor === "commands",
+    everyRouteSwitchedOff: waitingFor === "routes",
   };
 }
 
