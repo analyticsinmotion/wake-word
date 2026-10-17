@@ -13,7 +13,7 @@ jobs:
     # The trusted publisher registered on Open VSX pins this environment, so
     # the registry issues a publishing token only to a job that runs in it.
     # Its deployment rule admits only tags matching v*, and it applies to
-    # every step of the job, the Marketplace publish included.
+    # every step of the job.
     environment: open-vsx
     # Declaring permissions withholds every permission not listed.
     # contents: write lets checkout read the repository and the upload step
@@ -128,29 +128,14 @@ jobs:
           EXE: ${{ startsWith(matrix.target, 'win32') && 'wake-word-engine.exe' || 'wake-word-engine' }}
         run: node engine-rs/scripts/drive-protocol.mjs --bin "$RUNNER_TEMP/vsix/extension/bin/$EXE" --no-microphone
 
-      # Attach .vsix to the GitHub release
+      # Attach .vsix to the GitHub release. The marketplace job publishes the
+      # attached file.
       - name: Upload .vsix to release
         uses: softprops/action-gh-release@v3
         with:
           files: wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Publish to the VS Code Marketplace the .vsix that the Package step
-      # wrote and the Verify step checked: the file the upload step attached
-      # to the release and the file the Open VSX step publishes. vsce reads
-      # the target platform from the package's manifest and refuses --target
-      # beside --packagePath, so the step gives none. On a re-run attempt,
-      # --skip-duplicate ends the step with success, and publishes nothing,
-      # when the Marketplace already has this version for this target, so a
-      # re-run of the release, or of one of its legs, does not fail on a
-      # target that an earlier attempt published. The first attempt leaves
-      # the flag out, so a version that is already published, such as one
-      # that package.json was not raised for, fails the step.
-      - name: Publish to VS Code Marketplace
-        run: npx vsce publish --packagePath wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix ${{ github.run_attempt != '1' && '--skip-duplicate' || '' }}
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
       # Publish to Open VSX Registry with trusted publishing: ovsx exchanges
       # the job's OIDC ID token for a publishing token that expires within
@@ -165,3 +150,87 @@ jobs:
       # out, as the Marketplace step does.
       - name: Publish to Open VSX
         run: npx ovsx publish wake-word-${{ matrix.target }}-${{ github.event.release.tag_name }}.vsix --trusted-publishing ${{ github.run_attempt != '1' && '--skip-duplicate' || '' }}
+
+  marketplace:
+    # Publishes to the VS Code Marketplace the four packages that the release
+    # job checked and attached to the release. It runs only when every leg of
+    # the release job has succeeded, so only for a release tagged v*.
+    needs: release
+    # The federated credential of the Microsoft Entra identity that publishes
+    # to the Marketplace names this environment, so only a job that runs in
+    # it can sign in as that identity. Its deployment rule admits only tags
+    # matching v*, and its secrets hold the identity's client and tenant IDs.
+    environment: microsoft-marketplace
+    # Declaring permissions withholds every permission not listed.
+    # contents: read lets checkout read the repository and gh read the
+    # release's assets. id-token: write lets the sign-in step request the
+    # job's OIDC ID token.
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      # The targets of the release job's matrix.
+      TARGETS: win32-x64 darwin-arm64 linux-x64 linux-arm64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      # Download each target's package from the release, and stop if a file
+      # differs from the SHA-256 digest that GitHub recorded when the release
+      # job's upload step attached it.
+      - name: Download the verified packages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir "$RUNNER_TEMP/marketplace"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.digest) \(.name)"' > "$RUNNER_TEMP/asset-digests.txt"
+          for target in $TARGETS; do
+            file="wake-word-$target-$TAG.vsix"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$file" --dir "$RUNNER_TEMP/marketplace"
+            line="sha256:$(sha256sum "$RUNNER_TEMP/marketplace/$file" | cut -d ' ' -f 1) $file"
+            if ! grep -qxF "$line" "$RUNNER_TEMP/asset-digests.txt"; then
+              echo "::error::$file does not match the digest of its release asset"
+              exit 1
+            fi
+            echo "$line"
+          done
+
+      # Sign in to Microsoft Entra ID as the identity that is a member of the
+      # Marketplace publisher. The step requests the job's OIDC ID token for
+      # the audience that the identity's federated credential accepts, masks
+      # it, and exchanges it with the Azure CLI that the runner image
+      # provides. --allow-no-subscriptions signs in an identity that holds no
+      # role on any Azure subscription.
+      - name: Sign in to Microsoft Entra ID
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          token=$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | node -e 'const { value } = JSON.parse(require("fs").readFileSync(0, "utf8")); if (!value) process.exit(1); process.stdout.write(value)')
+          echo "::add-mask::$token"
+          az login --service-principal --username "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" --federated-token "$token" --allow-no-subscriptions --output none
+
+      # Publish the downloaded packages to the VS Code Marketplace.
+      # --azure-credential has vsce take the identity's Microsoft Entra token
+      # from the Azure CLI sign-in. vsce uses a Personal Access Token, given
+      # with -p or in its environment variable, before --azure-credential, so
+      # the job gives none. vsce reads each package's target platform from
+      # its manifest and refuses --target beside --packagePath, so the step
+      # gives none. On a re-run attempt, --skip-duplicate skips, and does not
+      # fail on, each target that the Marketplace already has this version
+      # for, so a re-run publishes only the targets that an earlier attempt
+      # did not. The first attempt leaves the flag out, so a version that is
+      # already published, such as one that package.json was not raised for,
+      # fails the step.
+      - name: Publish to VS Code Marketplace
+        run: npx vsce publish --azure-credential --packagePath "$RUNNER_TEMP"/marketplace/*.vsix ${{ github.run_attempt != '1' && '--skip-duplicate' || '' }}
