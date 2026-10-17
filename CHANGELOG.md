@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.0] - 2026-10-18
+
+### Added
+
+- **Wake Word: Switch Routes On or Off** and the `wakeWord.routesSwitchedOff` setting switch any route off and back on, a default route included. Switching off a default route adds only its label to your settings, and the other default routes stay as they are. When every route is switched off, the status bar shows **Wake: Routes off**.
+
+### Changed
+
+- Only the editor window you are using listens. `wakeWord.pauseOnFocusLoss` is now on by default: a window that loses focus pauses and releases the microphone, and the window you switch to starts listening. If you have set `wakeWord.pauseOnFocusLoss` yourself, your setting is kept.
+- A wake phrase that hands the microphone to an assistant keeps it handed over when you move to another window.
+- When the editor starts with several windows, the focused one starts listening.
+- The speech model comes with the extension, so listening starts on the first start with no download and works offline. A copy that an earlier version downloaded is removed when the extension starts.
+- Wake Word releases the microphone faster when it pauses just after you stop speaking.
+
+### Removed
+
+- The first-run download of the speech model and its progress notification.
+
 ## [0.17.0] - 2026-10-15
 
 ### Changed
