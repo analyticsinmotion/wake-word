@@ -43,7 +43,7 @@ path = "src/main.rs"
 [dependencies]
 serde_json = "1"
 decibri = { version = "=6.4.0", default-features = false, features = ["capture", "vad", "gain", "ort-load-dynamic"] }
-sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["static"] }
+sherpa-onnx = { version = "=2.0.1", default-features = false, features = ["static"] }
 
 [profile.release]
 # This binary ships inside the .vsix, so size and start-up cost matter.
